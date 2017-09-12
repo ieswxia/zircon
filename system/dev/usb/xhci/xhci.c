@@ -160,7 +160,7 @@ static zx_status_t xhci_vmo_init(size_t size, zx_handle_t* out_handle, zx_vaddr_
     }
 
     if (!contiguous) {
-        // needs to be done before ZX_VMO_OP_LOOKUP for non-contiguous VMOs
+        // needs to be done before zx_bti_pin for non-contiguous VMOs
         status = zx_vmo_op_range(handle, ZX_VMO_OP_COMMIT, 0, size, NULL, 0);
         if (status != ZX_OK) {
             dprintf(ERROR, "xhci_vmo_init: zx_vmo_op_range(ZX_VMO_OP_COMMIT) failed %d\n", status);
@@ -198,7 +198,7 @@ void xhci_num_interrupts_init(xhci_t* xhci, void* mmio, uint32_t num_msi_interru
                                MIN(INTERRUPTER_COUNT, max_interrupters));
 }
 
-zx_status_t xhci_init(xhci_t* xhci, void* mmio) {
+zx_status_t xhci_init(xhci_t* xhci, void* mmio, zx_handle_t bti) {
     zx_status_t result = ZX_OK;
     zx_paddr_t* phys_addrs = NULL;
 
@@ -292,15 +292,24 @@ zx_status_t xhci_init(xhci_t* xhci, void* mmio) {
 
     // set up DCBAA, ERST array and input context
     xhci->dcbaa = (uint64_t *)xhci->dcbaa_erst_virt;
-    result = zx_vmo_op_range(xhci->dcbaa_erst_handle, ZX_VMO_OP_LOOKUP, 0, PAGE_SIZE,
-                             &xhci->dcbaa_phys, sizeof(xhci->dcbaa_phys));
+    uint32_t expected_num_addrs;
+    result = zx_bti_pin(bti, xhci->dcbaa_erst_handle, 0, PAGE_SIZE,
+                        ZX_VM_FLAG_PERM_READ | ZX_VM_FLAG_PERM_WRITE,
+                        &xhci->dcbaa_phys, 1, &expected_num_addrs);
+    if (result == ZX_OK && expected_num_addrs != 1) {
+        result = ZX_ERR_BAD_STATE;
+    }
     if (result != ZX_OK) {
         dprintf(ERROR, "zx_vmo_op_range failed for xhci->dcbaa_erst_handle\n");
         goto fail;
     }
     xhci->input_context = (uint8_t *)xhci->input_context_virt;
-    result = zx_vmo_op_range(xhci->input_context_handle, ZX_VMO_OP_LOOKUP, 0, PAGE_SIZE,
-                             &xhci->input_context_phys, sizeof(xhci->input_context_phys));
+    result = zx_bti_pin(bti, xhci->input_context_handle, 0, PAGE_SIZE,
+                        ZX_VM_FLAG_PERM_READ | ZX_VM_FLAG_PERM_WRITE,
+                        &xhci->input_context_phys, 1, &expected_num_addrs);
+    if (result == ZX_OK && expected_num_addrs != 1) {
+        result = ZX_ERR_BAD_STATE;
+    }
     if (result != ZX_OK) {
         dprintf(ERROR, "zx_vmo_op_range failed for xhci->input_context_handle\n");
         goto fail;
@@ -331,8 +340,12 @@ zx_status_t xhci_init(xhci_t* xhci, void* mmio) {
         off_t offset = 0;
         for (uint32_t i = 0; i < scratch_pad_bufs; i++) {
             zx_paddr_t scratch_pad_phys;
-            result = zx_vmo_op_range(xhci->scratch_pad_pages_handle, ZX_VMO_OP_LOOKUP, offset,
-                                     PAGE_SIZE, &scratch_pad_phys, sizeof(scratch_pad_phys));
+            result = zx_bti_pin(bti, xhci->scratch_pad_pages_handle, offset, xhci->page_size,
+                                ZX_VM_FLAG_PERM_READ | ZX_VM_FLAG_PERM_WRITE,
+                                &scratch_pad_phys, 1, &expected_num_addrs);
+            if (result == ZX_OK && expected_num_addrs != 1) {
+                result = ZX_ERR_BAD_STATE;
+            }
             if (result != ZX_OK) {
                 dprintf(ERROR, "zx_vmo_op_range failed for xhci->scratch_pad_pages_handle\n");
                 goto fail;
@@ -342,8 +355,13 @@ zx_status_t xhci_init(xhci_t* xhci, void* mmio) {
         }
 
         zx_paddr_t scratch_pad_index_phys;
-        result = zx_vmo_op_range(xhci->scratch_pad_index_handle, ZX_VMO_OP_LOOKUP, 0, PAGE_SIZE,
-                                  &scratch_pad_index_phys, sizeof(scratch_pad_index_phys));
+        const size_t scratch_pad_index_size = PAGE_ROUNDUP(scratch_pad_bufs * sizeof(uint64_t));
+        result = zx_bti_pin(bti, xhci->scratch_pad_index_handle, 0, scratch_pad_index_size,
+                            ZX_VM_FLAG_PERM_READ | ZX_VM_FLAG_PERM_WRITE,
+                            &scratch_pad_index_phys, 1, &expected_num_addrs);
+        if (result == ZX_OK && expected_num_addrs != 1) {
+            result = ZX_ERR_BAD_STATE;
+        }
         if (result != ZX_OK) {
             dprintf(ERROR, "zx_vmo_op_range failed for xhci->scratch_pad_index_handle\n");
             goto fail;

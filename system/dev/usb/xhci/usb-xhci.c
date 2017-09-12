@@ -277,6 +277,13 @@ static zx_status_t usb_xhci_bind(void* ctx, zx_device_t* dev, void** cookie) {
         goto error_return;
     }
 
+    zx_handle_t bti;
+    status = pci.ops->get_bti(pci.ctx, &bti);
+    if (status != ZX_OK) {
+        goto error_return;
+    }
+    iotxn_set_default_bti(bti);
+
     xhci = calloc(1, sizeof(xhci_t));
     if (!xhci) {
         status = ZX_ERR_NO_MEMORY;
@@ -338,7 +345,7 @@ static zx_status_t usb_xhci_bind(void* ctx, zx_device_t* dev, void** cookie) {
     // used for enabling bus mastering
     memcpy(&xhci->pci, &pci, sizeof(pci_protocol_t));
 
-    status = xhci_init(xhci, mmio);
+    status = xhci_init(xhci, mmio, bti);
     if (status != ZX_OK) {
         goto error_return;
     }

@@ -191,7 +191,7 @@ struct xhci {
 // is constrained by the number of interrupters supported by XHCI,
 // number of interrupts supported by MSI, and INTERRUPTER_COUNT.
 void xhci_num_interrupts_init(xhci_t* xhci, void* mmio, uint32_t num_msi_interrupts);
-zx_status_t xhci_init(xhci_t* xhci, void* mmio);
+zx_status_t xhci_init(xhci_t* xhci, void* mmio, zx_handle_t bti);
 int xhci_get_ep_ctx_state(xhci_endpoint_t* ep);
 zx_status_t xhci_start(xhci_t* xhci);
 void xhci_handle_interrupt(xhci_t* xhci, bool legacy, uint32_t interrupter);
