@@ -21,6 +21,7 @@
 
 #include "pl061.h"
 #include "hi3660-bus.h"
+#include "hi3660-hw.h"
 
 // MMIO indices
 enum {
@@ -183,7 +184,7 @@ static int led_test_thread(void *arg) {
         return ZX_ERR_INTERNAL;
     }
 
-    uint32_t led_gpios[] = { 150, 151, 190, 189 };
+    uint32_t led_gpios[] = { GPIO_USER_LED1, GPIO_USER_LED2, GPIO_USER_LED3, GPIO_USER_LED4 };
 
     for (unsigned i = 0; i < countof(led_gpios); i++) {
         gpio_config(&gpio, led_gpios[i], GPIO_DIR_OUT);
@@ -252,6 +253,7 @@ static zx_status_t hi3660_bind(void* ctx, zx_device_t* parent, void** cookie) {
     if ((status = hi3360_usb_init(bus)) != ZX_OK) {
         printf("hi3660_bind: hi3360_usb_init failed!\n");;
     }
+    hi3660_usb_set_host(bus, true);
 
     return ZX_OK;
 
