@@ -179,6 +179,63 @@ usage:
     return -1;
 }
 
+static int mode_command(int argc, const char** argv) {
+    zx_status_t status = ZX_OK;
+
+    int fd = open(DEV_VIRTUAL_USB, O_RDWR);
+    if (fd < 0) {
+        fprintf(stderr, "could not open %s\n", DEV_VIRTUAL_USB);
+        return fd;
+    }
+
+    if (argc == 1) {
+        // print current mode
+        usb_mode_t mode;
+        status = ioctl_usb_device_get_mode(fd, &mode);
+        if (status == ZX_OK) {
+            switch (mode) {
+            case USB_MODE_NONE:
+                printf("NONE\n");
+                break;
+            case USB_MODE_HOST:
+                printf("HOST\n");
+                break;
+            case USB_MODE_DEVICE:
+                printf("DEVICE\n");
+                break;
+            case USB_MODE_OTG:
+                printf("OTG\n");
+                break;
+            }
+         }
+    } else {
+        usb_mode_t mode;
+        if (strcasecmp(argv[1], "none") == 0) {
+            mode = USB_MODE_NONE;
+        } else if (strcasecmp(argv[1], "host") == 0) {
+            mode = USB_MODE_HOST;
+        } else if (strcasecmp(argv[1], "device") == 0) {
+            mode = USB_MODE_DEVICE;
+        } else if (strcasecmp(argv[1], "otg") == 0) {
+            mode = USB_MODE_OTG;
+        } else {
+            fprintf(stderr, "unknown USB mode %s\n", argv[1]);
+            status = ZX_ERR_INVALID_ARGS;
+        }
+
+        if (status == ZX_OK) {
+            status = ioctl_usb_device_set_mode(fd, &mode);
+            if (status != ZX_OK) {
+                fprintf(stderr, "ioctl_usb_device_set_mode failed: %d\n", status);
+            }
+        }
+    }
+
+    close(fd);
+    return status == ZX_OK ? 0 : -1;
+}
+
+
 static int virtual_command(int argc, const char** argv) {
     int fd = open(DEV_VIRTUAL_USB, O_RDWR);
     if (fd < 0) {
@@ -229,6 +286,11 @@ static usbctl_command_t commands[] = {
         device_command,
         "device [reset|init-cdc|init-ums] resets the device or "
         "initializes the UMS function"
+    },
+    {
+        "mode",
+        mode_command,
+        "mode [none|host|device|otg] sets the current USB mode"
     },
     {
         "virtual",
