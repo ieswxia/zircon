@@ -6,6 +6,7 @@
 #include <ddk/debug.h>
 #include <ddk/protocol/platform-devices.h>
 #include <ddk/protocol/usb-function.h>
+#include <ddk/protocol/usb-mode-switch.h>
 #include <hw/reg.h>
 #include <pretty/hexdump.h>
 
@@ -343,12 +344,45 @@ usb_dci_protocol_ops_t dwc_dci_protocol = {
     .ep_clear_stall = dwc3_clear_stall,
 };
 
+static usb_mode_t dwc3_get_mode(void* ctx) {
+    return USB_MODE_NONE;
+}
+
+static zx_status_t dwc3_set_mode(void* ctx, usb_mode_t mode) {
+
+    return -1;
+}
+
+usb_mode_switch_protocol_ops_t dwc_ums_protocol = {
+    .get_mode = dwc3_get_mode,
+    .set_mode = dwc3_set_mode,
+};
+
 static void dwc3_unbind(void* ctx) {
     dwc3_t* dwc = ctx;
 
     zx_interrupt_signal(dwc->irq_handle);
     thrd_join(dwc->irq_thread, NULL);
     device_remove(dwc->zxdev);
+}
+
+static zx_status_t dwc3_get_protocol(void* ctx, uint32_t proto_id, void* out) {
+    switch (proto_id) {
+    case ZX_PROTOCOL_USB_DCI: {
+        usb_dci_protocol_t* proto = out;
+        proto->ops = &dwc_dci_protocol;
+        proto->ctx = ctx;
+        return ZX_OK;
+    }
+    case ZX_PROTOCOL_USB_MODE_SWITCH: {
+        usb_mode_switch_protocol_t* proto = out;
+        proto->ops = &dwc_ums_protocol;
+        proto->ctx = ctx;
+        return ZX_OK;
+    }
+    default:
+        return ZX_ERR_NOT_SUPPORTED;
+    }
 }
 
 static void dwc3_iotxn_queue(void* ctx, iotxn_t* txn) {
@@ -386,6 +420,7 @@ static void dwc3_release(void* ctx) {
 
 static zx_protocol_device_t dwc3_device_proto = {
     .version = DEVICE_OPS_VERSION,
+    .get_protocol = dwc3_get_protocol,
     .iotxn_queue = dwc3_iotxn_queue,
     .release = dwc3_release,
 };

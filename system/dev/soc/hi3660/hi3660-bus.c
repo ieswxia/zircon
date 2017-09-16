@@ -14,6 +14,7 @@
 #include <ddk/driver.h>
 #include <ddk/binding.h>
 #include <ddk/protocol/gpio.h>
+#include <ddk/protocol/usb-mode-switch.h>
 
 #include <zircon/process.h>
 #include <zircon/syscalls.h>
@@ -106,14 +107,37 @@ static gpio_protocol_ops_t gpio_ops = {
     .int_clear = hi3660_gpio_int_clear,
 };
 
+static usb_mode_t hi3660_get_mode(void* ctx) {
+    return USB_MODE_NONE;
+}
+
+static zx_status_t hi3660_set_mode(void* ctx, usb_mode_t mode) {
+
+    return -1;
+}
+
+usb_mode_switch_protocol_ops_t usb_mode_switch_ops = {
+    .get_mode = hi3660_get_mode,
+    .set_mode = hi3660_set_mode,
+};
+
 static zx_status_t hi3660_get_protocol(void* ctx, uint32_t proto_id, void* out) {
-    if (proto_id == ZX_PROTOCOL_GPIO) {
+    switch (proto_id) {
+    case ZX_PROTOCOL_GPIO: {
         gpio_protocol_t* proto = out;
-        proto->ctx = ctx;
         proto->ops = &gpio_ops;
+        proto->ctx = ctx;
         return ZX_OK;
     }
-    return ZX_ERR_NOT_SUPPORTED;
+    case ZX_PROTOCOL_USB_MODE_SWITCH: {
+        usb_mode_switch_protocol_t* proto = out;
+        proto->ops = &usb_mode_switch_ops;
+        proto->ctx = ctx;
+        return ZX_OK;
+    }
+    default:
+        return ZX_ERR_NOT_SUPPORTED;
+    }
 }
 
 static zx_status_t hi3660_add_gpios(void* ctx, uint32_t start, uint32_t count, uint32_t mmio_index,
