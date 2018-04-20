@@ -179,6 +179,19 @@ inline trace_thread_ref_t trace_context_make_registered_thread(
     return ref;
 }
 
+// Write a blob of binary data into the trace buffer.
+// Discards the record if it cannot be written.
+// |context| must be a valid trace context reference.
+// |type| is the blob type.
+// |name_ref| is the name of the blob.
+// |blob| is the binary data to write.
+// |blob_size| is the size of the binary data to write.
+void trace_context_write_blob_record(
+    trace_context_t* context,
+    trace_blob_type_t type,
+    const trace_string_ref_t* name_ref,
+    const void* blob, size_t blob_size);
+
 // Writes a kernel object record which describes the specified object into
 // the trace buffer.  Discards the record if it cannot be written.
 //
@@ -202,6 +215,7 @@ void trace_context_write_kernel_object_record(
 //
 // |context| must be a valid trace context reference.
 // |handle| is the handle of the object being described.
+// |args| contains |num_args| key/value pairs to include in the record, or NULL if none.
 //
 // This function is thread-safe.
 void trace_context_write_kernel_object_record_for_handle(
@@ -320,7 +334,8 @@ void trace_context_write_counter_event_record(
 // Discards the record if it cannot be written.
 //
 // |context| must be a valid trace context reference.
-// |event_time| is the time of the event, in ticks.
+// |start_time| is the start time of the event, in ticks.
+// |end_time| is the end time of the event, in ticks.
 // |thread_ref| is the thread on which the event occurred.
 // |category_ref| is the category of the event.
 // |name_ref| is the name of the event.
@@ -340,7 +355,7 @@ void trace_context_write_duration_event_record(
 // Discards the record if it cannot be written.
 //
 // |context| must be a valid trace context reference.
-// |event_time| is the time of the event, in ticks.
+// |event_time| is the start time of the event, in ticks.
 // |thread_ref| is the thread on which the event occurred.
 // |category_ref| is the category of the event.
 // |name_ref| is the name of the event.
@@ -359,7 +374,7 @@ void trace_context_write_duration_begin_event_record(
 // Discards the record if it cannot be written.
 //
 // |context| must be a valid trace context reference.
-// |event_time| is the time of the event, in ticks.
+// |event_time| is the end time of the event, in ticks.
 // |thread_ref| is the thread on which the event occurred.
 // |category_ref| is the category of the event.
 // |name_ref| is the name of the event.
@@ -378,7 +393,7 @@ void trace_context_write_duration_end_event_record(
 // Discards the record if it cannot be written.
 //
 // |context| must be a valid trace context reference.
-// |event_time| is the time of the event, in ticks.
+// |event_time| is the start time of the event, in ticks.
 // |thread_ref| is the thread on which the event occurred.
 // |category_ref| is the category of the event.
 // |name_ref| is the name of the event.
@@ -422,7 +437,7 @@ void trace_context_write_async_instant_event_record(
 // Discards the record if it cannot be written.
 //
 // |context| must be a valid trace context reference.
-// |event_time| is the time of the event, in ticks.
+// |event_time| is the end time of the event, in ticks.
 // |thread_ref| is the thread on which the event occurred.
 // |category_ref| is the category of the event.
 // |name_ref| is the name of the event.
@@ -444,7 +459,7 @@ void trace_context_write_async_end_event_record(
 // Discards the record if it cannot be written.
 //
 // |context| must be a valid trace context reference.
-// |event_time| is the time of the event, in ticks.
+// |event_time| is the start time of the event, in ticks.
 // |thread_ref| is the thread on which the event occurred.
 // |category_ref| is the category of the event.
 // |name_ref| is the name of the event.
@@ -488,7 +503,7 @@ void trace_context_write_flow_step_event_record(
 // Discards the record if it cannot be written.
 //
 // |context| must be a valid trace context reference.
-// |event_time| is the time of the event, in ticks.
+// |event_time| is the end time of the event, in ticks.
 // |thread_ref| is the thread on which the event occurred.
 // |category_ref| is the category of the event.
 // |name_ref| is the name of the event.
@@ -515,7 +530,7 @@ void trace_context_write_flow_end_event_record(
 // This function is thread-safe.
 void trace_context_write_initialization_record(
     trace_context_t* context,
-    uint64_t ticks_per_second);
+    zx_ticks_t ticks_per_second);
 
 // Writes a string record into the trace buffer.
 // Discards the record if it cannot be written.

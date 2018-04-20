@@ -7,20 +7,22 @@
 
 #pragma once
 
-#ifndef ASSEMBLY
+#define CURRENT_PERCPU_PTR_OFFSET 16
+
+#ifndef __ASSEMBLER__
 
 #include <assert.h>
-#include <zircon/compiler.h>
-#include <zircon/tls.h>
 #include <stddef.h>
 #include <sys/types.h>
+#include <zircon/compiler.h>
+#include <zircon/tls.h>
 
 __BEGIN_CDECLS
 
 struct fpstate {
-    uint32_t    fpcr;
-    uint32_t    fpsr;
-    uint64_t    regs[64];
+    uint32_t fpcr;
+    uint32_t fpsr;
+    uint64_t regs[64];
 };
 
 struct arm64_percpu;
@@ -41,21 +43,21 @@ struct arch_thread {
     // in an exception.
     // The regs are saved on the stack and then a pointer is stored here.
     // NULL if not suspended or stopped in an exception.
-    struct arm64_iframe_long *suspended_general_regs;
+    struct arm64_iframe_long* suspended_general_regs;
 
     // Point to the current cpu pointer when the thread is running, used to
     // restore x18 on exception entry. Swapped on context switch.
-    struct arm64_percpu *current_percpu_ptr;
+    struct arm64_percpu* current_percpu_ptr;
 
     // if non-NULL, address to return to on data fault
-    void *data_fault_resume;
+    void* data_fault_resume;
 
     // saved fpu state
     struct fpstate fpstate;
 };
 
-#define thread_pointer_offsetof(field)                                  \
-    ((int)offsetof(struct arch_thread, field) -                         \
+#define thread_pointer_offsetof(field)          \
+    ((int)offsetof(struct arch_thread, field) - \
      (int)offsetof(struct arch_thread, thread_pointer_location))
 
 static_assert(
@@ -64,7 +66,10 @@ static_assert(
 static_assert(
     thread_pointer_offsetof(unsafe_sp) == ZX_TLS_UNSAFE_SP_OFFSET,
     "unsafe_sp field in wrong place");
+static_assert(
+    thread_pointer_offsetof(current_percpu_ptr) == CURRENT_PERCPU_PTR_OFFSET,
+    "per cpu ptr offset in wrong place");
 
 __END_CDECLS
 
-#endif // ASSEMBLY
+#endif // __ASSEMBLER__

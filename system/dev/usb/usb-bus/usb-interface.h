@@ -8,7 +8,6 @@
 #include <zircon/device/usb.h>
 #include <zircon/hw/usb.h>
 #include <sync/completion.h>
-#include <threads.h>
 
 // Represents an interface within a composite device
 typedef struct {
@@ -28,15 +27,18 @@ typedef struct {
     // node for our USB device's "children" list
     list_node_t node;
 
-    // thread for calling client's iotxn complete callback
+    // thread for calling client's usb request complete callback
     thrd_t callback_thread;
     bool callback_thread_stop;
     // completion used for signalling callback_thread
     completion_t callback_thread_completion;
-    // list of txns that need to have client's completion callback called
-    list_node_t completed_txns;
+    // list of requests that need to have client's completion callback called
+    list_node_t completed_reqs;
     // mutex that protects the callback_* members above
     mtx_t callback_lock;
+
+    // pool of requests that can be reused
+    usb_request_pool_t free_reqs;
 
 } usb_interface_t;
 
@@ -56,8 +58,6 @@ zx_status_t usb_device_add_interface_association(usb_device_t* device,
                                                  usb_device_descriptor_t* device_desc,
                                                  usb_interface_assoc_descriptor_t* assoc_desc,
                                                  size_t assoc_desc_length);
-
-void usb_device_remove_interfaces(usb_device_t* device);
 
 // returns whether the interface with the given id was removed.
 bool usb_device_remove_interface_by_id_locked(usb_device_t* device, uint8_t interface_id);

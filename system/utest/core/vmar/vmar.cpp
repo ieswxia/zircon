@@ -77,6 +77,8 @@ zx_status_t test_local_address(uintptr_t address, bool write, bool* success) {
     alignas(16) static uint8_t thread_stack[PAGE_SIZE];
 
     zx_port_packet_t packet;
+    zx_info_handle_basic_t info;
+    zx_koid_t tid = ZX_KOID_INVALID;
     bool saw_page_fault = false;
 
     zx_handle_t thread = ZX_HANDLE_INVALID;
@@ -90,6 +92,13 @@ zx_status_t test_local_address(uintptr_t address, bool write, bool* success) {
         goto err;
     }
 
+    status = zx_object_get_info(thread, ZX_INFO_HANDLE_BASIC,
+                                &info, sizeof(info), NULL, NULL);
+    if (status != ZX_OK) {
+        goto err;
+    }
+    tid = info.koid;
+
     // Create an exception port and bind it to the thread to prevent the
     // thread's illegal access from killing the process.
     status = zx_port_create(0, &port);
@@ -97,6 +106,11 @@ zx_status_t test_local_address(uintptr_t address, bool write, bool* success) {
         goto err;
     }
     status = zx_task_bind_exception_port(thread, port, 0, 0);
+    if (status != ZX_OK) {
+        goto err;
+    }
+    status = zx_object_wait_async(thread, port, tid, ZX_THREAD_TERMINATED,
+                                  ZX_WAIT_ASYNC_ONCE);
     if (status != ZX_OK) {
         goto err;
     }
@@ -110,12 +124,21 @@ zx_status_t test_local_address(uintptr_t address, bool write, bool* success) {
     // Wait for the thread to exit and identify its cause of death.
     // Keep looping until the thread is gone so that crashlogger doesn't
     // see the page fault.
-    do {
+    while (true) {
         zx_status_t s;
 
-        s = zx_port_wait(port, ZX_TIME_INFINITE, &packet, 0);
+        s = zx_port_wait(port, ZX_TIME_INFINITE, &packet, 1);
         if (s != ZX_OK && status != ZX_OK) {
             status = s;
+            break;
+        }
+        if (ZX_PKT_IS_SIGNAL_ONE(packet.type)) {
+            if (packet.key != tid ||
+                !(packet.signal.observed & ZX_THREAD_TERMINATED)) {
+                status = ZX_ERR_BAD_STATE;
+                break;
+            }
+            // Leave status as is.
             break;
         }
         if (!ZX_PKT_IS_EXCEPTION(packet.type)) {
@@ -127,15 +150,12 @@ zx_status_t test_local_address(uintptr_t address, bool write, bool* success) {
             saw_page_fault = true;
             // Leave status as is.
         }
-        else if (packet.type == ZX_EXCP_GONE) {
-            // Leave status as is.
-        }
         else {
             zx_task_kill(thread);
             if (status != ZX_OK)
                 status = ZX_ERR_BAD_STATE;
         }
-    } while (packet.type != ZX_EXCP_GONE);
+    }
 
     if (status == ZX_OK && !saw_page_fault)
         *success = true;
@@ -341,7 +361,7 @@ bool destroyed_vmar_test() {
     zx_handle_t process;
     zx_handle_t vmar;
     zx_handle_t vmo;
-    zx_handle_t region[3] = {0};
+    zx_handle_t region[3] = {};
     uintptr_t region_addr[3];
     uintptr_t map_addr[2];
 
@@ -442,9 +462,10 @@ bool map_over_destroyed_test() {
     zx_handle_t process;
     zx_handle_t vmar;
     zx_handle_t vmo, vmo2;
-    zx_handle_t region[2] = {0};
+    zx_handle_t region[2] = {};
     uintptr_t region_addr[2];
     uintptr_t map_addr;
+    size_t len;
 
     ASSERT_EQ(zx_process_create(zx_job_default(), kProcessName, sizeof(kProcessName) - 1,
                                 0, &process, &vmar), ZX_OK);
@@ -472,9 +493,7 @@ bool map_over_destroyed_test() {
     // Check that the mapping worked
     {
         uint8_t buf = 5;
-        size_t len;
-        ASSERT_EQ(zx_vmo_write(vmo, &buf, 0, 1, &len), ZX_OK);
-        EXPECT_EQ(len, 1U);
+        ASSERT_EQ(zx_vmo_write(vmo, &buf, 0, 1), ZX_OK);
 
         buf = 0;
         EXPECT_EQ(zx_process_read_memory(process, map_addr, &buf, 1, &len),
@@ -529,7 +548,7 @@ bool overmapping_test() {
     BEGIN_TEST;
 
     zx_handle_t process;
-    zx_handle_t region[3] = {0};
+    zx_handle_t region[3] = {};
     zx_handle_t vmar;
     zx_handle_t vmo, vmo2;
     uintptr_t region_addr[3];
@@ -662,6 +681,13 @@ bool invalid_args_test() {
               ZX_ERR_INVALID_ARGS);
     EXPECT_EQ(zx_vmar_map(vmar, PAGE_SIZE, vmo, 0,
                           4 * PAGE_SIZE, ZX_VM_FLAG_PERM_READ | ZX_VM_FLAG_PERM_WRITE,
+                          &map_addr),
+              ZX_ERR_INVALID_ARGS);
+
+    // Using MAP_RANGE with SPECIFIC_OVERWRITE
+    EXPECT_EQ(zx_vmar_map(vmar, PAGE_SIZE, vmo, 0, 4 * PAGE_SIZE,
+                          ZX_VM_FLAG_PERM_READ | ZX_VM_FLAG_SPECIFIC_OVERWRITE |
+                          ZX_VM_FLAG_MAP_RANGE,
                           &map_addr),
               ZX_ERR_INVALID_ARGS);
 
@@ -1012,7 +1038,7 @@ bool nested_region_perms_test() {
     zx_handle_t process;
     zx_handle_t vmar;
     zx_handle_t vmo;
-    zx_handle_t region[2] = {0};
+    zx_handle_t region[2] = {};
     uintptr_t region_addr[2];
     uintptr_t map_addr;
 
@@ -1412,9 +1438,9 @@ bool map_specific_overwrite_test() {
     // which.
     for (size_t i = 0; i < mapping_size / PAGE_SIZE; ++i) {
         buf[0] = 1;
-        ASSERT_EQ(zx_vmo_write(vmo, buf, i * PAGE_SIZE, 1, &len), ZX_OK);
+        ASSERT_EQ(zx_vmo_write(vmo, buf, i * PAGE_SIZE, 1), ZX_OK);
         buf[0] = 2;
-        ASSERT_EQ(zx_vmo_write(vmo2, buf, i * PAGE_SIZE, 1, &len), ZX_OK);
+        ASSERT_EQ(zx_vmo_write(vmo2, buf, i * PAGE_SIZE, 1), ZX_OK);
     }
 
     // Create a single mapping and overwrite it
@@ -1819,7 +1845,150 @@ bool unmap_large_uncommitted_test() {
     END_TEST;
 }
 
+bool partial_unmap_and_read() {
+    BEGIN_TEST;
+
+    // Map a two-page VMO.
+    zx_handle_t vmo;
+    ASSERT_EQ(zx_vmo_create(PAGE_SIZE * 2, 0, &vmo), ZX_OK);
+    uintptr_t mapping_addr;
+    ASSERT_EQ(zx_vmar_map(zx_vmar_root_self(), 0, vmo, 0, PAGE_SIZE * 2,
+                          ZX_VM_FLAG_PERM_READ | ZX_VM_FLAG_PERM_WRITE,
+                          &mapping_addr),
+              ZX_OK);
+    EXPECT_EQ(zx_handle_close(vmo), ZX_OK);
+
+    char* ptr = (char*)mapping_addr;
+    memset(ptr, 0, PAGE_SIZE * 2);
+
+    // Unmap the second page.
+    zx_vmar_unmap(zx_vmar_root_self(), mapping_addr + PAGE_SIZE, PAGE_SIZE);
+
+    char buffer[PAGE_SIZE * 2];
+    size_t actual_read;
+
+    // First page succeeds.
+    EXPECT_EQ(zx_process_read_memory(zx_process_self(), mapping_addr, buffer, PAGE_SIZE, &actual_read),
+              ZX_OK);
+    EXPECT_EQ(actual_read, PAGE_SIZE);
+
+    // Second page fails.
+    EXPECT_EQ(zx_process_read_memory(zx_process_self(), mapping_addr + PAGE_SIZE, buffer, PAGE_SIZE, &actual_read),
+              ZX_ERR_NO_MEMORY);
+
+    // Reading the whole region succeeds, but only reads the first page.
+    EXPECT_EQ(zx_process_read_memory(zx_process_self(), mapping_addr, buffer, PAGE_SIZE * 2, &actual_read),
+              ZX_OK);
+    EXPECT_EQ(actual_read, PAGE_SIZE);
+
+    // Read at the boundary straddling the pages.
+    EXPECT_EQ(zx_process_read_memory(zx_process_self(), mapping_addr + PAGE_SIZE - 1, buffer, 2, &actual_read), ZX_OK);
+    EXPECT_EQ(actual_read, 1);
+
+    // Unmap the left over first page.
+    EXPECT_EQ(zx_vmar_unmap(zx_vmar_root_self(), mapping_addr, PAGE_SIZE), ZX_OK);
+
+    END_TEST;
 }
+
+bool partial_unmap_and_write() {
+    BEGIN_TEST;
+
+    // Map a two-page VMO.
+    zx_handle_t vmo;
+    ASSERT_EQ(zx_vmo_create(PAGE_SIZE * 2, 0, &vmo), ZX_OK);
+    uintptr_t mapping_addr;
+    ASSERT_EQ(zx_vmar_map(zx_vmar_root_self(), 0, vmo, 0, PAGE_SIZE * 2,
+                          ZX_VM_FLAG_PERM_READ | ZX_VM_FLAG_PERM_WRITE,
+                          &mapping_addr),
+              ZX_OK);
+    EXPECT_EQ(zx_handle_close(vmo), ZX_OK);
+
+    char* ptr = (char*)mapping_addr;
+    memset(ptr, 0, PAGE_SIZE * 2);
+
+    // Unmap the second page.
+    zx_vmar_unmap(zx_vmar_root_self(), mapping_addr + PAGE_SIZE, PAGE_SIZE);
+
+    char buffer[PAGE_SIZE * 2];
+    size_t actual_written;
+    memset(buffer, 0, PAGE_SIZE * 2);
+
+    // First page succeeds.
+    EXPECT_EQ(zx_process_write_memory(zx_process_self(), mapping_addr, buffer, PAGE_SIZE, &actual_written),
+              ZX_OK);
+    EXPECT_EQ(actual_written, PAGE_SIZE);
+
+    // Second page fails.
+    EXPECT_EQ(zx_process_write_memory(zx_process_self(), mapping_addr + PAGE_SIZE, buffer, PAGE_SIZE, &actual_written),
+              ZX_ERR_NO_MEMORY);
+
+    // Writing to the whole region succeeds, but only writes the first page.
+    EXPECT_EQ(zx_process_write_memory(zx_process_self(), mapping_addr, buffer, PAGE_SIZE * 2, &actual_written),
+              ZX_OK);
+    EXPECT_EQ(actual_written, PAGE_SIZE);
+
+    // Write at the boundary straddling the pages.
+    EXPECT_EQ(zx_process_write_memory(zx_process_self(), mapping_addr + PAGE_SIZE - 1, buffer, 2, &actual_written), ZX_OK);
+    EXPECT_EQ(actual_written, 1);
+
+    // Unmap the left over first page.
+    EXPECT_EQ(zx_vmar_unmap(zx_vmar_root_self(), mapping_addr, PAGE_SIZE), ZX_OK);
+
+    END_TEST;
+}
+
+bool partial_unmap_with_vmar_offset() {
+    BEGIN_TEST;
+
+    constexpr size_t kOffset = 0x1000;
+    constexpr size_t kVmoSize = PAGE_SIZE * 10;
+    // Map a VMO, using an offset into the VMO.
+    zx_handle_t vmo;
+    ASSERT_EQ(zx_vmo_create(kVmoSize, 0, &vmo), ZX_OK);
+    uintptr_t mapping_addr;
+    ASSERT_EQ(zx_vmar_map(zx_vmar_root_self(), 0, vmo, kOffset, kVmoSize - kOffset,
+                          ZX_VM_FLAG_PERM_READ | ZX_VM_FLAG_PERM_WRITE,
+                          &mapping_addr),
+              ZX_OK);
+    EXPECT_EQ(zx_handle_close(vmo), ZX_OK);
+
+    char* ptr = (char*)mapping_addr;
+    memset(ptr, 0, kVmoSize - kOffset);
+
+    // Make sure both reads and writes to both the beginning and the end are allowed.
+    char buffer[kVmoSize - kOffset];
+    size_t actual;
+    EXPECT_EQ(zx_process_write_memory(zx_process_self(), mapping_addr, buffer, kVmoSize - kOffset, &actual), ZX_OK);
+    EXPECT_EQ(actual, kVmoSize - kOffset);
+
+    EXPECT_EQ(zx_process_read_memory(zx_process_self(), mapping_addr, buffer, kVmoSize - kOffset, &actual), ZX_OK);
+    EXPECT_EQ(actual, kVmoSize - kOffset);
+
+    // That reads and writes right at the end are OK.
+    EXPECT_EQ(zx_process_write_memory(zx_process_self(), mapping_addr + kVmoSize - kOffset - 1, buffer, 1, &actual),
+              ZX_OK);
+    EXPECT_EQ(zx_process_read_memory(zx_process_self(), mapping_addr + kVmoSize - kOffset - 1, buffer, 1, &actual),
+              ZX_OK);
+
+    // That reads and writes one past the end fail.
+    EXPECT_EQ(zx_process_write_memory(zx_process_self(), mapping_addr + kVmoSize - kOffset, buffer, 1, &actual),
+              ZX_ERR_NO_MEMORY);
+    EXPECT_EQ(zx_process_read_memory(zx_process_self(), mapping_addr + kVmoSize - kOffset, buffer, 1, &actual),
+              ZX_ERR_NO_MEMORY);
+
+    // And crossing the boundary works as expected.
+    EXPECT_EQ(zx_process_write_memory(zx_process_self(), mapping_addr + kVmoSize - kOffset - 1, buffer, 2, &actual),
+              ZX_OK);
+    EXPECT_EQ(actual, 1);
+    EXPECT_EQ(zx_process_read_memory(zx_process_self(), mapping_addr + kVmoSize - kOffset - 1, buffer, 2, &actual),
+              ZX_OK);
+    EXPECT_EQ(actual, 1);
+
+    END_TEST;
+}
+
+} // namespace
 
 BEGIN_TEST_CASE(vmar_tests)
 RUN_TEST(destroy_root_test);
@@ -1846,6 +2015,9 @@ RUN_TEST(protect_multiple_test);
 RUN_TEST(protect_over_demand_paged_test);
 RUN_TEST(protect_large_uncommitted_test);
 RUN_TEST(unmap_large_uncommitted_test);
+RUN_TEST(partial_unmap_and_read);
+RUN_TEST(partial_unmap_and_write);
+RUN_TEST(partial_unmap_with_vmar_offset);
 END_TEST_CASE(vmar_tests)
 
 #ifndef BUILD_COMBINED_TESTS

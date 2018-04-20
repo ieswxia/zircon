@@ -11,14 +11,12 @@ MODULE_GROUP := core
 
 MODULE_SRCS += \
     $(LOCAL_DIR)/crashlogger.cpp \
-    $(LOCAL_DIR)/backtrace.cpp \
-    $(LOCAL_DIR)/dso-list.cpp \
     $(LOCAL_DIR)/dump-pt.cpp \
-    $(LOCAL_DIR)/utils.cpp \
 
 MODULE_NAME := crashlogger
 
 MODULE_STATIC_LIBS := \
+    system/ulib/inspector \
     system/ulib/zxcpp \
     system/ulib/fbl \
     system/ulib/pretty \

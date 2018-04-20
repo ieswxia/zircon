@@ -1,4 +1,0 @@
-module example_1
-
-struct Point {
-}

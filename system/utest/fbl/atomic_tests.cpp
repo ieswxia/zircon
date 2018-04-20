@@ -12,50 +12,52 @@ namespace {
 bool atomic_explicit_declarations_test() {
     BEGIN_TEST;
 
-    fbl::atomic<char> zero_char(0);
-    fbl::atomic<signed char> zero_schar(0);
-    fbl::atomic<unsigned char> zero_uchar(0);
-    fbl::atomic<short> zero_short(0);
-    fbl::atomic<unsigned short> zero_ushort(0);
-    fbl::atomic<int> zero_int(0);
-    fbl::atomic<unsigned int> zero_uint(0);
-    fbl::atomic<long> zero_long(0);
-    fbl::atomic<unsigned long> zero_ulong(0);
-    fbl::atomic<long long> zero_llong(0);
-    fbl::atomic<unsigned long long> zero_ullong(0);
+    [[gnu::unused]] fbl::atomic<char> zero_char(0);
+    [[gnu::unused]] fbl::atomic<signed char> zero_schar(0);
+    [[gnu::unused]] fbl::atomic<unsigned char> zero_uchar(0);
+    [[gnu::unused]] fbl::atomic<short> zero_short(0);
+    [[gnu::unused]] fbl::atomic<unsigned short> zero_ushort(0);
+    [[gnu::unused]] fbl::atomic<int> zero_int(0);
+    [[gnu::unused]] fbl::atomic<unsigned int> zero_uint(0);
+    [[gnu::unused]] fbl::atomic<long> zero_long(0);
+    [[gnu::unused]] fbl::atomic<unsigned long> zero_ulong(0);
+    [[gnu::unused]] fbl::atomic<long long> zero_llong(0);
+    [[gnu::unused]] fbl::atomic<unsigned long long> zero_ullong(0);
 
-    fbl::atomic<intptr_t> zero_intptr_t(0);
-    fbl::atomic<uintptr_t> zero_uintptr_t(0);
-    fbl::atomic<size_t> zero_size_t(0);
-    fbl::atomic<ptrdiff_t> zero_ptrdiff_t(0);
-    fbl::atomic<intmax_t> zero_intmax_t(0);
-    fbl::atomic<uintmax_t> zero_uintmax_t(0);
+    [[gnu::unused]] fbl::atomic<intptr_t> zero_intptr_t(0);
+    [[gnu::unused]] fbl::atomic<uintptr_t> zero_uintptr_t(0);
+    [[gnu::unused]] fbl::atomic<size_t> zero_size_t(0);
+    [[gnu::unused]] fbl::atomic<ptrdiff_t> zero_ptrdiff_t(0);
+    [[gnu::unused]] fbl::atomic<intmax_t> zero_intmax_t(0);
+    [[gnu::unused]] fbl::atomic<uintmax_t> zero_uintmax_t(0);
 
-    fbl::atomic<int8_t> zero_int8_t(0);
-    fbl::atomic<uint8_t> zero_uint8_t(0);
-    fbl::atomic<int16_t> zero_int16_t(0);
-    fbl::atomic<uint16_t> zero_uint16_t(0);
-    fbl::atomic<int32_t> zero_int32_t(0);
-    fbl::atomic<uint32_t> zero_uint32_t(0);
-    fbl::atomic<int64_t> zero_int64_t(0);
-    fbl::atomic<uint64_t> zero_uint64_t(0);
+    [[gnu::unused]] fbl::atomic<int8_t> zero_int8_t(0);
+    [[gnu::unused]] fbl::atomic<uint8_t> zero_uint8_t(0);
+    [[gnu::unused]] fbl::atomic<int16_t> zero_int16_t(0);
+    [[gnu::unused]] fbl::atomic<uint16_t> zero_uint16_t(0);
+    [[gnu::unused]] fbl::atomic<int32_t> zero_int32_t(0);
+    [[gnu::unused]] fbl::atomic<uint32_t> zero_uint32_t(0);
+    [[gnu::unused]] fbl::atomic<int64_t> zero_int64_t(0);
+    [[gnu::unused]] fbl::atomic<uint64_t> zero_uint64_t(0);
 
-    fbl::atomic<int_least8_t> zero_int_least8_t(0);
-    fbl::atomic<uint_least8_t> zero_uint_least8_t(0);
-    fbl::atomic<int_least16_t> zero_int_least16_t(0);
-    fbl::atomic<uint_least16_t> zero_uint_least16_t(0);
-    fbl::atomic<int_least32_t> zero_int_least32_t(0);
-    fbl::atomic<uint_least32_t> zero_uint_least32_t(0);
-    fbl::atomic<int_least64_t> zero_int_least64_t(0);
-    fbl::atomic<uint_least64_t> zero_uint_least64_t(0);
-    fbl::atomic<int_fast8_t> zero_int_fast8_t(0);
-    fbl::atomic<uint_fast8_t> zero_uint_fast8_t(0);
-    fbl::atomic<int_fast16_t> zero_int_fast16_t(0);
-    fbl::atomic<uint_fast16_t> zero_uint_fast16_t(0);
-    fbl::atomic<int_fast32_t> zero_int_fast32_t(0);
-    fbl::atomic<uint_fast32_t> zero_uint_fast32_t(0);
-    fbl::atomic<int_fast64_t> zero_int_fast64_t(0);
-    fbl::atomic<uint_fast64_t> zero_uint_fast64_t(0);
+    [[gnu::unused]] fbl::atomic<int_least8_t> zero_int_least8_t(0);
+    [[gnu::unused]] fbl::atomic<uint_least8_t> zero_uint_least8_t(0);
+    [[gnu::unused]] fbl::atomic<int_least16_t> zero_int_least16_t(0);
+    [[gnu::unused]] fbl::atomic<uint_least16_t> zero_uint_least16_t(0);
+    [[gnu::unused]] fbl::atomic<int_least32_t> zero_int_least32_t(0);
+    [[gnu::unused]] fbl::atomic<uint_least32_t> zero_uint_least32_t(0);
+    [[gnu::unused]] fbl::atomic<int_least64_t> zero_int_least64_t(0);
+    [[gnu::unused]] fbl::atomic<uint_least64_t> zero_uint_least64_t(0);
+    [[gnu::unused]] fbl::atomic<int_fast8_t> zero_int_fast8_t(0);
+    [[gnu::unused]] fbl::atomic<uint_fast8_t> zero_uint_fast8_t(0);
+    [[gnu::unused]] fbl::atomic<int_fast16_t> zero_int_fast16_t(0);
+    [[gnu::unused]] fbl::atomic<uint_fast16_t> zero_uint_fast16_t(0);
+    [[gnu::unused]] fbl::atomic<int_fast32_t> zero_int_fast32_t(0);
+    [[gnu::unused]] fbl::atomic<uint_fast32_t> zero_uint_fast32_t(0);
+    [[gnu::unused]] fbl::atomic<int_fast64_t> zero_int_fast64_t(0);
+    [[gnu::unused]] fbl::atomic<uint_fast64_t> zero_uint_fast64_t(0);
+
+    [[gnu::unused]] fbl::atomic<bool> zero_bool(false);
 
     END_TEST;
 }
@@ -63,50 +65,52 @@ bool atomic_explicit_declarations_test() {
 bool atomic_using_declarations_test() {
     BEGIN_TEST;
 
-    fbl::atomic_char zero_char(0);
-    fbl::atomic_schar zero_schar(0);
-    fbl::atomic_uchar zero_uchar(0);
-    fbl::atomic_short zero_short(0);
-    fbl::atomic_ushort zero_ushort(0);
-    fbl::atomic_int zero_int(0);
-    fbl::atomic_uint zero_uint(0);
-    fbl::atomic_long zero_long(0);
-    fbl::atomic_ulong zero_ulong(0);
-    fbl::atomic_llong zero_llong(0);
-    fbl::atomic_ullong zero_ullong(0);
+    [[gnu::unused]] fbl::atomic_char zero_char(0);
+    [[gnu::unused]] fbl::atomic_schar zero_schar(0);
+    [[gnu::unused]] fbl::atomic_uchar zero_uchar(0);
+    [[gnu::unused]] fbl::atomic_short zero_short(0);
+    [[gnu::unused]] fbl::atomic_ushort zero_ushort(0);
+    [[gnu::unused]] fbl::atomic_int zero_int(0);
+    [[gnu::unused]] fbl::atomic_uint zero_uint(0);
+    [[gnu::unused]] fbl::atomic_long zero_long(0);
+    [[gnu::unused]] fbl::atomic_ulong zero_ulong(0);
+    [[gnu::unused]] fbl::atomic_llong zero_llong(0);
+    [[gnu::unused]] fbl::atomic_ullong zero_ullong(0);
 
-    fbl::atomic_intptr_t zero_intptr_t(0);
-    fbl::atomic_uintptr_t zero_uintptr_t(0);
-    fbl::atomic_size_t zero_size_t(0);
-    fbl::atomic_ptrdiff_t zero_ptrdiff_t(0);
-    fbl::atomic_intmax_t zero_intmax_t(0);
-    fbl::atomic_uintmax_t zero_uintmax_t(0);
+    [[gnu::unused]] fbl::atomic_intptr_t zero_intptr_t(0);
+    [[gnu::unused]] fbl::atomic_uintptr_t zero_uintptr_t(0);
+    [[gnu::unused]] fbl::atomic_size_t zero_size_t(0);
+    [[gnu::unused]] fbl::atomic_ptrdiff_t zero_ptrdiff_t(0);
+    [[gnu::unused]] fbl::atomic_intmax_t zero_intmax_t(0);
+    [[gnu::unused]] fbl::atomic_uintmax_t zero_uintmax_t(0);
 
-    fbl::atomic_int8_t zero_int8_t(0);
-    fbl::atomic_uint8_t zero_uint8_t(0);
-    fbl::atomic_int16_t zero_int16_t(0);
-    fbl::atomic_uint16_t zero_uint16_t(0);
-    fbl::atomic_int32_t zero_int32_t(0);
-    fbl::atomic_uint32_t zero_uint32_t(0);
-    fbl::atomic_int64_t zero_int64_t(0);
-    fbl::atomic_uint64_t zero_uint64_t(0);
+    [[gnu::unused]] fbl::atomic_int8_t zero_int8_t(0);
+    [[gnu::unused]] fbl::atomic_uint8_t zero_uint8_t(0);
+    [[gnu::unused]] fbl::atomic_int16_t zero_int16_t(0);
+    [[gnu::unused]] fbl::atomic_uint16_t zero_uint16_t(0);
+    [[gnu::unused]] fbl::atomic_int32_t zero_int32_t(0);
+    [[gnu::unused]] fbl::atomic_uint32_t zero_uint32_t(0);
+    [[gnu::unused]] fbl::atomic_int64_t zero_int64_t(0);
+    [[gnu::unused]] fbl::atomic_uint64_t zero_uint64_t(0);
 
-    fbl::atomic_int_least8_t zero_int_least8_t(0);
-    fbl::atomic_uint_least8_t zero_uint_least8_t(0);
-    fbl::atomic_int_least16_t zero_int_least16_t(0);
-    fbl::atomic_uint_least16_t zero_uint_least16_t(0);
-    fbl::atomic_int_least32_t zero_int_least32_t(0);
-    fbl::atomic_uint_least32_t zero_uint_least32_t(0);
-    fbl::atomic_int_least64_t zero_int_least64_t(0);
-    fbl::atomic_uint_least64_t zero_uint_least64_t(0);
-    fbl::atomic_int_fast8_t zero_int_fast8_t(0);
-    fbl::atomic_uint_fast8_t zero_uint_fast8_t(0);
-    fbl::atomic_int_fast16_t zero_int_fast16_t(0);
-    fbl::atomic_uint_fast16_t zero_uint_fast16_t(0);
-    fbl::atomic_int_fast32_t zero_int_fast32_t(0);
-    fbl::atomic_uint_fast32_t zero_uint_fast32_t(0);
-    fbl::atomic_int_fast64_t zero_int_fast64_t(0);
-    fbl::atomic_uint_fast64_t zero_uint_fast64_t(0);
+    [[gnu::unused]] fbl::atomic_int_least8_t zero_int_least8_t(0);
+    [[gnu::unused]] fbl::atomic_uint_least8_t zero_uint_least8_t(0);
+    [[gnu::unused]] fbl::atomic_int_least16_t zero_int_least16_t(0);
+    [[gnu::unused]] fbl::atomic_uint_least16_t zero_uint_least16_t(0);
+    [[gnu::unused]] fbl::atomic_int_least32_t zero_int_least32_t(0);
+    [[gnu::unused]] fbl::atomic_uint_least32_t zero_uint_least32_t(0);
+    [[gnu::unused]] fbl::atomic_int_least64_t zero_int_least64_t(0);
+    [[gnu::unused]] fbl::atomic_uint_least64_t zero_uint_least64_t(0);
+    [[gnu::unused]] fbl::atomic_int_fast8_t zero_int_fast8_t(0);
+    [[gnu::unused]] fbl::atomic_uint_fast8_t zero_uint_fast8_t(0);
+    [[gnu::unused]] fbl::atomic_int_fast16_t zero_int_fast16_t(0);
+    [[gnu::unused]] fbl::atomic_uint_fast16_t zero_uint_fast16_t(0);
+    [[gnu::unused]] fbl::atomic_int_fast32_t zero_int_fast32_t(0);
+    [[gnu::unused]] fbl::atomic_uint_fast32_t zero_uint_fast32_t(0);
+    [[gnu::unused]] fbl::atomic_int_fast64_t zero_int_fast64_t(0);
+    [[gnu::unused]] fbl::atomic_uint_fast64_t zero_uint_fast64_t(0);
+
+    [[gnu::unused]] fbl::atomic_bool zero_bool(false);
 
     END_TEST;
 }
@@ -128,7 +132,8 @@ constexpr bool IsSameAsSomeBuiltin() {
            fbl::is_same<T, fbl::atomic_long>::value ||
            fbl::is_same<T, fbl::atomic_ulong>::value ||
            fbl::is_same<T, fbl::atomic_llong>::value ||
-           fbl::is_same<T, fbl::atomic_ullong>::value;
+           fbl::is_same<T, fbl::atomic_ullong>::value ||
+           fbl::is_same<T, fbl::atomic_bool>::value;
 }
 
 static_assert(IsSameAsSomeBuiltin<fbl::atomic_intptr_t>(), "");
@@ -163,6 +168,138 @@ static_assert(IsSameAsSomeBuiltin<fbl::atomic_int_fast32_t>(), "");
 static_assert(IsSameAsSomeBuiltin<fbl::atomic_uint_fast32_t>(), "");
 static_assert(IsSameAsSomeBuiltin<fbl::atomic_int_fast64_t>(), "");
 static_assert(IsSameAsSomeBuiltin<fbl::atomic_uint_fast64_t>(), "");
+
+// We should be able to instantiate fbl::atomics of enum type as well.
+
+enum unspecified_enum {
+    kUnspecifiedValue = 23,
+};
+__UNUSED fbl::atomic<unspecified_enum> atomic_unspecified_enum;
+
+enum specified_enum_char : char {
+    kSpecifiedValue_char = 23,
+};
+__UNUSED fbl::atomic<specified_enum_char> atomic_specified_enum_char;
+
+enum specified_enum_signed_char : signed char {
+    kSpecifiedValue_signed_char = 23,
+};
+__UNUSED fbl::atomic<specified_enum_signed_char> atomic_specified_enum_signed_char;
+
+enum specified_enum_unsigned_char : unsigned char {
+    kSpecifiedValue_unsigned_char = 23,
+};
+__UNUSED fbl::atomic<specified_enum_unsigned_char> atomic_specified_enum_unsigned_char;
+
+enum specified_enum_short : short {
+    kSpecifiedValue_short = 23,
+};
+__UNUSED fbl::atomic<specified_enum_short> atomic_specified_enum_short;
+
+enum specified_enum_unsigned_short : unsigned short {
+    kSpecifiedValue_unsigned_short = 23,
+};
+__UNUSED fbl::atomic<specified_enum_unsigned_short> atomic_specified_enum_unsigned_short;
+
+enum specified_enum_int : int {
+    kSpecifiedValue_int = 23,
+};
+__UNUSED fbl::atomic<specified_enum_int> atomic_specified_enum_int;
+
+enum specified_enum_unsigned_int : unsigned int {
+    kSpecifiedValue_unsigned_int = 23,
+};
+__UNUSED fbl::atomic<specified_enum_unsigned_int> atomic_specified_enum_unsigned_int;
+
+enum specified_enum_long : long {
+    kSpecifiedValue_long = 23,
+};
+__UNUSED fbl::atomic<specified_enum_long> atomic_specified_enum_long;
+
+enum specified_enum_unsigned_long : unsigned long{
+    kSpecifiedValue_unsigned_long = 23,
+};
+__UNUSED fbl::atomic<specified_enum_unsigned_long> atomic_specified_enum_unsigned_long;
+
+enum specified_enum_long_long : long long {
+    kSpecifiedValue_long_long = 23,
+};
+__UNUSED fbl::atomic<specified_enum_long_long> atomic_specified_enum_long_long;
+
+enum specified_enum_unsigned_long_long : unsigned long long {
+    kSpecifiedValue_unsigned_long_long = 23,
+};
+__UNUSED fbl::atomic<specified_enum_unsigned_long_long> atomic_specified_enum_unsigned_long_long;
+
+enum specified_enum_bool : bool {
+    kSpecifiedValue_bool = true,
+};
+__UNUSED fbl::atomic<specified_enum_bool> atomic_specified_enum_bool;
+
+enum struct unspecified_struct_enum {
+    kUnspecifiedValueStruct = 23,
+};
+__UNUSED fbl::atomic<unspecified_struct_enum> atomic_unspecified_struct_enum;
+
+enum struct specified_struct_enum_char : char {
+    kSpecifiedStructValue_char = 23,
+};
+__UNUSED fbl::atomic<specified_struct_enum_char> atomic_specified_struct_enum_char;
+
+enum struct specified_struct_enum_signed_char : signed char {
+    kSpecifiedStructValue_signed_char = 23,
+};
+__UNUSED fbl::atomic<specified_struct_enum_signed_char> atomic_specified_struct_enum_signed_char;
+
+enum struct specified_struct_enum_unsigned_char : unsigned char {
+    kSpecifiedStructValue_unsigned_char = 23,
+};
+__UNUSED fbl::atomic<specified_struct_enum_unsigned_char> atomic_specified_struct_enum_unsigned_char;
+
+enum struct specified_struct_enum_short : short {
+    kSpecifiedStructValue_short = 23,
+};
+__UNUSED fbl::atomic<specified_struct_enum_short> atomic_specified_struct_enum_short;
+
+enum struct specified_struct_enum_unsigned_short : unsigned short {
+    kSpecifiedStructValue_unsigned_short = 23,
+};
+__UNUSED fbl::atomic<specified_struct_enum_unsigned_short> atomic_specified_struct_enum_unsigned_short;
+
+enum struct specified_struct_enum_int : int {
+    kSpecifiedStructValue_int = 23,
+};
+__UNUSED fbl::atomic<specified_struct_enum_int> atomic_specified_struct_enum_int;
+
+enum struct specified_struct_enum_unsigned_int : unsigned int {
+    kSpecifiedStructValue_unsigned_int = 23,
+};
+__UNUSED fbl::atomic<specified_struct_enum_unsigned_int> atomic_specified_struct_enum_unsigned_int;
+
+enum struct specified_struct_enum_long : long {
+    kSpecifiedStructValue_long = 23,
+};
+__UNUSED fbl::atomic<specified_struct_enum_long> atomic_specified_struct_enum_long;
+
+enum struct specified_struct_enum_unsigned_long : unsigned long{
+    kSpecifiedStructValue_unsigned_long = 23,
+};
+__UNUSED fbl::atomic<specified_struct_enum_unsigned_long> atomic_specified_struct_enum_unsigned_long;
+
+enum struct specified_struct_enum_long_long : long long {
+    kSpecifiedStructValue_long_long = 23,
+};
+__UNUSED fbl::atomic<specified_struct_enum_long_long> atomic_specified_struct_enum_long_long;
+
+enum struct specified_struct_enum_unsigned_long_long : unsigned long long {
+    kSpecifiedStructValue_unsigned_long_long = 23,
+};
+__UNUSED fbl::atomic<specified_struct_enum_unsigned_long_long> atomic_specified_struct_enum_unsigned_long_long;
+
+enum struct specified_struct_enum_bool : bool {
+    kSpecifiedStructValue_bool = true,
+};
+__UNUSED fbl::atomic<specified_struct_enum_bool> atomic_specified_struct_enum_bool;
 
 bool atomic_wont_compile_test() {
     BEGIN_TEST;
@@ -215,6 +352,15 @@ T test_values[] = {
     23,
     fbl::numeric_limits<T>::min() / 4,
     fbl::numeric_limits<T>::max() / 4,
+};
+
+template <>
+bool test_values<bool>[] = {
+    false,
+    true,
+    true,
+    false,
+    true,
 };
 
 template <typename T>
@@ -503,6 +649,26 @@ volatile_cas_function<T> volatile_cas_functions[] = {
      },
      false}};
 
+enum cas_slots {
+    kExpected = 0,
+    kActual = 1,
+    kDesired = 2,
+};
+
+template <typename T>
+T cas_test_values[] = {
+    22,
+    23,
+    24,
+};
+
+template <>
+bool cas_test_values<bool>[] = {
+    false,
+    true,
+    false,
+};
+
 template <typename T>
 bool compare_exchange_test() {
     for (auto cas : cas_functions<T>) {
@@ -510,10 +676,10 @@ bool compare_exchange_test() {
             for (const auto& failure_order : orders) {
                 {
                     // Failure case
-                    T actual = 23;
+                    T actual = cas_test_values<T>[kActual];
                     fbl::atomic<T> atomic_value(actual);
-                    T expected = 22;
-                    T desired = 24;
+                    T expected = cas_test_values<T>[kExpected];
+                    T desired = cas_test_values<T>[kDesired];
                     EXPECT_FALSE(cas.function(&atomic_value, &expected, desired,
                                               success_order, failure_order),
                                  "compare-exchange shouldn't have succeeded!");
@@ -521,10 +687,10 @@ bool compare_exchange_test() {
                 }
                 {
                     // Success case
-                    T actual = 23;
+                    T actual = cas_test_values<T>[kActual];
                     fbl::atomic<T> atomic_value(actual);
                     T expected = actual;
-                    T desired = 24;
+                    T desired = cas_test_values<T>[kDesired];
                     // Some compare-and-swap functions can spuriously fail.
                     bool succeeded = cas.function(&atomic_value, &expected, desired,
                                                   success_order, failure_order);
@@ -542,10 +708,10 @@ bool compare_exchange_test() {
             for (const auto& failure_order : orders) {
                 {
                     // Failure case
-                    T actual = 23;
+                    T actual = cas_test_values<T>[kActual];
                     fbl::atomic<T> atomic_value(actual);
-                    T expected = 22;
-                    T desired = 24;
+                    T expected = cas_test_values<T>[kExpected];
+                    T desired = cas_test_values<T>[kDesired];
                     EXPECT_FALSE(cas.function(&atomic_value, &expected, desired,
                                               success_order, failure_order),
                                  "compare-exchange shouldn't have succeeded!");
@@ -553,10 +719,10 @@ bool compare_exchange_test() {
                 }
                 {
                     // Success case
-                    T actual = 23;
+                    T actual = cas_test_values<T>[kActual];
                     fbl::atomic<T> atomic_value(actual);
                     T expected = actual;
-                    T desired = 24;
+                    T desired = cas_test_values<T>[kDesired];
                     // Compare-and-swap can spuriously fail.
                     // Some compare-and-swap functions can spuriously fail.
                     bool succeeded = cas.function(&atomic_value, &expected, desired,
@@ -606,6 +772,7 @@ bool atomic_load_store_test() {
     ASSERT_TRUE(load_store_test<unsigned long>());
     ASSERT_TRUE(load_store_test<long long>());
     ASSERT_TRUE(load_store_test<unsigned long long>());
+    ASSERT_TRUE(load_store_test<bool>());
 
     END_TEST;
 }
@@ -624,6 +791,7 @@ bool atomic_exchange_test() {
     ASSERT_TRUE(exchange_test<unsigned long>());
     ASSERT_TRUE(exchange_test<long long>());
     ASSERT_TRUE(exchange_test<unsigned long long>());
+    ASSERT_TRUE(exchange_test<bool>());
 
     END_TEST;
 }
@@ -642,6 +810,7 @@ bool atomic_compare_exchange_test() {
     ASSERT_TRUE(compare_exchange_test<unsigned long>());
     ASSERT_TRUE(compare_exchange_test<long long>());
     ASSERT_TRUE(compare_exchange_test<unsigned long long>());
+    ASSERT_TRUE(compare_exchange_test<bool>());
 
     END_TEST;
 }
@@ -661,6 +830,7 @@ static_assert(sizeof(fbl::atomic<long>) == sizeof(long), "");
 static_assert(sizeof(fbl::atomic<unsigned long>) == sizeof(unsigned long), "");
 static_assert(sizeof(fbl::atomic<long long>) == sizeof(long long), "");
 static_assert(sizeof(fbl::atomic<unsigned long long>) == sizeof(unsigned long long), "");
+static_assert(sizeof(fbl::atomic<bool>) == sizeof(bool), "");
 
 static_assert(alignof(fbl::atomic<char>) == alignof(char), "");
 static_assert(alignof(fbl::atomic<signed char>) == alignof(signed char), "");
@@ -673,6 +843,7 @@ static_assert(alignof(fbl::atomic<long>) == alignof(long), "");
 static_assert(alignof(fbl::atomic<unsigned long>) == alignof(unsigned long), "");
 static_assert(alignof(fbl::atomic<long long>) == alignof(long long), "");
 static_assert(alignof(fbl::atomic<unsigned long long>) == alignof(unsigned long long), "");
+static_assert(alignof(fbl::atomic<bool>) == alignof(bool), "");
 
 static_assert(fbl::is_standard_layout<fbl::atomic<char>>::value, "");
 static_assert(fbl::is_standard_layout<fbl::atomic<signed char>>::value, "");
@@ -685,6 +856,7 @@ static_assert(fbl::is_standard_layout<fbl::atomic<long>>::value, "");
 static_assert(fbl::is_standard_layout<fbl::atomic<unsigned long>>::value, "");
 static_assert(fbl::is_standard_layout<fbl::atomic<long long>>::value, "");
 static_assert(fbl::is_standard_layout<fbl::atomic<unsigned long long>>::value, "");
+static_assert(fbl::is_standard_layout<fbl::atomic<bool>>::value, "");
 
 bool atomic_fence_test() {
     BEGIN_TEST;

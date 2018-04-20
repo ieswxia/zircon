@@ -9,8 +9,6 @@
 #include <arch/arm64.h>
 #include <arch/asm_macros.h>
 #include <arch/defines.h>
-#include <arch/efi.h>
-#include <vm/initial_map.h>
 #include <zircon/tls.h>
 
 #ifndef __has_feature
@@ -26,71 +24,33 @@
 tmp                     .req x9
 tmp2                    .req x10
 wtmp2                   .req w10
-index                   .req x11
-index_shift             .req x12
-page_table              .req x13
-new_page_table          .req x14
-phys_offset             .req x15
+page_table              .req x11
 
 cpuid                   .req x19
 page_table0             .req x20
 page_table1             .req x21
-mmu_initial_mapping     .req x22
-vaddr                   .req x23
-paddr                   .req x24
-mapping_size            .req x25
-size                    .req x26
-attr                    .req x27
+kernel_vaddr            .req x22
 
-.section .text.boot, "ax", @progbits
-FUNCTION_LABEL(_start)
-#if FASTBOOT_HEADER
-#include "fastboot-header.S"
-#endif
-FUNCTION(arm_reset)
-    movlit  x9, EFI_BOOT_SIGNATURE
-    ldr     x10, [x1]
-    cmp     x9,x10
-    bne     .Lno_efi
-/* We were launched by EFI with x1 containing system table
-     mmu is on, dcache is on, icache is on
-*/
-    adr_global    x2, _start
-    push_regs     x29, x30
-    bl            efi_boot
-    mov           x20, x0
-    pop_regs      x29, x30
-
-        /* Turn off Dcache and MMU */
-    mrs    x0, CurrentEL
-    cmp    x0, #0x04
-    b.ne   1f
-    mrs    x0, sctlr_el2
-    bic    x0, x0, #1 << 0    // clear SCTLR.M
-    bic    x0, x0, #1 << 2    // clear SCTLR.C
-    msr    sctlr_el2, x0
-    isb
-    b      2f
-1:
-    mrs    x0, sctlr_el1
-    bic    x0, x0, #1 << 0    // clear SCTLR.M
-    bic    x0, x0, #1 << 2    // clear SCTLR.C
-    msr    sctlr_el1, x0
-    isb
-2:
-    mov     x0, x20
-    mov     x1, xzr
-    mov     x2, xzr
-    mov     x3, xzr
-    movlit  x20, (MEMBASE + KERNEL_LOAD_OFFSET)
-    br      x20
-.Lno_efi:
-
-    adrp    tmp, boot_structure_paddr
+// This code is purely position-independent and generates no relocations
+// that need boot-time fixup; gen-kaslr-fixup.sh ensures this (and would
+// ignore it if this code were in .text.boot, so don't put it there).
+.text
+FUNCTION(_start)
+    /* Save the Boot info for the primary CPU only */
+    mrs     cpuid, mpidr_el1
+    ubfx    cpuid, cpuid, #0, #15 /* mask Aff0 and Aff1 fields */
+    cbnz    cpuid, .Lno_save_bootinfo
+    /* save x0 in bootdata_paddr */
+    adrp    tmp, bootdata_paddr
+    str     x0, [tmp, #:lo12:bootdata_paddr]
+    /* save entry point physical address in kernel_entry_paddr */
+    adrp    tmp, kernel_entry_paddr
+    adr     tmp2, _start
+    str     tmp2, [tmp, #:lo12:kernel_entry_paddr]
     adrp    tmp2, arch_boot_el
     mrs     x2, CurrentEL
-    str     x0, [tmp, #:lo12:boot_structure_paddr]
     str     x2, [tmp2, #:lo12:arch_boot_el]
+.Lno_save_bootinfo:
 
     bl      arm64_elX_to_el1
     bl      arch_invalidate_cache_all
@@ -101,207 +61,86 @@ FUNCTION(arm_reset)
     orr     tmp, tmp, #(1<<2)  /* Enable dcache/ucache */
     msr     sctlr_el1, tmp
 
-    /* set up the mmu according to mmu_initial_mappings */
+    // This can be any arbitrary (page-aligned) address >= KERNEL_ASPACE_BASE.
+    // TODO(SEC-31): Choose it randomly.
+    movlit  kernel_vaddr, KERNEL_BASE
 
-    /* load the base of the translation table and clear the table */
+    // The fixup code appears right after the kernel image (at __data_end
+    // in our view).  It expects x0 to contain the actual runtime address
+    // of __code_start.
+    mov     x0, kernel_vaddr
+    bl      __data_end
+
+    /* load the base of the translation tables */
+    adr_global page_table0, tt_trampoline
     adr_global page_table1, arm64_kernel_translation_table
 
     /* Prepare tt_trampoline page table */
     /* Calculate pagetable physical addresses */
     adr_global page_table0, tt_trampoline
 
-    mrs     cpuid, mpidr_el1
-    ubfx    cpuid, cpuid, #0, #15 /* mask Aff0 and Aff1 fields */
+    /* send secondary cpus over to a waiting spot for the primary to finish */
     cbnz    cpuid, .Lmmu_enable_secondary
 
-    mov     tmp, #0
+    /* clear out the kernel's bss using current physical location */
+    /* NOTE: Relies on __bss_start and _end being 16 byte aligned */
+.Ldo_bss:
+    adr_global tmp, __bss_start
+    adr_global tmp2, _end
+    sub     tmp2, tmp2, tmp
+    cbz     tmp2, .Lbss_loop_done
+.Lbss_loop:
+    sub     tmp2, tmp2, #16
+    stp     xzr, xzr, [tmp], #16
+    cbnz    tmp2, .Lbss_loop
+.Lbss_loop_done:
 
-    /* walk through all the entries in the translation table, setting them up */
+    /* set up a functional stack pointer */
+    adr_global tmp, boot_cpu_kstack_end
+    mov     sp, tmp
+
+    /* make sure the boot allocator is given a chance to figure out where
+     * we are loaded in physical memory. */
+    bl      boot_alloc_init
+
+    /* save the physical address the kernel is loaded at */
+    adr_global x0, __code_start
+    adr_global x1, kernel_base_phys
+    str     x0, [x1]
+
+    /* set up the mmu according to mmu_initial_mappings */
+
+    /* clear out the kernel translation table */
+    mov     tmp, #0
 .Lclear_top_page_table_loop:
     str     xzr, [page_table1, tmp, lsl #3]
     add     tmp, tmp, #1
     cmp     tmp, #MMU_KERNEL_PAGE_TABLE_ENTRIES_TOP
     bne     .Lclear_top_page_table_loop
 
-    /* load the address of the mmu_initial_mappings table and start processing */
-    adr_global mmu_initial_mapping, mmu_initial_mappings
+    /* void arm64_boot_map(pte_t* kernel_table0, vaddr_t vaddr, paddr_t paddr, size_t len, pte_t flags); */
 
-.Linitial_mapping_loop:
-/* Read entry of mmu_initial_mappings (likely defined in platform.c) */
-    ldp     paddr, vaddr, [mmu_initial_mapping, #__MMU_INITIAL_MAPPING_PHYS_OFFSET]
-    ldp     size, tmp, [mmu_initial_mapping, #__MMU_INITIAL_MAPPING_SIZE_OFFSET]
+    /* map a large run of physical memory at the base of the kernel's address space */
+    mov     x0, page_table1
+    mov     x1, KERNEL_ASPACE_BASE
+    mov     x2, 0
+    mov     x3, ARCH_PHYSMAP_SIZE
+    movlit  x4, MMU_PTE_KERNEL_DATA_FLAGS
+    bl      arm64_boot_map
 
-    tbzmask tmp, MMU_INITIAL_MAPPING_FLAG_DYNAMIC, .Lnot_dynamic
-    adr     paddr, _start
-    mov     size, x0
-    str     paddr, [mmu_initial_mapping, #__MMU_INITIAL_MAPPING_PHYS_OFFSET]
-    str     size, [mmu_initial_mapping, #__MMU_INITIAL_MAPPING_SIZE_OFFSET]
+    /* map the kernel to a fixed address */
+    /* note: mapping the kernel here with full rwx, this will get locked down later in vm initialization; */
+    mov     x0, page_table1
+    mov     x1, kernel_vaddr
+    adr_global x2, __code_start
+    adr_global x3, _end
+    sub     x3, x3, x2
+    mov     x4, MMU_PTE_KERNEL_RWX_FLAGS
+    bl      arm64_boot_map
 
-.Lnot_dynamic:
-    /* if size == 0, end of list, done with initial mapping */
-    cbz     size, .Linitial_mapping_done
-    mov     mapping_size, size
-
-    /* set up the flags */
-    tbzmask tmp, MMU_INITIAL_MAPPING_FLAG_UNCACHED, .Lnot_uncached
-    movlit  attr, MMU_INITIAL_MAP_STRONGLY_ORDERED
-    b       .Lmem_type_done
-
-.Lnot_uncached:
-    /* is this memory mapped to device/peripherals? */
-    tbzmask tmp, MMU_INITIAL_MAPPING_FLAG_DEVICE, .Lnot_device
-    movlit  attr, MMU_INITIAL_MAP_DEVICE
-    b       .Lmem_type_done
-.Lnot_device:
-
-/* Determine the segment in which the memory resides and set appropriate
- *  attributes.  In order to handle offset kernels, the following rules are
- *  implemented below:
- *      KERNEL_BASE    to __code_start             -read/write (see note below)
- *      __code_start   to __rodata_start (.text)   -read only
- *      __rodata_start to __data_start   (.rodata) -read only, execute never
- *      __data_start   to .....          (.data)   -read/write
- *
- *  The space below __code_start is presently left as read/write (same as .data)
- *   mainly as a workaround for the raspberry pi boot process.  Boot vectors for
- *   secondary CPUs are in this area and need to be updated by cpu0 once the system
- *   is ready to boot the secondary processors.
- *   TODO: handle this via mmu_initial_mapping entries, which may need to be
- *         extended with additional flag types
- */
-.Lmapping_size_loop:
-    movlit  attr, MMU_PTE_KERNEL_DATA_FLAGS
-    movabs  tmp, __code_start
-    subs    size, tmp, vaddr
-    /* If page is below  the entry point (_start) mark as kernel data */
-    b.hi    .Lmem_type_done
-
-    movlit  attr, MMU_PTE_KERNEL_RO_FLAGS
-    movabs  tmp, __rodata_start
-    subs    size, tmp, vaddr
-    b.hi    .Lmem_type_done
-    orr     attr, attr, #MMU_PTE_ATTR_PXN
-    movabs  tmp, __data_start
-    subs    size, tmp, vaddr
-    b.hi    .Lmem_type_done
-    movlit  attr, MMU_PTE_KERNEL_DATA_FLAGS
-    movabs  tmp, _end
-    subs    size, tmp, vaddr
-    b.lo    . /* Error: _end < vaddr */
-    cmp     mapping_size, size
-    b.lo    . /* Error: mapping_size < size => RAM size too small for data/bss */
-    mov     size, mapping_size
-
-.Lmem_type_done:
-    subs    mapping_size, mapping_size, size
-    b.lo    . /* Error: mapping_size < size (RAM size too small for code/rodata?) */
-
-    /* Check that paddr, vaddr and size are page aligned */
-    orr     tmp, vaddr, paddr
-    orr     tmp, tmp, size
-    tst     tmp, #(1 << MMU_KERNEL_PAGE_SIZE_SHIFT) - 1
-    bne     . /* Error: not page aligned */
-
-    /* Clear top bits of virtual address (should be all set) */
-    eor     vaddr, vaddr, #(~0 << MMU_KERNEL_SIZE_SHIFT)
-
-    /* Check that top bits were all set */
-    tst     vaddr, #(~0 << MMU_KERNEL_SIZE_SHIFT)
-    bne     . /* Error: vaddr out of range */
-
-.Lmap_range_top_loop:
-    /* Select top level page table */
-    mov     page_table, page_table1
-    mov     index_shift, #MMU_KERNEL_TOP_SHIFT
-
-    lsr     index, vaddr, index_shift
-
-
-/* determine the type of page table entry to use given alignment and size
- *  of the chunk of memory we are mapping
- */
-.Lmap_range_one_table_loop:
-    /* Check if current level allow block descriptors */
-    cmp     index_shift, #MMU_PTE_DESCRIPTOR_BLOCK_MAX_SHIFT
-    b.hi    .Lmap_range_need_page_table
-
-    /* Check if paddr and vaddr alignment allows a block descriptor */
-    orr     tmp2, vaddr, paddr
-    lsr     tmp, tmp2, index_shift
-    lsl     tmp, tmp, index_shift
-    cmp     tmp, tmp2
-    b.ne    .Lmap_range_need_page_table
-
-    /* Check if size is large enough for a block mapping */
-    lsr     tmp, size, index_shift
-    cbz     tmp, .Lmap_range_need_page_table
-
-    /* Select descriptor type, page for level 3, block for level 0-2 */
-    orr     tmp, attr, #MMU_PTE_L3_DESCRIPTOR_PAGE
-    cmp     index_shift, MMU_KERNEL_PAGE_SIZE_SHIFT
-    beq     .Lmap_range_l3
-    orr     tmp, attr, #MMU_PTE_L012_DESCRIPTOR_BLOCK
-.Lmap_range_l3:
-
-    /* Write page table entry */
-    orr     tmp, tmp, paddr
-    str     tmp, [page_table, index, lsl #3]
-
-    /* Move to next page table entry */
-    mov     tmp, #1
-    lsl     tmp, tmp, index_shift
-    add     vaddr, vaddr, tmp
-    add     paddr, paddr, tmp
-    subs    size, size, tmp
-    /* TODO: add local loop if next entry is in the same page table */
-    b.ne    .Lmap_range_top_loop /* size != 0 */
-
-    /* Restore top bits of virtual address (should be all set) */
-    eor     vaddr, vaddr, #(~0 << MMU_KERNEL_SIZE_SHIFT)
-    /* Move to next subtype of ram mmu_initial_mappings entry */
-    cbnz     mapping_size, .Lmapping_size_loop
-
-    /* Move to next mmu_initial_mappings entry */
-    add     mmu_initial_mapping, mmu_initial_mapping, __MMU_INITIAL_MAPPING_SIZE
-    b       .Linitial_mapping_loop
-
-.Lmap_range_need_page_table:
-    /* Check if page table entry is unused */
-    ldr     new_page_table, [page_table, index, lsl #3]
-    cbnz    new_page_table, .Lmap_range_has_page_table
-
-    /* Calculate phys offset (needed for memory allocation) */
-.Lphys_offset:
-    adr     phys_offset, .Lphys_offset /* phys */
-    movabs  tmp, .Lphys_offset /* virt */
-    sub     phys_offset, tmp, phys_offset
-
-    /* Allocate new page table */
-    calloc_bootmem_aligned new_page_table, tmp, tmp2, MMU_KERNEL_PAGE_SIZE_SHIFT, phys_offset
-
-    /* Write page table entry (with allocated page table) */
-    orr     new_page_table, new_page_table, #MMU_PTE_L012_DESCRIPTOR_TABLE
-    str     new_page_table, [page_table, index, lsl #3]
-
-.Lmap_range_has_page_table:
-    /* Check descriptor type */
-    and     tmp, new_page_table, #MMU_PTE_DESCRIPTOR_MASK
-    cmp     tmp, #MMU_PTE_L012_DESCRIPTOR_TABLE
-    b.ne    . /* Error: entry already in use (as a block entry) */
-
-    /* switch to next page table level */
-    bic     page_table, new_page_table, #MMU_PTE_DESCRIPTOR_MASK
-    mov     tmp, #~0
-    lsl     tmp, tmp, index_shift
-    bic     tmp, vaddr, tmp
-    sub     index_shift, index_shift, #(MMU_KERNEL_PAGE_SIZE_SHIFT - 3)
-    lsr     index, tmp, index_shift
-
-    b       .Lmap_range_one_table_loop
-
-.Linitial_mapping_done:
-
-    /* Prepare tt_trampoline page table */
+    /* Prepare tt_trampoline page table.
+     * this will identity map the 1GB page holding the physical address of this code.
+     * Used to temporarily help us get switched to the upper virtual address. */
 
     /* Zero tt_trampoline translation tables */
     mov     tmp, #0
@@ -317,14 +156,16 @@ FUNCTION(arm_reset)
     movlit  tmp2, MMU_PTE_IDENT_FLAGS
     add     tmp2, tmp2, tmp, lsl #MMU_IDENT_TOP_SHIFT  /* tmp2 = pt entry */
 
-    str     tmp2, [page_table0, tmp, lsl #3]     /* tt_trampoline[paddr index] = pt entry */
+    str     tmp2, [page_table0, tmp, lsl #3]  /* tt_trampoline[paddr index] = pt entry */
 
+    /* mark page tables as set up, so secondary cpus can fall through */
     adr_global tmp, page_tables_not_ready
     str     wzr, [tmp]
     b       .Lpage_tables_ready
 
 .Lmmu_enable_secondary:
     adr_global tmp, page_tables_not_ready
+    /* trap any secondary cpus until the primary has set up the page tables */
 .Lpage_tables_not_ready:
     ldr     wtmp2, [tmp]
     cbnz    wtmp2, .Lpage_tables_not_ready
@@ -365,8 +206,12 @@ FUNCTION(arm_reset)
 .Lmmu_on_pc:
     isb
 
-    /* Jump to virtual code address */
-    movabs  tmp, .Lmmu_on_vaddr
+    // Map our current physical PC to the virtual PC and jump there.
+    // PC = next_PC - __code_start + kernel_vaddr
+    adr     tmp, .Lmmu_on_vaddr
+    adr     tmp2, __code_start
+    sub     tmp, tmp, tmp2
+    add     tmp, tmp, kernel_vaddr
     br      tmp
 
 .Lmmu_on_vaddr:
@@ -376,27 +221,13 @@ FUNCTION(arm_reset)
     msr     tcr_el1, tmp
     isb
 
-
     /* Invalidate TLB */
     tlbi    vmalle1
     isb
 
     cbnz    cpuid, .Lsecondary_boot
 
-    // Clear out the bss excluding the kernel translation table ("prebss").
-    // NOTE: Relies on __post_prebss_bss_start and __bss_end
-    // being 16 byte aligned.
-.L__do_bss:
-    adr_global tmp, __post_prebss_bss_start
-    adr_global tmp2, __bss_end
-    sub     tmp2, tmp2, tmp
-    cbz     tmp2, .L__bss_loop_done
-.L__bss_loop:
-    sub     tmp2, tmp2, #16
-    stp     xzr, xzr, [tmp], #16
-    cbnz    tmp2, .L__bss_loop
-.L__bss_loop_done:
-
+    // set up the boot stack for real
     adr_global tmp, boot_cpu_kstack_end
     mov     sp, tmp
 
@@ -415,9 +246,10 @@ FUNCTION(arm_reset)
 
     // Choose a good (ideally random) stack-guard value as early as possible.
     bl      choose_stack_guard
-    str	    x0, [tmp, #ZX_TLS_STACK_GUARD_OFFSET]
+    mrs     tmp, tpidr_el1
+    str     x0, [tmp, #ZX_TLS_STACK_GUARD_OFFSET]
     // Don't leak the value to other code.
-    mov	    x0, xzr
+    mov     x0, xzr
 
     bl  lk_main
     b   .
@@ -433,7 +265,7 @@ FUNCTION(arm_reset)
 .Lunsupported_cpu_trap:
     wfe
     b       .Lunsupported_cpu_trap
-END_FUNCTION(arm_reset)
+END_FUNCTION(_start)
 
 .ltorg
 
@@ -444,9 +276,12 @@ END_FUNCTION(arm_reset)
 DATA(arch_boot_el)
     .quad 0xdeadbeef00ff00ff
 END_DATA(arch_boot_el)
-DATA(boot_structure_paddr)
-    .quad 0x00ff00ffdeadbeef
-END_DATA(boot_structure_paddr)
+DATA(bootdata_paddr)
+    .quad -1
+END_DATA(bootdata_paddr)
+DATA(kernel_entry_paddr)
+    .quad -1
+END_DATA(kernel_entry_paddr)
 
 DATA(page_tables_not_ready)
     .long       1
@@ -483,3 +318,7 @@ END_DATA(boot_cpu_unsafe_kstack)
 DATA(tt_trampoline)
     .skip 8 * MMU_PAGE_TABLE_ENTRIES_IDENT
 END_DATA(tt_trampoline)
+
+// This symbol is used by image.S.
+.global IMAGE_ELF_ENTRY
+IMAGE_ELF_ENTRY = _start

@@ -7,12 +7,13 @@
 
 #include <err.h>
 #include <inttypes.h>
-#include <kernel/vm.h>
 #include <lib/console.h>
 #include <stdio.h>
 #include <string.h>
 #include <vm/page.h>
+#include <vm/physmap.h>
 #include <vm/pmm.h>
+#include <vm/vm.h>
 
 const char* page_state_to_string(unsigned int state) {
     switch (state) {
@@ -63,7 +64,7 @@ static int cmd_vm_page(int argc, const cmd_args* argv, uint32_t flags) {
         vm_page* page = reinterpret_cast<vm_page*>(argv[2].u);
 
         paddr_t pa = vm_page_to_paddr(page);
-        void* ptr = paddr_to_kvaddr(pa);
+        void* ptr = paddr_to_physmap(pa);
         if (!ptr) {
             printf("bad page or page not mapped in kernel space\n");
             return -1;

@@ -1,4 +1,4 @@
-// Copyright 2017 The Fuchsia Authors. All rights reserved.
+// Copyright 2018 The Fuchsia Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
@@ -14,45 +14,18 @@
 namespace ddk {
 namespace internal {
 
-DECLARE_HAS_MEMBER_FN(has_block_set_callbacks, BlockSetCallbacks);
-DECLARE_HAS_MEMBER_FN(has_block_get_info, BlockGetInfo);
-DECLARE_HAS_MEMBER_FN(has_block_read, BlockRead);
-DECLARE_HAS_MEMBER_FN(has_block_write, BlockWrite);
+DECLARE_HAS_MEMBER_FN_WITH_SIGNATURE(has_block_query, BlockQuery,
+                                     void (C::*)(block_info_t*, size_t*));
+DECLARE_HAS_MEMBER_FN_WITH_SIGNATURE(has_block_queue, BlockQueue, void (C::*)(block_op_t*));
 
 template <typename D>
 constexpr void CheckBlockProtocolSubclass() {
-    static_assert(internal::has_block_set_callbacks<D>::value,
-                  "BlockProtocol subclasses must implement BlockSetCallbacks");
-    static_assert(fbl::is_same<decltype(&D::BlockSetCallbacks),
-                                void (D::*)(block_callbacks_t*)>::value,
-                  "BlockSetCallbacks must be a non-static member function with signature "
-                  "'void BlockSetCallbacks(block_callbacks_t* cb)', and be visible to "
-                  "ddk::BlockProtocol<D> (either because they are public, or because of "
-                  "friendship).");
-    static_assert(internal::has_block_get_info<D>::value,
-                  "BlockProtocol subclasses must implement BlockGetInfo");
-    static_assert(fbl::is_same<decltype(&D::BlockGetInfo),
-                                void (D::*)(block_info_t*)>::value,
-                  "BlockStop must be a non-static member function with signature "
-                  "'void BlockGetInfo(block_info_t* info)', and be visible to "
-                  "ddk::BlockProtocol<D> (either because they are public, or because "
-                  "of friendship).");
-    static_assert(internal::has_block_read<D>::value,
-                  "BlockProtocol subclasses must implement BlockRead");
-    static_assert(fbl::is_same<decltype(&D::BlockRead),
-                                void (D::*)(zx_handle_t, uint64_t, uint64_t, uint64_t, void*)>::value,
-                  "BlockRead must be a non-static member function with signature "
-                  "'void BlockRead(zx_handle_t, uint64_t, uint64_t, uint64_t, void*)', and be "
-                  "visible to ddk::BlockProtocol<D> (either because they are public, or because of "
-                  "friendship).");
-    static_assert(internal::has_block_write<D>::value,
-                  "BlockProtocol subclasses must implement BlockWrite");
-    static_assert(fbl::is_same<decltype(&D::BlockWrite),
-                                void (D::*)(zx_handle_t, uint64_t, uint64_t, uint64_t, void*)>::value,
-                  "BlockWrite must be a non-static member function with signature "
-                  "'void BlockWrite(zx_handle_t, uint64_t, uint64_t, uint64_t, void*)', and be "
-                  "visible to ddk::BlockProtocol<D> (either because they are public, or because of "
-                  "friendship).");
+    static_assert(internal::has_block_query<D>::value,
+                  "BlockProtocol subclasses must implement "
+                  "BlockQuery(block_info_t* info_out, size_t* block_op_size_out)");
+    static_assert(internal::has_block_queue<D>::value,
+                  "BlockProtocol subclasses must implement "
+                  "BlockQueue(block_op_t* txn)");
 }
 
 }  // namespace internal

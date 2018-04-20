@@ -1,7 +1,7 @@
 #include "asan_impl.h"
 #include "futex_impl.h"
 #include "libc.h"
-#include "pthread_impl.h"
+#include "threads_impl.h"
 #include "zircon_impl.h"
 #include "stdio_impl.h"
 
@@ -169,7 +169,7 @@ _Noreturn void __pthread_exit(void* result) {
 
     __tls_run_dtors();
 
-    __pthread_tsd_run_dtors();
+    __thread_tsd_run_dtors();
 
     __dl_thread_cleanup();
 

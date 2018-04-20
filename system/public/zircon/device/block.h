@@ -49,7 +49,7 @@
 #define IOCTL_BLOCK_FVM_EXTEND \
     IOCTL(IOCTL_KIND_DEFAULT, IOCTL_FAMILY_BLOCK, 12)
 // Shink a virtual partition. Returns "success" if ANY slices are
-// freed.
+// freed, even if part of the requested range contains unallocated slices.
 #define IOCTL_BLOCK_FVM_SHRINK \
     IOCTL(IOCTL_KIND_DEFAULT, IOCTL_FAMILY_BLOCK, 13)
 #define IOCTL_BLOCK_FVM_DESTROY \
@@ -57,12 +57,33 @@
 // Returns the total number of vslices and slice size for an FVM partition
 #define IOCTL_BLOCK_FVM_QUERY \
     IOCTL(IOCTL_KIND_DEFAULT, IOCTL_FAMILY_BLOCK, 15)
-// Given a number of initial vslices, returns the number of contiguous allocated (or unallocated)
-// vslices starting from each vslice.
+// Given a number of initial vslices, returns the number of contiguous allocated
+// (or unallocated) vslices starting from each vslice.
 #define IOCTL_BLOCK_FVM_VSLICE_QUERY \
     IOCTL(IOCTL_KIND_DEFAULT, IOCTL_FAMILY_BLOCK, 16)
+// Atomically marks a vpartition (by instance GUID) as inactive, while finding
+// another partition (by instance GUID) and marking it as active.
+//
+// If the "old" partition does not exist, the GUID is ignored.
+// If the "old" partition is the same as the "new" partition, the "old"
+// GUID is ignored (as in, "Upgrade" only activates).
+// If the "new" partition does not exist, |ZX_ERR_NOT_FOUND| is returned.
+//
+// This function does not destroy the "old" partition, it just marks it as
+// inactive -- to reclaim that space, the "old" partition must be explicitly
+// destroyed.  This destruction can also occur automatically when the FVM driver
+// is rebound (i.e., on reboot).
+//
+// This function may be useful for A/B updates within the FVM,
+// since it will allow "activating" updated partitions.
+#define IOCTL_BLOCK_FVM_UPGRADE \
+    IOCTL(IOCTL_KIND_DEFAULT, IOCTL_FAMILY_BLOCK, 17)
+// Prints stats about the block device to the provided buffer and optionally
+// clears the counters
+#define IOCTL_BLOCK_GET_STATS   \
+    IOCTL(IOCTL_KIND_DEFAULT, IOCTL_FAMILY_BLOCK, 18)
 
-// Block Core ioctls (specific to each block device):
+// Block Impl ioctls (specific to each block device):
 
 #define BLOCK_FLAG_READONLY 0x00000001
 #define BLOCK_FLAG_REMOVABLE 0x00000002
@@ -74,6 +95,13 @@ typedef struct {
     uint32_t flags;
     uint32_t reserved;
 } block_info_t;
+
+typedef struct {
+    size_t max_concur;      // The maximum number of concurrent ops
+    size_t max_pending;     // The maximum number of pending block ops
+    size_t total_ops;       // Total number of block ops processed
+    size_t total_blocks;    // Total number of blocks processed
+} block_stats_t;
 
 // ssize_t ioctl_block_get_info(int fd, block_info_t* out);
 IOCTL_WRAPPER_OUT(ioctl_block_get_info, IOCTL_BLOCK_GET_INFO, block_info_t);
@@ -98,13 +126,22 @@ IOCTL_WRAPPER_OUT(ioctl_block_get_fifos, IOCTL_BLOCK_GET_FIFOS, zx_handle_t);
 
 typedef uint16_t vmoid_t;
 
+// Dummy vmoid value reserved for "invalid". Will never be allocated; can be
+// used as a local value for unallocated / freed ID.
+#define VMOID_INVALID 0
+
 // ssize_t ioctl_block_attach_vmo(int fd, zx_handle_t* in, vmoid_t* out_vmoid);
 IOCTL_WRAPPER_INOUT(ioctl_block_attach_vmo, IOCTL_BLOCK_ATTACH_VMO, zx_handle_t, vmoid_t);
 
-#define MAX_TXN_MESSAGES 16
 #define MAX_TXN_COUNT 256
 
 typedef uint16_t txnid_t;
+
+// Dummy TXNID value reserved for "invalid". Will never be allocated; can be
+// used as a local value for unallocated / freed ID.
+#define TXNID_INVALID 0xFFFF
+
+static_assert(TXNID_INVALID > MAX_TXN_COUNT, "Invalid Txn ID may be valid");
 
 // ssize_t ioctl_block_alloc_txn(int fd, txnid_t* out_txnid);
 IOCTL_WRAPPER_OUT(ioctl_block_alloc_txn, IOCTL_BLOCK_ALLOC_TXN, txnid_t);
@@ -124,6 +161,7 @@ typedef struct {
     uint8_t type[GUID_LEN];
     uint8_t guid[GUID_LEN];
     char name[NAME_LEN];
+    uint32_t flags; // Refer to fvm.h for options here; default is zero.
 } alloc_req_t;
 
 // ssize_t ioctl_block_fvm_alloc(int fd, const alloc_req_t* req);
@@ -167,10 +205,21 @@ typedef struct {
 // ssize_t ioctl_block_fvm_query(int fd, fvm_info_t* info);
 IOCTL_WRAPPER_OUT(ioctl_block_fvm_query, IOCTL_BLOCK_FVM_QUERY, fvm_info_t);
 
-// ssize_t ioctl_block_fvm_query(int fd, query_request_t* request, query_response_t* response);
+// ssize_t ioctl_block_fvm_vslice_query(int fd, query_request_t* request,
+//                                      query_response_t* response);
 IOCTL_WRAPPER_INOUT(ioctl_block_fvm_vslice_query, IOCTL_BLOCK_FVM_VSLICE_QUERY,
                     query_request_t, query_response_t);
 
+typedef struct {
+    uint8_t old_guid[GUID_LEN];
+    uint8_t new_guid[GUID_LEN];
+} upgrade_req_t;
+
+// ssize_t ioctl_block_fvm_upgrade(int fd, const upgrade_req_t* req);
+IOCTL_WRAPPER_IN(ioctl_block_fvm_upgrade, IOCTL_BLOCK_FVM_UPGRADE, upgrade_req_t);
+
+// ssize_t ioctl_block_get_stats(int fd, bool clear, block_stats_t* out)
+IOCTL_WRAPPER_INOUT(ioctl_block_get_stats, IOCTL_BLOCK_GET_STATS, bool, block_stats_t);
 
 // Multiple Block IO operations may be sent at once before a response is actually sent back.
 // Block IO ops may be sent concurrently to different vmoids, and they also may be sent
@@ -178,12 +227,12 @@ IOCTL_WRAPPER_INOUT(ioctl_block_fvm_vslice_query, IOCTL_BLOCK_FVM_VSLICE_QUERY,
 // be allocated at any point in time.
 //
 // "Transactions" are allocated with the "alloc_txn" ioctl. Allocating a transaction allows
-// MAX_TXN_MESSAGES to be buffered at once on a single txn before receiving a response.
+// multiple message to be buffered at once on a single txn before receiving a response.
 // Once a txn has been allocated, it can be re-used many times. It is recommended that
 // transactions are allocated on a "per-thread" basis, and only freed on thread teardown.
 //
 // The protocol to communicate with a single txn is as follows:
-// 1) SEND [N - 1] messages with an allocated txnid for any value of 1 <= N < MAX_TXN_MESSAGES.
+// 1) SEND [N - 1] messages with an allocated txnid for any value of 1 <= N.
 //    The BLOCKIO_TXN_END flag is not set for this step.
 // 2) SEND a final Nth message with the same txnid, but also the BLOCKIO_TXN_END flag.
 // 3) RECEIVE a single response from the Block IO server after all N requests have completed.
@@ -213,25 +262,35 @@ IOCTL_WRAPPER_INOUT(ioctl_block_fvm_vslice_query, IOCTL_BLOCK_FVM_VSLICE_QUERY,
 //   -> (txnid = 3, vmoid = 1, OP = Read | Want Reply)
 //   <- Repsonse sent to txnid = 3
 //
-// Each transaction reads or writes up to 'length' bytes from the device, starting at
-// 'dev_offset', into the VMO associated with 'vmoid', starting at 'vmo_offset'.
-// If the transaction is out of range, for example if 'length' is too large or if
-// 'dev_offset' is beyond the end of the device, ZX_ERR_OUT_OF_RANGE is returned.
+// Each transaction reads or writes up to 'length' blocks from the device, starting at 'dev_offset'
+// blocks, into the VMO associated with 'vmoid', starting at 'vmo_offset' blocks.  If the
+// transaction is out of range, for example if 'length' is too large or if 'dev_offset' is beyond
+// the end of the device, ZX_ERR_OUT_OF_RANGE is returned.
 
-#define BLOCKIO_READ 0x0001      // Reads from the Block device into the VMO
-#define BLOCKIO_WRITE 0x0002     // Writes to the Block device from the VMO
-#define BLOCKIO_SYNC 0x0003      // Unimplemented
-#define BLOCKIO_CLOSE_VMO 0x0004 // Detaches the VMO from the block device; closes the handle to it.
-#define BLOCKIO_OP_MASK 0x00FF
+// Reads from the Block device into the VMO
+#define BLOCKIO_READ           0x00000001
+// Writes to the Block device from the VMO
+#define BLOCKIO_WRITE          0x00000002
+// Write any cached data to nonvolatile storage.
+// Implies BARRIER_BEFORE and BARRIER_AFTER.
+#define BLOCKIO_FLUSH          0x00000003
+// Detaches the VMO from the block device.
+#define BLOCKIO_CLOSE_VMO      0x00000004
+#define BLOCKIO_OP_MASK        0x000000FF
 
-#define BLOCKIO_TXN_END 0x0100 // Expects response after request (and all previous) have completed
-#define BLOCKIO_FLAG_MASK 0xFF00
+// Require that this operation will not begin until all prior operations
+// have completed.
+#define BLOCKIO_BARRIER_BEFORE 0x00000100
+// Require that this operation must complete before additional operations begin.
+#define BLOCKIO_BARRIER_AFTER  0x00000200
+// Respond after request (and all previous) have completed
+#define BLOCKIO_TXN_END        0x00000400
+#define BLOCKIO_FLAG_MASK      0x0000FF00
 
 typedef struct {
     txnid_t txnid;
     vmoid_t vmoid;
-    uint16_t opcode;
-    uint16_t reserved0;
+    uint32_t opcode;
     uint64_t length;
     uint64_t vmo_offset;
     uint64_t dev_offset;

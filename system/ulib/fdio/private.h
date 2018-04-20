@@ -6,10 +6,12 @@
 
 #include <zircon/types.h>
 #include <fdio/limits.h>
+#include <fdio/remoteio.h>
 #include <stdarg.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <threads.h>
@@ -40,7 +42,7 @@ typedef struct fdio_ops {
     off_t (*seek)(fdio_t* io, off_t offset, int whence);
     zx_status_t (*misc)(fdio_t* io, uint32_t op, int64_t off, uint32_t maxreply, void* data, size_t len);
     zx_status_t (*close)(fdio_t* io);
-    zx_status_t (*open)(fdio_t* io, const char* path, int32_t flags, uint32_t mode, fdio_t** out);
+    zx_status_t (*open)(fdio_t* io, const char* path, uint32_t flags, uint32_t mode, fdio_t** out);
     zx_status_t (*clone)(fdio_t* io, zx_handle_t* out_handles, uint32_t* out_types);
     zx_status_t (*unwrap)(fdio_t* io, zx_handle_t* out_handles, uint32_t* out_types);
     zx_status_t (*shutdown)(fdio_t* io, int how);
@@ -48,28 +50,28 @@ typedef struct fdio_ops {
     void (*wait_end)(fdio_t* io, zx_signals_t signals, uint32_t* events);
     ssize_t (*ioctl)(fdio_t* io, uint32_t op, const void* in_buf, size_t in_len, void* out_buf, size_t out_len);
     ssize_t (*posix_ioctl)(fdio_t* io, int req, va_list va);
-    zx_status_t (*get_vmo)(fdio_t* io, zx_handle_t* out, size_t* off, size_t* len);
+    zx_status_t (*get_vmo)(fdio_t* io, int flags, zx_handle_t* out);
 } fdio_ops_t;
 
-// fdio_t flags
-#define FDIO_FLAG_CLOEXEC ((int32_t)1 << 0)
-#define FDIO_FLAG_SOCKET ((int32_t)1 << 1)
-#define FDIO_FLAG_EPOLL ((int32_t)1 << 2)
-#define FDIO_FLAG_WAITABLE ((int32_t)1 << 3)
-#define FDIO_FLAG_SOCKET_CONNECTING ((int32_t)1 << 4)
-#define FDIO_FLAG_SOCKET_CONNECTED ((int32_t)1 << 5)
-#define FDIO_FLAG_NONBLOCK ((int32_t)1 << 6)
+// fdio_t ioflag values
+#define IOFLAG_CLOEXEC              (1 << 0)
+#define IOFLAG_SOCKET               (1 << 1)
+#define IOFLAG_EPOLL                (1 << 2)
+#define IOFLAG_WAITABLE             (1 << 3)
+#define IOFLAG_SOCKET_CONNECTING    (1 << 4)
+#define IOFLAG_SOCKET_CONNECTED     (1 << 5)
+#define IOFLAG_NONBLOCK             (1 << 6)
 
 // The subset of fdio_t per-fd flags queryable via fcntl.
 // Static assertions in unistd.c ensure we aren't colliding.
-#define FDIO_FD_FLAGS FDIO_FLAG_CLOEXEC
+#define IOFLAG_FD_FLAGS IOFLAG_CLOEXEC
 
 typedef struct fdio {
     fdio_ops_t* ops;
     uint32_t magic;
     atomic_int_fast32_t refcount;
     int32_t dupcount;
-    int32_t flags;
+    uint32_t ioflag;
 } fdio_t;
 
 // Lifecycle notes:
@@ -115,7 +117,7 @@ static inline off_t fdio_seek(fdio_t* io, off_t offset, int whence) {
 static inline zx_status_t fdio_misc(fdio_t* io, uint32_t op, int64_t off, uint32_t maxreply, void* data, size_t len) {
     return io->ops->misc(io, op, off, maxreply, data, len);
 }
-static inline zx_status_t fdio_open(fdio_t* io, const char* path, int32_t flags, uint32_t mode, fdio_t** out) {
+static inline zx_status_t fdio_open(fdio_t* io, const char* path, uint32_t flags, uint32_t mode, fdio_t** out) {
     return io->ops->open(io, path, flags, mode, out);
 }
 zx_status_t fdio_close(fdio_t* io);
@@ -133,27 +135,12 @@ zx_status_t fdio_pipe_posix_ioctl(fdio_t* io, int req, va_list va);
 fdio_t* fdio_vmofile_create(zx_handle_t h, zx_off_t off, zx_off_t len);
 
 // Wraps a socket with an fdio_t using socket io.
-// Takes ownership of h and s.
-fdio_t* fdio_socket_create(zx_handle_t h, zx_handle_t s, int flags);
+fdio_t* fdio_socket_create(zx_handle_t s, int flags);
 
 // creates a message port and pair of simple io fdio_t's
 int fdio_pipe_pair(fdio_t** a, fdio_t** b);
 
-// create a fdio (if possible) from type, handles and extradata
-zx_status_t fdio_from_handles(uint32_t type, zx_handle_t* handles, int hcount,
-                              void* extra, uint32_t esize, fdio_t** out);
-
 void fdio_free(fdio_t* io);
-
-static inline void fdio_acquire(fdio_t* io) {
-    atomic_fetch_add(&io->refcount, 1);
-}
-
-static inline void fdio_release(fdio_t* io) {
-    if (atomic_fetch_sub(&io->refcount, 1) == 1) {
-        fdio_free(io);
-    }
-}
 
 fdio_t* fdio_ns_open_root(fdio_ns_t* ns);
 
@@ -183,7 +170,7 @@ ssize_t fdio_default_sendmsg(fdio_t* io, const struct msghdr* msg, int flags);
 off_t fdio_default_seek(fdio_t* io, off_t offset, int whence);
 zx_status_t fdio_default_misc(fdio_t* io, uint32_t op, int64_t off, uint32_t arg, void* data, size_t len);
 zx_status_t fdio_default_close(fdio_t* io);
-zx_status_t fdio_default_open(fdio_t* io, const char* path, int32_t flags, uint32_t mode, fdio_t** out);
+zx_status_t fdio_default_open(fdio_t* io, const char* path, uint32_t flags, uint32_t mode, fdio_t** out);
 zx_status_t fdio_default_clone(fdio_t* io, zx_handle_t* handles, uint32_t* types);
 ssize_t fdio_default_ioctl(fdio_t* io, uint32_t op, const void* in_buf, size_t in_len, void* out_buf, size_t out_len);
 void fdio_default_wait_begin(fdio_t* io, uint32_t events, zx_handle_t* handle, zx_signals_t* _signals);
@@ -191,7 +178,7 @@ void fdio_default_wait_end(fdio_t* io, zx_signals_t signals, uint32_t* _events);
 zx_status_t fdio_default_unwrap(fdio_t* io, zx_handle_t* handles, uint32_t* types);
 zx_status_t fdio_default_shutdown(fdio_t* io, int how);
 ssize_t fdio_default_posix_ioctl(fdio_t* io, int req, va_list va);
-zx_status_t fdio_default_get_vmo(fdio_t* io, zx_handle_t* out, size_t* off, size_t* len);
+zx_status_t fdio_default_get_vmo(fdio_t* io, int flags, zx_handle_t* out);
 
 void __fdio_startup_handles_init(uint32_t num, zx_handle_t handles[],
                                  uint32_t handle_info[])
@@ -221,3 +208,48 @@ extern fdio_state_t __fdio_global_state;
 #define fdio_fdtab (__fdio_global_state.fdtab)
 #define fdio_root_init (__fdio_global_state.init)
 #define fdio_root_ns (__fdio_global_state.ns)
+
+
+// Enable low level debug chatter, which requires a kernel that
+// doesn't check the resource argument to zx_debuglog_create()
+//
+// The value is the default debug level (0 = none)
+// The environment variable FDIODEBUG will override this on fdio init
+//
+// #define FDIO_LLDEBUG 1
+
+#ifdef FDIO_LLDEBUG
+void fdio_lldebug_printf(unsigned level, const char* fmt, ...);
+#define LOG(level, fmt...) fdio_lldebug_printf(level, fmt)
+#else
+#define LOG(level, fmt...) do {} while (0)
+#endif
+
+void fdio_set_debug_level(unsigned level);
+
+
+// Enable intrusive allocation debugging
+//
+//#define FDIO_ALLOCDEBUG
+
+static inline void fdio_acquire(fdio_t* io) {
+    LOG(6, "fdio: acquire: %p\n", io);
+    atomic_fetch_add(&io->refcount, 1);
+}
+
+static inline void fdio_release(fdio_t* io) {
+    LOG(6, "fdio: release: %p\n", io);
+    if (atomic_fetch_sub(&io->refcount, 1) == 1) {
+        fdio_free(io);
+    }
+}
+
+#ifdef FDIO_ALLOCDEBUG
+void* fdio_alloc(size_t sz);
+#else
+static inline void* fdio_alloc(size_t sz) {
+    void* ptr = calloc(1, sz);
+    LOG(5, "fdio: io: alloc: %p\n", ptr);
+    return ptr;
+}
+#endif

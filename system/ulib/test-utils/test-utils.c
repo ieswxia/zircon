@@ -6,6 +6,7 @@
 #include <string.h>
 #include <launchpad/launchpad.h>
 #include <launchpad/vmo.h>
+#include <zircon/crashlogger.h>
 #include <zircon/process.h>
 #include <zircon/syscalls.h>
 #include <zircon/syscalls/port.h>
@@ -15,13 +16,29 @@
 #include <unittest/unittest.h>
 
 #define TU_FAIL_ERRCODE 10
+#define TU_WATCHDOG_ERRCODE 5
+
+static int timeout_scale = 1;
+
+static thrd_t watchdog_thread;
 
 void* tu_malloc(size_t size)
 {
     void* result = malloc(size);
     if (result == NULL) {
         // TODO(dje): printf may try to malloc too ...
-        unittest_printf_critical("out of memory trying to allocate %zu bytes\n", size);
+        unittest_printf_critical("out of memory trying to malloc(%zu)\n", size);
+        exit(TU_FAIL_ERRCODE);
+    }
+    return result;
+}
+
+void* tu_calloc(size_t nmemb, size_t size)
+{
+    void* result = calloc(nmemb, size);
+    if (result == NULL) {
+        // TODO(dje): printf may try to malloc too ...
+        unittest_printf_critical("out of memory trying to calloc(%zu, %zu)\n", nmemb, size);
         exit(TU_FAIL_ERRCODE);
     }
     return result;
@@ -51,7 +68,14 @@ char* tu_asprintf(const char* fmt, ...)
 void tu_fatal(const char *what, zx_status_t status)
 {
     const char* reason = zx_status_get_string(status);
-    unittest_printf_critical("%s failed, rc %d (%s)\n", what, status, reason);
+    unittest_printf_critical("\nFATAL: %s failed, rc %d (%s)\n", what, status, reason);
+
+    // Request a backtrace to assist debugging.
+    unittest_printf_critical("FATAL: backtrace follows:\n");
+    unittest_printf_critical("       (using sw breakpoint request to crashlogger)\n");
+    crashlogger_request_backtrace();
+
+    unittest_printf_critical("FATAL: exiting process\n");
     exit(TU_FAIL_ERRCODE);
 }
 
@@ -62,6 +86,16 @@ void tu_handle_close(zx_handle_t handle)
     if (status < 0) {
         tu_fatal(__func__, status);
     }
+}
+
+zx_handle_t tu_handle_duplicate(zx_handle_t handle)
+{
+    zx_handle_t copy = ZX_HANDLE_INVALID;
+    zx_status_t status =
+        zx_handle_duplicate(handle, ZX_RIGHT_SAME_RIGHTS, &copy);
+    if (status < 0)
+        tu_fatal(__func__, status);
+    return copy;
 }
 
 // N.B. This creates a C11 thread.
@@ -84,19 +118,28 @@ void tu_thread_create_c11(thrd_t* t, thrd_start_t entry, void* arg,
     }
 }
 
-static zx_status_t tu_wait(const zx_handle_t* handles, const zx_signals_t* signals,
-                           uint32_t num_handles, uint32_t* result_index,
-                           zx_time_t timeout,
-                           zx_signals_t* pending)
+zx_status_t tu_wait(uint32_t num_objects,
+                    const zx_handle_t* handles,
+                    const zx_signals_t* signals,
+                    zx_signals_t* pending,
+                    zx_time_t timeout)
 {
-    zx_wait_item_t items[num_handles];
-    for (uint32_t n = 0; n < num_handles; n++) {
+    zx_wait_item_t items[num_objects];
+    for (uint32_t n = 0; n < num_objects; n++) {
         items[n].handle = handles[n];
         items[n].waitfor = signals[n];
     }
+    if (timeout != ZX_TIME_INFINITE) {
+        zx_time_t scaled_timeout = timeout * timeout_scale;
+        // Overflow -> infinity.
+        if (scaled_timeout < timeout)
+            timeout = ZX_TIME_INFINITE;
+        else
+            timeout = scaled_timeout;
+    }
     zx_time_t deadline = zx_deadline_after(timeout);
-    zx_status_t status = zx_object_wait_many(items, num_handles, deadline);
-    for (uint32_t n = 0; n < num_handles; n++) {
+    zx_status_t status = zx_object_wait_many(items, num_objects, deadline);
+    for (uint32_t n = 0; n < num_objects; n++) {
         pending[n] = items[n].pending;
     }
     return status;
@@ -127,15 +170,11 @@ void tu_channel_read(zx_handle_t handle, uint32_t flags, void* bytes, uint32_t* 
         tu_fatal(__func__, status);
 }
 
-// Wait until |channel| is readable or peer is closed.
-// Result is true if readable, otherwise false.
-
 bool tu_channel_wait_readable(zx_handle_t channel)
 {
     zx_signals_t signals = ZX_CHANNEL_READABLE | ZX_CHANNEL_PEER_CLOSED;
     zx_signals_t pending;
-    int64_t timeout = TU_WATCHDOG_DURATION_NANOSECONDS;
-    zx_status_t result = tu_wait(&channel, &signals, 1, NULL, timeout, &pending);
+    zx_status_t result = tu_wait(1, &channel, &signals, &pending, ZX_TIME_INFINITE);
     if (result != ZX_OK)
         tu_fatal(__func__, result);
     if ((pending & ZX_CHANNEL_READABLE) == 0) {
@@ -204,8 +243,7 @@ void tu_process_wait_signaled(zx_handle_t process)
 {
     zx_signals_t signals = ZX_PROCESS_TERMINATED;
     zx_signals_t pending;
-    int64_t timeout = TU_WATCHDOG_DURATION_NANOSECONDS;
-    zx_status_t result = tu_wait(&process, &signals, 1, NULL, timeout, &pending);
+    zx_status_t result = tu_wait(1, &process, &signals, &pending, ZX_TIME_INFINITE);
     if (result != ZX_OK)
         tu_fatal(__func__, result);
     if ((pending & ZX_PROCESS_TERMINATED) == 0) {
@@ -245,6 +283,28 @@ int tu_process_wait_exit(zx_handle_t process)
     return tu_process_get_return_code(process);
 }
 
+zx_handle_t tu_process_get_thread(zx_handle_t process, zx_koid_t tid)
+{
+    zx_handle_t thread;
+    zx_status_t status = zx_object_get_child(process, tid, ZX_RIGHT_SAME_RIGHTS, &thread);
+    if (status == ZX_ERR_NOT_FOUND)
+        return ZX_HANDLE_INVALID;
+    if (status < 0)
+        tu_fatal(__func__, status);
+    return thread;
+}
+
+size_t tu_process_get_threads(zx_handle_t process, zx_koid_t* threads, size_t max_threads)
+{
+    size_t num_threads;
+    size_t buf_size = max_threads * sizeof(threads[0]);
+    zx_status_t status = zx_object_get_info(process, ZX_INFO_PROCESS_THREADS,
+                                            threads, buf_size, &num_threads, NULL);
+    if (status < 0)
+        tu_fatal(__func__, status);
+    return num_threads;
+}
+
 zx_handle_t tu_job_create(zx_handle_t job)
 {
     zx_handle_t child_job;
@@ -263,18 +323,20 @@ zx_handle_t tu_io_port_create(void)
     return handle;
 }
 
-void tu_set_system_exception_port(zx_handle_t eport, uint64_t key)
-{
-    zx_status_t status = zx_task_bind_exception_port(0, eport, key, 0);
-    if (status < 0)
-        tu_fatal(__func__, status);
-}
-
 void tu_set_exception_port(zx_handle_t handle, zx_handle_t eport, uint64_t key, uint32_t options)
 {
     if (handle == 0)
         handle = zx_process_self();
     zx_status_t status = zx_task_bind_exception_port(handle, eport, key, options);
+    if (status < 0)
+        tu_fatal(__func__, status);
+}
+
+void tu_object_wait_async(zx_handle_t handle, zx_handle_t port, zx_signals_t signals)
+{
+    uint64_t key = tu_get_koid(handle);
+    uint32_t options = ZX_WAIT_ASYNC_REPEATING;
+    zx_status_t status = zx_object_wait_async(handle, port, key, signals, options);
     if (status < 0)
         tu_fatal(__func__, status);
 }
@@ -319,6 +381,13 @@ zx_info_thread_t tu_thread_get_info(zx_handle_t thread)
     return info;
 }
 
+bool tu_thread_is_dying_or_dead(zx_handle_t thread)
+{
+    zx_info_thread_t info = tu_thread_get_info(thread);
+    return (info.state == ZX_THREAD_STATE_DYING ||
+            info.state == ZX_THREAD_STATE_DEAD);
+}
+
 int tu_run_program(const char *progname, int argc, const char** argv)
 {
     launchpad_t* lp;
@@ -350,4 +419,48 @@ int tu_run_command(const char* progname, const char* cmd)
     };
 
     return tu_run_program(progname, countof(argv), argv);
+}
+
+int tu_set_timeout_scale(int scale)
+{
+    int prev = timeout_scale;
+    if (scale != 0)
+        timeout_scale = scale;
+    return prev;
+}
+
+// Setting to true when done turns off the watchdog timer. This
+// must be an atomic so that the compiler does not assume anything
+// about when it can be touched. Otherwise, since the compiler
+// knows that vDSO calls don't make direct callbacks, it assumes
+// that nothing can happen inside the watchdog loop that would touch
+// this variable. In fact, it will be touched in parallel by another thread.
+static volatile atomic_bool done_tests;
+
+static int watchdog_thread_func(void* arg)
+{
+    for (int i = 0; i < TU_WATCHDOG_TIMEOUT_TICKS * timeout_scale; ++i) {
+        zx_nanosleep(zx_deadline_after(TU_WATCHDOG_TICK_DURATION));
+        if (atomic_load(&done_tests))
+            return 0;
+    }
+    unittest_printf_critical("\n\n*** WATCHDOG TIMER FIRED ***\n");
+    // This should *cleanly* kill the entire process, not just this thread.
+    // TODO(dbort): Figure out why the shell sometimes reports a zero
+    // exit status when we expect to see '5'.
+    exit(TU_WATCHDOG_ERRCODE);
+}
+
+void tu_watchdog_start(void)
+{
+    atomic_store(&done_tests, false);
+    tu_thread_create_c11(&watchdog_thread, watchdog_thread_func, NULL, "watchdog-thread");
+}
+
+void tu_watchdog_cancel(void)
+{
+    atomic_store(&done_tests, true);
+
+    // TODO: Add an alarm as thrd_join doesn't provide a timeout.
+    thrd_join(watchdog_thread, NULL);
 }

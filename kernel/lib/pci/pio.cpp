@@ -7,6 +7,7 @@
 #include <zircon/types.h>
 #include <lib/pci/pio.h>
 #include <kernel/auto_lock.h>
+#include <kernel/spinlock.h>
 
 // TODO: This library exists as a shim for the awkward period between bringing
 // PCI legacy support online, and moving PCI to userspace. Initially, it exists
@@ -19,7 +20,7 @@ namespace Pci {
 
 #ifdef ARCH_X86
 #include <arch/x86.h>
-static mutex_t pio_lock = MUTEX_INITIAL_VALUE(pio_lock);
+static SpinLock pio_lock;
 
 static constexpr uint16_t kPciConfigAddr = 0xCF8;
 static constexpr uint16_t kPciConfigData = 0xCFC;
@@ -29,14 +30,14 @@ static constexpr uint32_t WidthMask(size_t width) {
 }
 
 zx_status_t PioCfgRead(uint32_t addr, uint32_t* val, size_t width) {
-    fbl::AutoLock lock(&pio_lock);
+    AutoSpinLock lock(&pio_lock);
 
     size_t shift = (addr & 0x3) * 8u;
     if (shift + width > 32) {
         return ZX_ERR_INVALID_ARGS;
     }
 
-    outpd(kPciConfigAddr, addr | kPciCfgEnable);;
+    outpd(kPciConfigAddr, (addr & ~0x3) | kPciCfgEnable);;
     uint32_t tmp_val = LE32(inpd(kPciConfigData));
     uint32_t width_mask = WidthMask(width);
 
@@ -47,11 +48,11 @@ zx_status_t PioCfgRead(uint32_t addr, uint32_t* val, size_t width) {
 
 zx_status_t PioCfgRead(uint8_t bus, uint8_t dev, uint8_t func,
                              uint8_t offset, uint32_t* val, size_t width) {
-    return PioCfgRead(PciBdfAddr(bus, dev, func, offset), val, width);
+    return PioCfgRead(PciBdfRawAddr(bus, dev, func, offset), val, width);
 }
 
 zx_status_t PioCfgWrite(uint32_t addr, uint32_t val, size_t width) {
-    fbl::AutoLock lock(&pio_lock);
+    AutoSpinLock lock(&pio_lock);
 
     size_t shift = (addr & 0x3) * 8u;
     if (shift + width > 32) {
@@ -60,7 +61,7 @@ zx_status_t PioCfgWrite(uint32_t addr, uint32_t val, size_t width) {
 
     uint32_t width_mask = WidthMask(width);
     uint32_t write_mask = width_mask << shift;
-    outpd(kPciConfigAddr, addr | kPciCfgEnable);
+    outpd(kPciConfigAddr, (addr & ~0x3) | kPciCfgEnable);
     uint32_t tmp_val = LE32(inpd(kPciConfigData));
 
     val &= width_mask;
@@ -73,7 +74,7 @@ zx_status_t PioCfgWrite(uint32_t addr, uint32_t val, size_t width) {
 
 zx_status_t PioCfgWrite(uint8_t bus, uint8_t dev, uint8_t func,
                               uint8_t offset, uint32_t val, size_t width) {
-    return PioCfgWrite(PciBdfAddr(bus, dev, func, offset), val, width);
+    return PioCfgWrite(PciBdfRawAddr(bus, dev, func, offset), val, width);
 }
 
 #else // not x86

@@ -6,56 +6,67 @@
 #include "device.h"
 #include "ring.h"
 
-#include <zircon/compiler.h>
 #include <stdlib.h>
+#include <zircon/compiler.h>
 
-#include <ddk/protocol/block.h>
+#include "backends/backend.h"
 #include <virtio/block.h>
+#include <zircon/device/block.h>
+#include <ddk/protocol/block.h>
+
+#include <sync/completion.h>
 
 namespace virtio {
+
+struct block_txn_t {
+    block_op_t op;
+    struct vring_desc* desc;
+    size_t index;
+    list_node_t node;
+    zx_handle_t pmt;
+};
 
 class Ring;
 
 class BlockDevice : public Device {
 public:
-    BlockDevice(zx_device_t* device);
+    BlockDevice(zx_device_t* device, zx::bti bti, fbl::unique_ptr<Backend> backend);
     virtual ~BlockDevice();
 
-    virtual zx_status_t Init();
+    virtual zx_status_t Init() override;
 
-    virtual void IrqRingUpdate();
-    virtual void IrqConfigChange();
+    virtual void IrqRingUpdate() override;
+    virtual void IrqConfigChange() override;
 
     uint64_t GetSize() const { return config_.capacity * config_.blk_size; }
     uint32_t GetBlockSize() const { return config_.blk_size; }
     uint64_t GetBlockCount() const { return config_.capacity; }
+    const char* tag() const override { return "virtio-blk"; }
 
 private:
     // DDK driver hooks
-    static void virtio_block_iotxn_queue(void* ctx, iotxn_t* txn);
     static zx_off_t virtio_block_get_size(void* ctx);
     static zx_status_t virtio_block_ioctl(void* ctx, uint32_t op, const void* in_buf, size_t in_len,
-                                      void* out_buf, size_t out_len, size_t* out_actual);
+                                          void* out_buf, size_t out_len, size_t* out_actual);
 
-    static void virtio_block_set_callbacks(void* ctx, block_callbacks_t* cb);
-    static void virtio_block_get_info(void* ctx, block_info_t* info);
-    static void virtio_block_complete(iotxn_t* txn, void* cookie);
-    static void virtio_block_read(void* ctx, zx_handle_t vmo,
-                                  uint64_t length, uint64_t vmo_offset,
-                                  uint64_t dev_offset, void* cookie);
-    static void virtio_block_write(void* ctx, zx_handle_t vmo,
-                                   uint64_t length, uint64_t vmo_offset,
-                                   uint64_t dev_offset, void* cookie);
-    static void block_do_txn(BlockDevice* dev, uint32_t opcode, zx_handle_t vmo,
-                             uint64_t length, uint64_t vmo_offset,
-                             uint64_t dev_offset, void* cookie);
+    static void virtio_block_query(void* ctx, block_info_t* bi, size_t* bopsz);
+    static void virtio_block_queue(void* ctx, block_op_t* bop);
 
     void GetInfo(block_info_t* info);
 
-    void QueueReadWriteTxn(iotxn_t* txn);
+    zx_status_t QueueTxn(block_txn_t* txn, bool write, size_t bytes,
+                         uint64_t* pages, size_t pagecount, uint16_t* idx);
+    void QueueReadWriteTxn(block_txn_t* txn, bool write);
+
+    void txn_complete(block_txn_t* txn, zx_status_t status);
 
     // the main virtio ring
     Ring vring_ = {this};
+
+    // lock to be used around Ring::AllocDescChain and FreeDesc
+    // TODO: move this into Ring class once it's certain that other
+    // users of the class are okay with it.
+    fbl::Mutex ring_lock_;
 
     static const uint16_t ring_size = 128; // 128 matches legacy pci
 
@@ -65,7 +76,7 @@ private:
     // a queue of block request/responses
     static const size_t blk_req_count = 32;
 
-    zx_paddr_t blk_req_pa_ = 0;
+    io_buffer_t blk_req_buf_;
     virtio_blk_req_t* blk_req_ = nullptr;
 
     zx_paddr_t blk_res_pa_ = 0;
@@ -86,12 +97,13 @@ private:
         blk_req_bitmap_ &= ~(1 << i);
     }
 
-    // Callbacks for PROTOCOL_BLOCK
-    block_callbacks_t* callbacks_;
-    block_protocol_ops_t device_block_ops_;
+    // pending iotxns and waiter state
+    fbl::Mutex txn_lock_;
+    list_node txn_list_ = LIST_INITIAL_VALUE(txn_list_);
+    bool txn_wait_ = false;
+    completion_t txn_signal_;
 
-    // pending iotxns
-    list_node iotxn_list = LIST_INITIAL_VALUE(iotxn_list);
+    block_protocol_ops_t block_ops_ = {};
 };
 
 } // namespace virtio

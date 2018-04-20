@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <ddk/usb-request.h>
 #include <zircon/compiler.h>
 #include <zircon/types.h>
 #include <zircon/hw/usb.h>
@@ -15,6 +16,8 @@ __BEGIN_CDECLS;
 typedef struct usb_bus_interface usb_bus_interface_t;
 
 typedef struct usb_hci_protocol_ops {
+    // queues a USB request
+    void (*request_queue)(void* ctx, usb_request_t* usb_request);
     void (*set_bus_interface)(void* ctx, usb_bus_interface_t* bus_intf);
     size_t (*get_max_device_count)(void* ctx);
     // enables or disables an endpoint using parameters derived from ep_desc
@@ -33,12 +36,17 @@ typedef struct usb_hci_protocol_ops {
     zx_status_t (*reset_endpoint)(void* ctx, uint32_t device_id, uint8_t ep_address);
     size_t (*get_max_transfer_size)(void* ctx, uint32_t device_id, uint8_t ep_address);
     zx_status_t (*cancel_all)(void* ctx, uint32_t device_id, uint8_t ep_address);
+    zx_status_t (*get_bti)(void* ctx, zx_handle_t* out_handle);
 } usb_hci_protocol_ops_t;
 
 typedef struct usb_hci_protocol {
     usb_hci_protocol_ops_t* ops;
     void* ctx;
 } usb_hci_protocol_t;
+
+static inline void usb_hci_request_queue(usb_hci_protocol_t* hci, usb_request_t* usb_request) {
+    return hci->ops->request_queue(hci->ctx, usb_request);
+}
 
 static inline void usb_hci_set_bus_interface(usb_hci_protocol_t* hci, usb_bus_interface_t* intf) {
     hci->ops->set_bus_interface(hci->ctx, intf);
@@ -90,6 +98,11 @@ static inline size_t usb_hci_get_max_transfer_size(usb_hci_protocol_t* hci, uint
 static inline zx_status_t usb_hci_cancel_all(usb_hci_protocol_t* hci, uint32_t device_id,
                                              uint8_t ep_address) {
     return hci->ops->cancel_all(hci->ctx, device_id, ep_address);
+}
+
+// shares a copy of the HCI driver's BTI handle
+static inline zx_status_t usb_hci_get_bti(usb_hci_protocol_t* hci, zx_handle_t* out_handle) {
+    return hci->ops->get_bti(hci->ctx, out_handle);
 }
 
 __END_CDECLS;

@@ -26,6 +26,7 @@ public:
     static int CmdPciUnplug(int argc, const cmd_args *argv, uint32_t flags);
     static int CmdPciReset(int argc, const cmd_args *argv, uint32_t flags);
     static int CmdPciRescan(int argc, const cmd_args *argv, uint32_t flags);
+    static int CmdPciRegionDump(int argc, const cmd_args *argv, uint32_t flags);
 };
 
 /* Class code/Subclass code definitions taken from
@@ -79,6 +80,8 @@ static const pci_dev_type_lut_entry_t PCI_DEV_TYPE_LUT[] = {
     LUT_ENTRY_ONE_PIF(0x01, 0x06, 0x00, "Serial ATA (Vendor Specific Interface)"),
     LUT_ENTRY_ONE_PIF(0x01, 0x06, 0x01, "Serial ATA (AHCI 1.0)"),
     LUT_ENTRY_ONE_PIF(0x01, 0x07, 0x00, "Serial Attached SCSI (SAS)"),
+    LUT_ENTRY_ONE_PIF(0x01, 0x08, 0x01, "Non-Volatile Memory Controller (NVMHCI)"),
+    LUT_ENTRY_ONE_PIF(0x01, 0x08, 0x02, "Non-Volatile Memory Controller (NVM Express)"),
     LUT_ENTRY_ONE_PIF(0x01, 0x80, 0x00, "Other Mass Storage Controller"),
     LUT_ENTRY_ONE_PIF(0x02, 0x00, 0x00, "Ethernet Controller"),
     LUT_ENTRY_ONE_PIF(0x02, 0x01, 0x00, "Token Ring Controller"),
@@ -719,7 +722,7 @@ int PcieDebugConsole::CmdPciReset(int argc, const cmd_args *argv, uint32_t flags
         printf("Failed to find PCI device %02x:%02x.%01x\n", bus_id, dev_id, func_id);
     } else {
         printf("Attempting reset of device %02x:%02x.%01x...\n", bus_id, dev_id, func_id);
-        status_t res = dev->DoFunctionLevelReset();
+        zx_status_t res = dev->DoFunctionLevelReset();
         dev = nullptr;
         if (res != ZX_OK)
             printf("Reset attempt failed (res = %d).\n", res);
@@ -738,6 +741,23 @@ int PcieDebugConsole::CmdPciRescan(int argc, const cmd_args *argv, uint32_t flag
     return bus_drv->RescanDevices();
 }
 
+int PcieDebugConsole::CmdPciRegionDump(int argc, const cmd_args *argv, uint32_t flags) {
+    auto walk_cb = [](const ralloc_region_t* r) -> bool {
+        printf("\tregion { base = %" PRIxPTR ", size = %#lx }\n", r->base, r->size);
+        return true;
+    };
+
+    auto bus_drv = PcieBusDriver::GetDriver();
+    printf("mmio_low:\n");
+    bus_drv->mmio_lo_regions_.WalkAllocatedRegions(walk_cb);
+    printf("mmio_high:\n");
+    bus_drv->mmio_hi_regions_.WalkAllocatedRegions(walk_cb);
+    printf("pio:\n");
+    bus_drv->pio_regions_.WalkAllocatedRegions(walk_cb);
+
+    return ZX_OK;
+}
+
 STATIC_COMMAND_START
 STATIC_COMMAND("lspci",
                "Enumerate the devices detected in PCIe ECAM space",
@@ -752,6 +772,9 @@ STATIC_COMMAND("pcirescan",
                "Force a rescan of the PCIe configuration space, matching drivers to unclaimed "
                "devices as we go.  Then attempt to start all newly claimed devices.",
                &PcieDebugConsole::CmdPciRescan)
+STATIC_COMMAND("pciregions",
+               "Dump information on present PCI address region allocations",
+               &PcieDebugConsole::CmdPciRegionDump)
 STATIC_COMMAND_END(pcie);
 
 #endif  // WITH_LIB_CONSOLE

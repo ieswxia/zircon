@@ -4,7 +4,7 @@
 
 #pragma once
 
-#ifndef ASSEMBLY
+#ifndef __ASSEMBLER__
 #include <zircon/compiler.h>
 #include <stdint.h>
 #endif
@@ -18,22 +18,13 @@
 // Round n up to the next 8 byte boundary
 #define BOOTDATA_ALIGN(n) (((n) + 7) & (~7))
 
-#define BOOTITEM_NO_CRC32 (~BOOTITEM_MAGIC)
+#define BOOTITEM_NO_CRC32 (0x4a87e8d6)
 
-// Bootdata items with the EXTRA flag have a bootextra_t
-// between them and the payload, which must have BOOTITEM_MAGIC
-// in its magic field, otherwise the file is corrupt.
-//
-// The bootextra_t is not included in the length of the header.
-// Consider the EXTRA flag to indicate a larger v2 header.
-//
-// The crc32 field must be BOOTITEM_NO_CRC32, unless the CRC32
-// flag is present, in which case it must be a valid crc32 of
-// the bootitem, bootextra (with crc32 field set to 0), and the
-// payload.
-#define BOOTDATA_FLAG_EXTRA      (0x00010000)
+// This flag is required.
+#define BOOTDATA_FLAG_V2         (0x00010000)
 
-// Bootdata items with the CRC32 flag must have a valid crc32
+// Bootdata items with the CRC32 flag must have a valid crc32.
+// Otherwise their crc32 field must contain BOOTITEM_NO_CRC32
 #define BOOTDATA_FLAG_CRC32      (0x00020000)
 
 // Containers are used to wrap a set of bootdata items
@@ -53,12 +44,18 @@
 #define BOOTDATA_BOOTFS_MASK      (0x00FFFFFF)
 #define BOOTDATA_BOOTFS_TYPE      (0x00534642) // BFS\0
 
-// MDI data.  The "extra" field is unused and set to 0.
-#define BOOTDATA_MDI              (0x3149444d) // MDI1
+// Virtual disk images.  The header fields and compression protocol
+// are the same as for the BOOTFS types, but the payload before
+// compression is a raw disk image rather than BOOTFS format.
+#define BOOTDATA_RAMDISK          (0x4b534452) // RDSK
 
 // A Zircon Kernel Image
 // Content: bootdata_kernel_t
 #define BOOTDATA_KERNEL           (0x4c4e524b) // KRNL
+
+// A Zircon Partition Map
+// Content: bootdata_partition_map_t
+#define BOOTDATA_PARTITION_MAP    (0x54524150) // PART
 
 // Flag indicating that the bootfs is compressed.
 #define BOOTDATA_BOOTFS_FLAG_COMPRESSED  (1 << 0)
@@ -74,6 +71,10 @@
 // Content: uint64_t phys addr
 #define BOOTDATA_ACPI_RSDP        (0x50445352) // RSDP
 
+// SMBIOS entry point pointer
+// Content: uint64_t phys addr
+#define BOOTDATA_SMBIOS           (0x49424d53) // SMBI
+
 // Framebuffer Parameters
 // Content: bootdata_swfb_t
 #define BOOTDATA_FRAMEBUFFER      (0x42465753) // SWFB
@@ -81,6 +82,10 @@
 // Debug Serial Port
 // Content: bootdata_uart_t
 #define BOOTDATA_DEBUG_UART       (0x54524155) // UART
+
+// Platform ID Information
+// Content: bootdata_platform_id_t
+#define BOOTDATA_PLATFORM_ID      (0x44494C50) // PLID
 
 // Memory which will persist across warm boots
 // Content bootdata_lastlog_nvram_t
@@ -106,9 +111,21 @@
 // Content: ascii/utf8 log data from previous boot
 #define BOOTDATA_LAST_CRASHLOG    (0x4d4f4f42) // BOOM
 
+// CPU configuration
+// Content: bootdata_cpu_config_t
+#define BOOTDATA_CPU_CONFIG       (0x43555043) // CPUC
+
+// Memory configuration
+// Content: one or more of bootdata_mem_range_t (count determined by bootdata_t length)
+#define BOOTDATA_MEM_CONFIG       (0x434D454D) // MEMC
+
+// Kernel driver configuration
+// Content: driver specific struct, with type determined by bootdata "extra" field
+#define BOOTDATA_KERNEL_DRIVER    (0x5652444B) // KDRV
+
 #define BOOTDATA_IGNORE           (0x50494b53) // SKIP
 
-#ifndef ASSEMBLY
+#ifndef __ASSEMBLER__
 __BEGIN_CDECLS;
 
 // BootData header, describing the type and size of data
@@ -132,14 +149,18 @@ typedef struct {
 
     // Flags for the boot data. See flag descriptions for each type.
     uint32_t flags;
-} bootdata_t;
 
-typedef struct {
+    // For future expansion.  Set to 0.
     uint32_t reserved0;
     uint32_t reserved1;
+
+    // Must be BOOTITEM_MAGIC
     uint32_t magic;
+
+    // Must be the CRC32 of payload if FLAG_CRC32 is set,
+    // otherwise must be BOOTITEM_NO_CRC32
     uint32_t crc32;
-} bootextra_t;
+} bootdata_t;
 
 typedef struct {
     uint64_t base; // physical base addr
@@ -160,13 +181,30 @@ typedef struct {
     bootdata_kernel_t data_kernel;
 } zircon_kernel_t;
 
+#define BOOTDATA_PART_NAME_LEN 32
+#define BOOTDATA_PART_GUID_LEN 16
+
 typedef struct {
-    bootdata_t hdr_file;
-    bootextra_t ext_file;
-    bootdata_t hdr_kernel;
-    bootextra_t ext_kernel;
-    bootdata_kernel_t data_kernel;
-} zircon_kernel2_t;
+    uint8_t type_guid[BOOTDATA_PART_GUID_LEN];
+    uint8_t uniq_guid[BOOTDATA_PART_GUID_LEN];
+    uint64_t first_block;
+    uint64_t last_block;
+    uint64_t flags;
+    char name[BOOTDATA_PART_NAME_LEN];
+} bootdata_partition_t;
+
+typedef struct {
+    uint64_t block_count;
+    uint64_t block_size;
+    // pdev_vid/pid/did are used to match partition map to
+    // appropriate block device on the platform bus
+    uint32_t pdev_vid;
+    uint32_t pdev_pid;
+    uint32_t pdev_did;
+    uint32_t partition_count;
+    char guid[BOOTDATA_PART_GUID_LEN];
+    bootdata_partition_t partitions[];
+} bootdata_partition_map_t;
 
 typedef struct {
     uint64_t base;
@@ -181,6 +219,35 @@ typedef struct {
     uint32_t type;
     uint32_t irq;
 } bootdata_uart_t;
+
+typedef struct {
+    uint32_t vid;
+    uint32_t pid;
+    char board_name[32];
+} bootdata_platform_id_t;
+
+typedef struct {
+    uint32_t cpu_count;     // number of CPU cores in the cluster
+    uint32_t type;          // for future use
+    uint32_t flags;         // for future use
+    uint32_t reserved;
+} bootdata_cpu_cluster_t;
+
+typedef struct {
+    uint32_t cluster_count;
+    uint32_t reserved[3];
+    bootdata_cpu_cluster_t clusters[];
+} bootdata_cpu_config_t;
+
+#define BOOTDATA_MEM_RANGE_RAM          1
+#define BOOTDATA_MEM_RANGE_PERIPHERAL   2
+#define BOOTDATA_MEM_RANGE_RESERVED     3
+typedef struct {
+    uint64_t    paddr;
+    uint64_t    length;
+    uint32_t    type;
+    uint32_t    reserved;
+} bootdata_mem_range_t;
 
 /* EFI Variable for Crash Log */
 #define ZIRCON_VENDOR_GUID \
@@ -236,4 +303,3 @@ typedef struct bootfs_entry {
     (sizeof(bootfs_entry_t) + BOOTFS_ALIGN(entry->name_len))
 
 #endif
-

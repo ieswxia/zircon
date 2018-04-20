@@ -5,8 +5,8 @@
 #pragma once
 
 #include <stdint.h>
-#include <zircon/device/ioctl.h>
 #include <zircon/device/ioctl-wrapper.h>
+#include <zircon/device/ioctl.h>
 #include <zircon/types.h>
 
 // TODO: GET_DEVICE_INFO ioctl
@@ -33,6 +33,8 @@ typedef struct eth_info_t {
 #define ETH_FEATURE_WLAN  1
 // Device is a synthetic network device
 #define ETH_FEATURE_SYNTH 2
+// Device is a loopback network device
+#define ETH_FEATURE_LOOPBACK 4
 
 // Get the fifos to submit tx and rx operations
 //   in: none
@@ -78,6 +80,32 @@ typedef struct eth_fifos_t {
 // de-asserted when this ioctl is called.
 #define IOCTL_ETHERNET_GET_STATUS \
     IOCTL(IOCTL_KIND_DEFAULT, IOCTL_FAMILY_ETH, 8)
+
+// Start/Stop promiscuous mode
+// in: bool
+#define IOCTL_ETHERNET_SET_PROMISC \
+    IOCTL(IOCTL_KIND_DEFAULT, IOCTL_FAMILY_ETH, 9)
+
+// Configure multicast mode
+//   in: eth_multicast_config_t*
+//   out: none
+#define IOCTL_ETHERNET_CONFIG_MULTICAST \
+    IOCTL(IOCTL_KIND_DEFAULT, IOCTL_FAMILY_ETH, 10)
+
+// If multicast promiscuous is not on, the filter will be used. Filter config is remembered and
+// can be updated while promiscuous is on. Address must be multicast (LSb of MSB is 1)
+#define ETH_MULTICAST_ADD_MAC     0
+#define ETH_MULTICAST_DEL_MAC     1
+#define ETH_MULTICAST_RECV_ALL    2
+#define ETH_MULTICAST_RECV_FILTER 3
+// TEST_FILTER turns off multicast promisc regardless of other ethdev's requests.
+// Use only during testing!
+#define ETH_MULTICAST_TEST_FILTER 4
+#define ETH_MULTICAST_DUMP_REGS 5
+typedef struct eth_multicast_config_t {
+    uint32_t op;    // one of ETH_MULTICAST_ #defines
+    uint8_t mac[6]; // used in ADD_MAC and DEL_MAC
+} eth_multicast_config_t;
 
 // Link status bits:
 #define ETH_STATUS_ONLINE (1u)
@@ -148,3 +176,10 @@ IOCTL_WRAPPER_VARIN(ioctl_ethernet_set_client_name, IOCTL_ETHERNET_SET_CLIENT_NA
 
 // ssize_t ioctl_ethernet_get_status(int fd, uint32_t*);
 IOCTL_WRAPPER_OUT(ioctl_ethernet_get_status, IOCTL_ETHERNET_GET_STATUS, uint32_t);
+
+// ssize_t ioctl_ethernet_set_promisc(int fd, bool*);
+IOCTL_WRAPPER_IN(ioctl_ethernet_set_promisc, IOCTL_ETHERNET_SET_PROMISC, bool);
+
+// ssize_t ioctl_ethernet_config_multicast(int fd, const eth_multicast_config_t *);
+IOCTL_WRAPPER_IN(ioctl_ethernet_config_multicast, IOCTL_ETHERNET_CONFIG_MULTICAST,
+                 eth_multicast_config_t)

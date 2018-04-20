@@ -29,6 +29,10 @@
 # MODULE_HOST_LIBS: static libraries for a hostapp or hostlib to depend on
 # MODULE_HOST_SYSLIBS: system libraries for a hostapp or hostlib to depend on
 # MODULE_GROUP: tag for manifest file entry
+# MODULE_PACKAGE: package type (src, so, a) for module to export to SDK
+# MODULE_PACKAGE_SRCS: override automated package source file selection, or the special
+#                      value "none" for header-only libraries
+# MODULE_PACKAGE_INCS: override automated package include file selection
 
 # the minimum module rules.mk file is as follows:
 #
@@ -58,10 +62,12 @@ DUPMODULES += $(MODULE)
 # if there's a manifest group, remove whitespace and wrap it in {}s
 ifneq ($(strip $(MODULE_GROUP)),)
 MODULE_GROUP := {$(strip $(MODULE_GROUP))}
+else ifeq ($(MODULE_TYPE),driver)
+MODULE_GROUP := {core}
+else ifeq ($(MODULE_TYPE),userlib)
+MODULE_GROUP := {libs}
 else ifneq (,$(filter usertest drivertest,$(MODULE_TYPE)))
 MODULE_GROUP := {test}
-else ifneq (,$(filter userlib driver,$(MODULE_TYPE)))
-MODULE_GROUP := {core}
 endif
 
 # all library deps go on the deps list
@@ -87,6 +93,7 @@ MODULE_HEADER_DEPS := $(sort $(MODULE_HEADER_DEPS))
 MODULES += $(_MODULE_DEPS)
 
 MODULE_BUILDDIR := $(call TOBUILDDIR,$(MODULE))
+MODULE_GENDIR := $(MODULE_BUILDDIR)/gen
 
 # MODULE_NAME is used to generate installed names
 # it defaults to being derived from the MODULE directory
@@ -108,8 +115,14 @@ MODULE_COMPILEFLAGS += -I$(LOCAL_DIR)/include
 MODULE_COMPILEFLAGS += -Ithird_party/ulib/musl/include
 MODULE_DEFINES += MODULE_LIBS=\"$(subst $(SPACE),_,$(MODULE_LIBS))\"
 MODULE_DEFINES += MODULE_STATIC_LIBS=\"$(subst $(SPACE),_,$(MODULE_STATIC_LIBS))\"
+
+# depend on the generated-headers of the modules we depend on
+# to insure they are generated before we are built
+MODULE_SRCDEPS += $(patsubst %,$(BUILDDIR)/%/gen-hdr.stamp,$(_MODULE_DEPS))
+
 endif
 MODULE_COMPILEFLAGS += $(foreach DEP,$(MODULE_HEADER_DEPS),-I$(DEP)/include)
+MODULE_COMPILEFLAGS += $(foreach DEP,$(MODULE_HEADER_DEPS),-I$(call TOBUILDDIR,$(DEP))/gen/include)
 #TODO: is this right?
 MODULE_SRCDEPS += $(USER_CONFIG_HEADER)
 else
@@ -177,6 +190,9 @@ USER_MANIFEST_LINES := $(SAVED_USER_MANIFEST_LINES)
 
 else # MODULE_ELIDED
 
+# list of generated public headers, asssmbled by */*compile.mk
+MODULE_GEN_HDR :=
+
 # include compile rules appropriate to module type
 # typeless modules are kernel modules
 ifeq ($(MODULE_TYPE),)
@@ -195,6 +211,10 @@ endif
 
 # MODULE_OBJS is passed back from *compile.mk
 #$(info MODULE_OBJS = $(MODULE_OBJS))
+
+$(MODULE_BUILDDIR)/gen-hdr.stamp: $(MODULE_GEN_HDR)
+	@$(MKDIR)
+	@touch $@
 
 # track all of the source files compiled
 ALLSRCS += $(MODULE_SRCS)
@@ -238,6 +258,7 @@ MODULE :=
 MODULE_ELIDED :=
 MODULE_SRCDIR :=
 MODULE_BUILDDIR :=
+MODULE_GENDIR :=
 MODULE_DEPS :=
 MODULE_HEADER_DEPS :=
 MODULE_SRCS :=
@@ -264,6 +285,9 @@ MODULE_SO_INSTALL_NAME :=
 MODULE_HOST_LIBS :=
 MODULE_HOST_SYSLIBS :=
 MODULE_GROUP :=
+MODULE_PACKAGE :=
+MODULE_PACKAGE_SRCS :=
+MODULE_PACKAGE_INCS :=
 
 # Save these before the next module.
 SAVED_EXTRA_BUILDDEPS := $(EXTRA_BUILDDEPS)

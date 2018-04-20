@@ -19,13 +19,15 @@ MODULE_SRCS := \
     $(LOCAL_DIR)/wrap.c \
     $(LOCAL_DIR)/test-access.cpp \
     $(LOCAL_DIR)/test-attr.c \
-    $(LOCAL_DIR)/test-append.c \
+    $(LOCAL_DIR)/test-append.cpp \
     $(LOCAL_DIR)/test-basic.c \
+    $(LOCAL_DIR)/test-clone.cpp \
     $(LOCAL_DIR)/test-directory.cpp \
     $(LOCAL_DIR)/test-dot-dot.c \
-    $(LOCAL_DIR)/test-link.c \
     $(LOCAL_DIR)/test-fcntl.cpp \
+    $(LOCAL_DIR)/test-link.c \
     $(LOCAL_DIR)/test-maxfile.cpp \
+    $(LOCAL_DIR)/test-minfs.cpp \
     $(LOCAL_DIR)/test-mmap.cpp \
     $(LOCAL_DIR)/test-overflow.c \
     $(LOCAL_DIR)/test-persist.cpp \
@@ -53,16 +55,24 @@ MODULE_STATIC_LIBS := \
     system/ulib/fs \
     system/ulib/gpt \
     system/ulib/digest \
+    system/ulib/trace \
     system/ulib/zxcpp \
     system/ulib/fbl \
-    third_party/ulib/cryptolib \
+    third_party/ulib/uboringssl \
 
 MODULE_LIBS := \
-    system/ulib/fdio \
     system/ulib/c \
+    system/ulib/fdio \
     system/ulib/fs-management \
     system/ulib/launchpad \
-    system/ulib/zircon \
+    system/ulib/trace-engine \
     system/ulib/unittest \
+    system/ulib/zircon \
+
+MODULE_COMPILEFLAGS := \
+    -Isystem/ulib/bitmap/include \
+    -Isystem/ulib/block-client/include \
+    -Isystem/ulib/minfs/include \
+    -Isystem/ulib/zx/include \
 
 include make/module.mk

@@ -7,11 +7,12 @@
 #include "elf.h"
 
 #include <zircon/assert.h>
+#include <zircon/dlfcn.h>
 #include <zircon/process.h>
 #include <zircon/processargs.h>
 #include <zircon/stack.h>
 #include <zircon/syscalls.h>
-#include <launchpad/loader-service.h>
+#include <ldmsg/ldmsg.h>
 #include <fdio/io.h>
 #include <assert.h>
 #include <stdatomic.h>
@@ -22,9 +23,6 @@
 #include <string.h>
 #include <sys/param.h>
 #include <threads.h>
-
-// to assist in the transition to unsigned handles
-#define INVALID_HANDLE(h) ((h) <= 0)
 
 enum special_handles {
     HND_LOADER_SVC,
@@ -282,8 +280,13 @@ static zx_status_t more_handles(launchpad_t* lp, size_t n) {
     if (lp->error)
         return lp->error;
 
+    if (ZX_CHANNEL_MAX_MSG_HANDLES - lp->handle_count < n)
+        return lp_error(lp, ZX_ERR_NO_MEMORY, "too many handles for handle table");
+
     if (lp->handle_alloc - lp->handle_count < n) {
         size_t alloc = lp->handle_alloc == 0 ? 8 : lp->handle_alloc * 2;
+        while (alloc - lp->handle_count < n)
+            alloc <<= 1;
         zx_handle_t* handles = realloc(lp->handles,
                                        alloc * sizeof(handles[0]));
         if (handles == NULL)
@@ -365,7 +368,7 @@ static void check_elf_stack_size(launchpad_t* lp, elf_load_info_t* elf) {
 }
 
 zx_status_t launchpad_elf_load_basic(launchpad_t* lp, zx_handle_t vmo) {
-    if (INVALID_HANDLE(vmo))
+    if (vmo == ZX_HANDLE_INVALID)
         return lp_error(lp, ZX_ERR_INVALID_ARGS, "elf_load: invalid vmo");
     if (lp->error)
         goto done;
@@ -396,7 +399,7 @@ zx_status_t launchpad_elf_load_extra(launchpad_t* lp, zx_handle_t vmo,
                                      zx_vaddr_t* base, zx_vaddr_t* entry) {
     if (lp->error)
         return lp->error;
-    if (INVALID_HANDLE(vmo))
+    if (vmo == ZX_HANDLE_INVALID)
         return lp_error(lp, ZX_ERR_INVALID_ARGS, "elf_load_extra: invalid vmo");
 
     elf_load_info_t* elf;
@@ -412,62 +415,61 @@ zx_status_t launchpad_elf_load_extra(launchpad_t* lp, zx_handle_t vmo,
 
 #define LOADER_SVC_MSG_MAX 1024
 
-static zx_status_t loader_svc_rpc(zx_handle_t loader_svc, uint32_t opcode,
+static zx_status_t loader_svc_rpc(zx_handle_t loader_svc, uint32_t ordinal,
                                   const void* data, size_t len, zx_handle_t* out) {
     static _Atomic zx_txid_t next_txid;
 
-    struct {
-        zx_loader_svc_msg_t header;
-        uint8_t data[LOADER_SVC_MSG_MAX - sizeof(zx_loader_svc_msg_t)];
-    } msg;
+    ldmsg_req_t req;
+    memset(&req.header, 0, sizeof(req.header));
+    req.header.ordinal = ordinal;
 
-    if (len >= sizeof(msg.data))
-        return ZX_ERR_BUFFER_TOO_SMALL;
+    size_t req_len;
+    zx_status_t status = ldmsg_req_encode(&req, &req_len, data, len);
+    if (status != ZX_OK)
+        return status;
 
-    memset(&msg.header, 0, sizeof(msg.header));
-    msg.header.txid = atomic_fetch_add(&next_txid, 1);
-    msg.header.opcode = opcode;
-    memcpy(msg.data, data, len);
-    msg.data[len] = 0;
+    req.header.txid = atomic_fetch_add(&next_txid, 1);
+
+    ldmsg_rsp_t rsp;
+    memset(&rsp, 0, sizeof(rsp));
 
     zx_handle_t handle = ZX_HANDLE_INVALID;
     const zx_channel_call_args_t call = {
-        .wr_bytes = &msg,
-        .wr_num_bytes = sizeof(msg.header) + len + 1,
-        .rd_bytes = &msg,
-        .rd_num_bytes = sizeof(msg),
+        .wr_bytes = &req,
+        .wr_num_bytes = req_len,
+        .rd_bytes = &rsp,
+        .rd_num_bytes = sizeof(rsp),
         .rd_handles = &handle,
         .rd_num_handles = 1,
     };
     uint32_t reply_size;
     uint32_t handle_count;
     zx_status_t read_status = ZX_OK;
-    zx_status_t status = zx_channel_call(loader_svc, 0, ZX_TIME_INFINITE,
-                                         &call, &reply_size, &handle_count,
-                                         &read_status);
+    status = zx_channel_call(loader_svc, 0, ZX_TIME_INFINITE, &call, &reply_size,
+                             &handle_count, &read_status);
     if (status != ZX_OK) {
         return status == ZX_ERR_CALL_FAILED ? read_status : status;
     }
 
     // Check for protocol violations.
-    if (reply_size != sizeof(msg.header)) {
+    if (reply_size != ldmsg_rsp_get_size(&rsp)) {
     protocol_violation:
         zx_handle_close(handle);
         return ZX_ERR_BAD_STATE;
     }
-    if (msg.header.opcode != LOADER_SVC_OP_STATUS)
+    if (rsp.header.ordinal != ordinal)
         goto protocol_violation;
 
-    if (msg.header.arg != ZX_OK) {
+    if (rsp.rv != ZX_OK) {
         if (handle != ZX_HANDLE_INVALID)
             goto protocol_violation;
-        if (msg.header.arg > 0)
+        if (rsp.rv > 0)
             goto protocol_violation;
         *out = ZX_HANDLE_INVALID;
     } else {
         *out = handle_count ? handle : ZX_HANDLE_INVALID;
     }
-    return msg.header.arg;
+    return rsp.rv;
 }
 
 static zx_status_t setup_loader_svc(launchpad_t* lp) {
@@ -475,7 +477,7 @@ static zx_status_t setup_loader_svc(launchpad_t* lp) {
         return ZX_OK;
 
     zx_handle_t loader_svc;
-    zx_status_t status = loader_service_get_default(&loader_svc);
+    zx_status_t status = dl_clone_loader_service(&loader_svc);
     if (status < 0)
         return status;
 
@@ -530,7 +532,7 @@ static zx_status_t handle_interp(launchpad_t* lp, zx_handle_t vmo,
 
     zx_handle_t interp_vmo;
     status = loader_svc_rpc(
-        lp->special_handles[HND_LOADER_SVC], LOADER_SVC_OP_LOAD_OBJECT,
+        lp->special_handles[HND_LOADER_SVC], LDMSG_OP_LOAD_OBJECT,
         interp, interp_len, &interp_vmo);
     if (status != ZX_OK)
         return status;
@@ -657,7 +659,7 @@ static zx_status_t parse_interp_spec(char *line, char **interp_start,
 }
 
 zx_status_t launchpad_file_load(launchpad_t* lp, zx_handle_t vmo) {
-    if (INVALID_HANDLE(vmo))
+    if (vmo == ZX_HANDLE_INVALID)
         return lp_error(lp, ZX_ERR_INVALID_ARGS, "file_load: invalid vmo");
 
     if (lp->script_args != NULL) {
@@ -668,18 +670,25 @@ zx_status_t launchpad_file_load(launchpad_t* lp, zx_handle_t vmo) {
     lp->num_script_args = 0;
 
     size_t script_nest_level = 0;
-    zx_status_t status;
+
     char first_line[LP_MAX_INTERP_LINE_LEN + 1];
-    size_t chars_read;
+    size_t to_read = sizeof(first_line);
+    size_t vmo_size;
+    zx_status_t status = zx_vmo_get_size(vmo, &vmo_size);
+    if (status != ZX_OK) {
+        return lp_error(lp, status, "file_load: zx_vmo_get_size() failed");
+    }
+    if (to_read > vmo_size) {
+        to_read = vmo_size;
+    }
 
     while (1) {
         // Read enough to get the interpreter specification of a script
-        status = zx_vmo_read(vmo, first_line, 0, sizeof(first_line),
-                             &chars_read);
+        status = zx_vmo_read(vmo, first_line, 0, to_read);
 
         // This is not a script -- load as an ELF file
         if ((status == ZX_OK)
-            && (chars_read < 2 || first_line[0] != '#' || first_line[1] != '!'))
+            && (to_read < 2 || first_line[0] != '#' || first_line[1] != '!'))
             break;
 
         zx_handle_close(vmo);
@@ -695,14 +704,14 @@ zx_status_t launchpad_file_load(launchpad_t* lp, zx_handle_t vmo) {
                             "file_load: too many levels of script indirection");
 
         // Normalize the line so that it is NULL-terminated
-        char* newline_pos = memchr(first_line, '\n', chars_read);
+        char* newline_pos = memchr(first_line, '\n', to_read);
         if (newline_pos)
             *newline_pos = '\0';
-        else if (chars_read == sizeof(first_line))
+        else if (to_read == sizeof(first_line))
             return lp_error(lp, ZX_ERR_OUT_OF_RANGE,
                             "file_load: first line of script too long");
         else
-            first_line[chars_read] = '\0';
+            first_line[to_read] = '\0';
 
         char* interp_start;
         size_t interp_len;
@@ -746,14 +755,14 @@ zx_status_t launchpad_file_load(launchpad_t* lp, zx_handle_t vmo) {
             return lp_error(lp, status, "file_load: setup_loader_svc() failed");
 
         status = loader_svc_rpc(lp->special_handles[HND_LOADER_SVC],
-                             LOADER_SVC_OP_LOAD_SCRIPT_INTERP,
+                             LDMSG_OP_LOAD_SCRIPT_INTERPRETER,
                              interp_start, interp_len, &vmo);
         if (status != ZX_OK)
             return lp_error(lp, status, "file_load: loader_svc_rpc() failed");
     }
 
     // Finally, load the interpreter itself
-    status = launchpad_elf_load_body(lp, first_line, chars_read, vmo);
+    status = launchpad_elf_load_body(lp, first_line, to_read, vmo);
 
     if (status != ZX_OK)
         lp_error(lp, status, "file_load: failed to load ELF file");
@@ -762,7 +771,7 @@ zx_status_t launchpad_file_load(launchpad_t* lp, zx_handle_t vmo) {
 }
 
 zx_status_t launchpad_elf_load(launchpad_t* lp, zx_handle_t vmo) {
-    if (INVALID_HANDLE(vmo))
+    if (vmo == ZX_HANDLE_INVALID)
         return lp_error(lp, ZX_ERR_INVALID_ARGS, "elf_load: invalid vmo");
 
     return launchpad_elf_load_body(lp, NULL, 0, vmo);
@@ -770,10 +779,10 @@ zx_status_t launchpad_elf_load(launchpad_t* lp, zx_handle_t vmo) {
 
 static zx_handle_t vdso_vmo = ZX_HANDLE_INVALID;
 static mtx_t vdso_mutex = MTX_INIT;
-static void vdso_lock(void) {
+static void vdso_lock(void) __TA_ACQUIRE(&vdso_mutex) {
     mtx_lock(&vdso_mutex);
 }
-static void vdso_unlock(void) {
+static void vdso_unlock(void) __TA_RELEASE(&vdso_mutex) {
     mtx_unlock(&vdso_mutex);
 }
 static zx_handle_t vdso_get_vmo(void) {
@@ -1027,7 +1036,7 @@ static zx_status_t prepare_start(launchpad_t* lp, const char* thread_name,
                                  zx_handle_t to_child,
                                  zx_handle_t* thread, uintptr_t* sp) {
     if (lp->entry == 0)
-        return ZX_ERR_BAD_STATE;
+        return lp_error(lp, ZX_ERR_BAD_STATE, "prepare start bad state");
 
     zx_status_t status = zx_thread_create(lp_proc(lp), thread_name,
                                           strlen(thread_name), 0, thread);
@@ -1046,7 +1055,7 @@ static zx_status_t prepare_start(launchpad_t* lp, const char* thread_name,
         status = launchpad_add_handle(lp, thread_copy, PA_THREAD_SELF);
         if (status != ZX_OK) {
             zx_handle_close(*thread);
-            return status;
+            return lp_error(lp, status, "cannot add thread self handle");
         }
     }
 
@@ -1182,7 +1191,20 @@ zx_handle_close failed on low address space reservation VMAR");
     return ZX_OK;
 }
 
-zx_handle_t launchpad_start(launchpad_t* lp) {
+// Start the process running.  If the send_loader_message flag is
+// set and this succeeds in sending the initial bootstrap message,
+// it clears the loader-service handle.  If this succeeds in sending
+// the main bootstrap message, it clears the list of handles to
+// transfer (after they've been transferred) as well as the process
+// handle.
+//
+// Returns the process handle via |process_out| on success, giving
+// ownership to the caller.  On failure, the return value doesn't
+// distinguish failure to send the first or second message from
+// failure to start the process, so on failure the loader-service
+// handle might or might not have been cleared and the handles to
+// transfer might or might not have been cleared.
+static zx_status_t launchpad_start(launchpad_t* lp, zx_handle_t* process_out) {
     if (lp->error)
         return lp->error;
 
@@ -1216,8 +1238,10 @@ zx_handle_t launchpad_start(launchpad_t* lp) {
         zx_handle_close(thread);
     }
     // process_start consumed child_bootstrap if successful.
-    if (status == ZX_OK)
-        return proc;
+    if (status == ZX_OK) {
+        *process_out = proc;
+        return ZX_OK;
+    }
 
     zx_handle_close(proc);
     zx_handle_close(child_bootstrap);
@@ -1248,22 +1272,20 @@ zx_status_t launchpad_start_injected(launchpad_t* lp, const char* thread_name,
 }
 
 zx_status_t launchpad_go(launchpad_t* lp, zx_handle_t* proc, const char** errmsg) {
-    zx_handle_t h = launchpad_start(lp);
+    zx_handle_t h = ZX_HANDLE_INVALID;
+    zx_status_t status = launchpad_start(lp, &h);
     if (errmsg)
         *errmsg = lp->errmsg;
-    if (h > 0) {
+    if (status == ZX_OK) {
         if (proc) {
             *proc = h;
         } else {
             zx_handle_close(h);
         }
-        h = ZX_OK;
     }
     launchpad_destroy(lp);
-    return h;
+    return status;
 }
-
-#include <launchpad/vmo.h>
 
 static zx_status_t launchpad_file_load_with_vdso(launchpad_t* lp, zx_handle_t vmo) {
     launchpad_file_load(lp, vmo);
@@ -1283,7 +1305,7 @@ zx_status_t launchpad_load_from_file(launchpad_t* lp, const char* path) {
 
 zx_status_t launchpad_load_from_fd(launchpad_t* lp, int fd) {
     zx_handle_t vmo;
-    zx_status_t status = fdio_get_vmo(fd, &vmo);
+    zx_status_t status = fdio_get_vmo_clone(fd, &vmo);
     if (status == ZX_OK) {
         return launchpad_file_load_with_vdso(lp, vmo);
     } else {

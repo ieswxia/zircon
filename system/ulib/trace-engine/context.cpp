@@ -11,8 +11,8 @@
 #include <fbl/atomic.h>
 #include <fbl/intrusive_hash_table.h>
 #include <fbl/unique_ptr.h>
-#include <zx/process.h>
-#include <zx/thread.h>
+#include <lib/zx/process.h>
+#include <lib/zx/thread.h>
 #include <trace-engine/fields.h>
 
 namespace trace {
@@ -245,8 +245,8 @@ public:
         return *this;
     }
 
-    Payload& WriteBytes(const void* src, size_t length) {
-        memcpy(ptr_, src, length);
+    void* PrepareWriteBytes(size_t length) {
+        auto result = ptr_;
         ptr_ += length / 8u;
         size_t tail = length & 7u;
         if (tail) {
@@ -254,6 +254,12 @@ public:
             ptr_++;
             memset(reinterpret_cast<uint8_t*>(ptr_) - padding, 0u, padding);
         }
+        return result;
+    }
+
+    Payload& WriteBytes(const void* src, size_t length) {
+        auto ptr = PrepareWriteBytes(length);
+        memcpy(ptr, src, length);
         return *this;
     }
 
@@ -536,6 +542,35 @@ void trace_context_register_thread(
     }
 }
 
+void trace_context_write_blob_record(
+    trace_context_t* context,
+    trace_blob_type_t type,
+    const trace_string_ref_t* name_ref,
+    const void* blob, size_t blob_size) {
+    const size_t name_string_size = trace::SizeOfEncodedStringRef(name_ref);
+    const size_t record_size_less_blob = sizeof(trace::RecordHeader) +
+                                         name_string_size;
+    const size_t padded_blob_size = trace::Pad(blob_size);
+    const size_t max_record_size = trace::RecordFields::kMaxRecordSizeBytes;
+    if (record_size_less_blob > max_record_size ||
+            padded_blob_size > max_record_size - record_size_less_blob) {
+        return;
+    }
+    const size_t record_size = record_size_less_blob + padded_blob_size;
+    trace::Payload payload(context, record_size);
+    if (payload) {
+        payload
+            .WriteUint64(trace::MakeRecordHeader(trace::RecordType::kBlob, record_size) |
+                         trace::BlobRecordFields::BlobType::Make(
+                             trace::ToUnderlyingType(type)) |
+                         trace::BlobRecordFields::NameStringRef::Make(
+                             name_ref->encoded_value) |
+                         trace::BlobRecordFields::BlobSize::Make(blob_size))
+            .WriteStringRef(name_ref)
+            .WriteBytes(blob, blob_size);
+    }
+}
+
 void trace_context_write_kernel_object_record(
     trace_context_t* context,
     zx_koid_t koid, zx_obj_type_t type,
@@ -549,8 +584,7 @@ void trace_context_write_kernel_object_record(
     if (payload) {
         payload
             .WriteUint64(trace::MakeRecordHeader(trace::RecordType::kKernelObject, record_size) |
-                         trace::KernelObjectRecordFields::ObjectType::Make(
-                             trace::ToUnderlyingType(type)) |
+                         trace::KernelObjectRecordFields::ObjectType::Make(type) |
                          trace::KernelObjectRecordFields::NameStringRef::Make(
                              name_ref->encoded_value) |
                          trace::KernelObjectRecordFields::ArgumentCount::Make(num_args))
@@ -610,7 +644,7 @@ void trace_context_write_thread_info_record(
     trace_context_register_string_literal(context, "process", &arg.name_ref);
     arg.value.type = TRACE_ARG_KOID;
     arg.value.koid_value = process_koid;
-    trace_context_write_kernel_object_record(context, process_koid, ZX_OBJ_TYPE_THREAD,
+    trace_context_write_kernel_object_record(context, thread_koid, ZX_OBJ_TYPE_THREAD,
                                              thread_name_ref, &arg, 1u);
 }
 
@@ -859,7 +893,7 @@ void trace_context_write_flow_end_event_record(
 
 void trace_context_write_initialization_record(
     trace_context_t* context,
-    uint64_t ticks_per_second) {
+    zx_ticks_t ticks_per_second) {
     const size_t record_size = sizeof(trace::RecordHeader) +
                                trace::WordsToBytes(1);
     trace::Payload payload(context, record_size);
@@ -949,10 +983,16 @@ uint64_t* trace_context::AllocRecord(size_t num_bytes) {
                           fbl::memory_order_relaxed);
 
     // Mark the end point if not already marked.
-    if (unlikely(ptr != buffer_end_)) {
-        buffer_full_mark_.store(reinterpret_cast<uintptr_t>(ptr),
-                                fbl::memory_order_relaxed);
+    uintptr_t expected_mark = 0u;
+    if (buffer_full_mark_.compare_exchange_strong(&expected_mark,
+                                                  reinterpret_cast<uintptr_t>(ptr),
+                                                  fbl::memory_order_relaxed,
+                                                  fbl::memory_order_relaxed)) {
+        // Notify the trace manager so it can notify the user that a record
+        // (likely) got dropped.
+        handler_->ops->buffer_overflow(handler_);
     }
+
     return nullptr;
 }
 

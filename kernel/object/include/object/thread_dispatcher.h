@@ -9,16 +9,16 @@
 #include <sys/types.h>
 
 #include <arch/exception.h>
+#include <kernel/dpc.h>
 #include <kernel/event.h>
 #include <kernel/thread.h>
 #include <vm/vm_address_region.h>
-#include <lib/dpc.h>
 #include <object/channel_dispatcher.h>
 #include <object/dispatcher.h>
 #include <object/excp_port.h>
 #include <object/futex_node.h>
-#include <object/state_tracker.h>
 
+#include <zircon/syscalls/debug.h>
 #include <zircon/syscalls/exception.h>
 #include <zircon/types.h>
 #include <fbl/canary.h>
@@ -30,7 +30,7 @@
 
 class ProcessDispatcher;
 
-class ThreadDispatcher final : public Dispatcher {
+class ThreadDispatcher final : public SoloDispatcher {
 public:
     // Traits to belong in the parent process's list.
     struct ThreadListTraits {
@@ -91,8 +91,7 @@ public:
 
     // Dispatcher implementation.
     zx_obj_type_t get_type() const final { return ZX_OBJ_TYPE_THREAD; }
-    StateTracker* get_state_tracker() final { return &state_tracker_; }
-    void on_zero_handles() final;
+    bool has_state_tracker() const final { return true; }
     zx_koid_t get_related_koid() const final;
 
     // Performs initialization on a newly constructed ThreadDispatcher
@@ -109,7 +108,6 @@ public:
     // accessors
     ProcessDispatcher* process() const { return process_.get(); }
 
-    FutexNode* futex_node() { return &futex_node_; }
     zx_status_t set_name(const char* name, size_t len) final;
     void get_name(char out_name[ZX_MAX_NAME_LEN]) const final;
     uint64_t runtime_ns() const { return thread_runtime(&thread_); }
@@ -132,15 +130,24 @@ public:
                                          const zx_exception_report_t* report,
                                          const arch_exception_context_t* arch_context,
                                          ExceptionStatus* out_estatus);
+
     // Called when an exception handler is finished processing the exception.
+    // TODO(brettw) ZX-1072 Remove this when all callers are updated to use
+    // the exception port variant below.
     zx_status_t MarkExceptionHandled(ExceptionStatus estatus);
+
+    // Called when an exception handler is finished processing the exception.
+    // The exception is only continued if the eport corresponds to the current
+    // exception port.
+    zx_status_t MarkExceptionHandled(PortDispatcher* eport, ExceptionStatus status);
+
     // Called when exception port |eport| is removed.
     // If the thread is waiting for the associated exception handler, continue
     // exception processing as if the exception port had not been installed.
     void OnExceptionPortRemoval(const fbl::RefPtr<ExceptionPort>& eport);
     // Return true if waiting for an exception response.
-    // |state_lock_| must be held.
-    bool InExceptionLocked() TA_REQ(state_lock_);
+    // |get_lock()| must be held.
+    bool InExceptionLocked() TA_REQ(get_lock());
     // Assuming the thread is stopped waiting for an exception response,
     // fill in |*report| with the exception report.
     // Returns ZX_ERR_BAD_STATE if not in an exception.
@@ -153,11 +160,9 @@ public:
     zx_status_t GetStatsForUserspace(zx_info_thread_stats_t* info);
 
     // For debugger usage.
-    // TODO(dje): The term "state" here conflicts with "state tracker".
-    uint32_t get_num_state_kinds() const;
-    // TODO(dje): Consider passing an Array<uint8_t> here and in WriteState.
-    zx_status_t ReadState(uint32_t state_kind, void* buffer, uint32_t* buffer_len);
-    zx_status_t WriteState(uint32_t state_kind, const void* buffer, uint32_t buffer_len);
+    zx_status_t ReadState(zx_thread_state_topic_t state_kind, void* buffer, size_t buffer_len);
+    zx_status_t WriteState(zx_thread_state_topic_t state_kind, const void* buffer,
+                           size_t buffer_len);
 
     // For ChannelDispatcher use.
     ChannelDispatcher::MessageWaiter* GetMessageWaiter() { return &channel_waiter_; }
@@ -182,7 +187,7 @@ private:
     static void ThreadUserCallback(enum thread_user_state_change new_state, void* arg);
 
     // change states of the object, do what is appropriate for the state transition
-    void SetStateLocked(State) TA_REQ(state_lock_);
+    void SetStateLocked(State) TA_REQ(get_lock());
 
     fbl::Canary<fbl::magic("THRD")> canary_;
 
@@ -198,30 +203,26 @@ private:
     uintptr_t user_arg1_ = 0;
     uintptr_t user_arg2_ = 0;
 
-    // our State
-    State state_ TA_GUARDED(state_lock_) = State::INITIAL;
-    fbl::Mutex state_lock_;
-
-    // Node for linked list of threads blocked on a futex
-    FutexNode futex_node_;
-
-    StateTracker state_tracker_;
+    State state_ TA_GUARDED(get_lock()) = State::INITIAL;
 
     // A thread-level exception port for this thread.
-    fbl::RefPtr<ExceptionPort> exception_port_ TA_GUARDED(exception_lock_);
-    fbl::Mutex exception_lock_;
+    fbl::RefPtr<ExceptionPort> exception_port_ TA_GUARDED(get_lock());
 
     // Support for sending an exception to an exception handler and then waiting for a response.
-    ExceptionStatus exception_status_ TA_GUARDED(state_lock_)
+    ExceptionStatus exception_status_ TA_GUARDED(get_lock())
         = ExceptionStatus::IDLE;
     // The exception port of the handler the thread is waiting for a response from.
-    fbl::RefPtr<ExceptionPort> exception_wait_port_ TA_GUARDED(state_lock_);
-    const zx_exception_report_t* exception_report_ TA_GUARDED(state_lock_);
+    fbl::RefPtr<ExceptionPort> exception_wait_port_ TA_GUARDED(get_lock());
+    const zx_exception_report_t* exception_report_ TA_GUARDED(get_lock());
     event_t exception_event_ =
         EVENT_INITIAL_VALUE(exception_event_, false, EVENT_FLAG_AUTOUNSIGNAL);
 
     // cleanup dpc structure
     dpc_t cleanup_dpc_ = {LIST_INITIAL_CLEARED_VALUE, nullptr, nullptr};
+
+    // Tracks the number of times Suspend() has been called. Resume() will resume this thread
+    // only when this reference count reaches 0.
+    int suspend_count_ = 0;
 
     // Used to protect thread name read/writes
     mutable SpinLock name_lock_;

@@ -17,9 +17,8 @@
 
 __BEGIN_CDECLS
 
-#define ZXRIO_SOCKET_DIR_NONE   "none"
-#define ZXRIO_SOCKET_DIR_SOCKET "socket"
-#define ZXRIO_SOCKET_DIR_ACCEPT "accept"
+#define ZXRIO_SOCKET_DIR_NONE   "none-v2"
+#define ZXRIO_SOCKET_DIR_SOCKET "socket-v2"
 
 // fdio signals
 #define ZXSIO_SIGNAL_INCOMING ZX_USER_SIGNAL_0
@@ -72,7 +71,7 @@ typedef struct zxrio_sockaddr_reply {
 typedef struct zxrio_sockopt_req_reply {
     int32_t level;
     int32_t optname;
-    char optval[8];
+    char optval[128];
     socklen_t optlen;
 } zxrio_sockopt_req_reply_t;
 

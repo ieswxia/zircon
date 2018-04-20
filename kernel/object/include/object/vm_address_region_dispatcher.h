@@ -16,7 +16,7 @@ class VmAddressRegion;
 class VmMapping;
 class VmObject;
 
-class VmAddressRegionDispatcher final : public Dispatcher {
+class VmAddressRegionDispatcher final : public SoloDispatcher {
 public:
     static zx_status_t Create(fbl::RefPtr<VmAddressRegion> vmar,
                               fbl::RefPtr<Dispatcher>* dispatcher,
@@ -40,7 +40,7 @@ public:
 
     zx_status_t Unmap(vaddr_t base, size_t len);
 
-    fbl::RefPtr<VmAddressRegion> vmar() const { return vmar_; }
+    const fbl::RefPtr<VmAddressRegion>& vmar() const { return vmar_; }
 
     // Check if the given flags define an allowed combination of RWX
     // protections.

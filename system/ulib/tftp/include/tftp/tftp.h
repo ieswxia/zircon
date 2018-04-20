@@ -37,7 +37,7 @@
  * |tftp_file_open_cb| callback will be called to prepare for receiving the
  * file.
  *
- * A timeout value is returned when calling |tftp_generate_write_request| and
+ * A timeout value is returned when calling |tftp_generate_request| and
  * |tftp_process_msg| and should be used to notify the library that the
  * expected packet was not receive within the value returned.
  **/
@@ -50,10 +50,31 @@ enum {
     TFTP_ERR_NOT_SUPPORTED = -2,
     TFTP_ERR_NOT_FOUND = -3,
     TFTP_ERR_INVALID_ARGS = -10,
-    TFTP_ERR_BUFFER_TOO_SMALL = -14,
+    TFTP_ERR_BUFFER_TOO_SMALL = -15,
     TFTP_ERR_BAD_STATE = -20,
-    TFTP_ERR_TIMED_OUT = -23,
+    TFTP_ERR_TIMED_OUT = -21,
+    TFTP_ERR_SHOULD_WAIT = -22,
     TFTP_ERR_IO = -40,
+};
+
+enum {
+    TFTP_ERR_CODE_UNDEF = 0,
+    TFTP_ERR_CODE_FILE_NOT_FOUND = 1,
+    TFTP_ERR_CODE_ACCESS_VIOLATION = 2,
+    TFTP_ERR_CODE_DISK_FULL = 3,
+    TFTP_ERR_CODE_ILLEGAL_OP = 4,
+    TFTP_ERR_CODE_UNKNOWN_ID = 5,
+    TFTP_ERR_CODE_FILE_EXISTS = 6,
+    TFTP_ERR_CODE_NO_USER = 7,
+    TFTP_ERR_CODE_BAD_OPTIONS = 8,
+
+    // Fuchsia-specific error code
+    // BUSY is sent by a server as a response to a RRQ or WRQ, and indicates
+    // that the server is unavailable to process the request at the moment
+    // (but expects to be able to handle it at some time in the future).
+    // A server will send an ERR_CODE_BUSY response if its open callback
+    // (open_read or open_write) returns TFTP_ERR_SHOULD_WAIT.
+    TFTP_ERR_CODE_BUSY = 0x143, /* 'B' + 'U' + 'S' + 'Y' */
 };
 
 #ifdef __cplusplus
@@ -72,9 +93,6 @@ typedef enum {
 } tftp_mode;
 
 // These are the default values used when sending a tftp request
-#define TFTP_DEFAULT_CLIENT_BLOCKSZ 1024
-#define TFTP_DEFAULT_CLIENT_TIMEOUT 1
-#define TFTP_DEFAULT_CLIENT_WINSZ 64
 #define TFTP_DEFAULT_CLIENT_MODE MODE_OCTET
 
 typedef struct {
@@ -119,6 +137,11 @@ typedef tftp_status (*tftp_file_open_write_cb)(const char* filename,
 // tftp_file_read_cb is called by the library to read |length| bytes, starting
 // at |offset|, into |data|. |file_cookie| will be passed to this function from
 // the argument to tftp_process_msg.
+//
+// |length| is both an input and output parameter, and may be set as a value
+// less than or equal to the original value to indicate a partial read.
+// |length| is only used as an output parameter if the returned status is
+// TFTP_NO_ERROR.
 typedef tftp_status (*tftp_file_read_cb)(void* data,
                                          size_t* length,
                                          off_t offset,
@@ -127,6 +150,11 @@ typedef tftp_status (*tftp_file_read_cb)(void* data,
 // tftp_file_write_cb is called by the library to write |length| bytes,
 // starting at |offset|, into the destination. |file_cookie| will be passed to
 // this function from the argument to tftp_process_msg.
+//
+// |length| is both an input and output parameter, and may be set as a value
+// less than or equal to the original value to indicate a partial write.
+// |length| is only used as an output parameter if the returned status is
+// TFTP_NO_ERROR.
 typedef tftp_status (*tftp_file_write_cb)(const void* data,
                                           size_t* length,
                                           off_t offset,
@@ -146,12 +174,10 @@ typedef struct {
 } tftp_file_interface;
 
 // tftp_transport_send_cb is called by the library to send |len| bytes from
-// |data| over a previously-established connection. On success, the function
-// should return the number of bytes sent. On error, it should return a
-// tftp_status error code.
-typedef int (*tftp_transport_send_cb)(void* data,
-                                      size_t len,
-                                      void* transport_cookie);
+// |data| over a previously-established connection.
+typedef tftp_status (*tftp_transport_send_cb)(void* data,
+                                              size_t len,
+                                              void* transport_cookie);
 
 // tftp_transport_recv_cb is called by the library to read from the transport
 // interface. It will read values into |data|, up to |len| bytes. If |block| is
@@ -221,30 +247,43 @@ tftp_status tftp_set_options(tftp_session* session,
                              const uint8_t* timeout,
                              const uint16_t* window_size);
 
+// tftp_session_has_pending returns true if the tftp_session has more data to
+// send before waiting for an ack. It is recommended that the caller do a
+// non-blocking read to see if an out-of-order ACK was sent by the remote host
+// before sending additional data packets.
+bool tftp_session_has_pending(tftp_session* session);
+
+// Prepare a DATA packet to send to the remote host. This is only required when
+// tftp_session_has_pending(session) returns true, as tftp_process_msg() will
+// prepare the first DATA message in each window.
+tftp_status tftp_prepare_data(tftp_session* session,
+                              void* outgoing,
+                              size_t* outlen,
+                              uint32_t* timeout_ms,
+                              void* cookie);
+
 // If no response from the peer is received before the most recent timeout_ms
 // value, this function should be called to take the next appropriate action
-// (e.g., retransmit or cancel). |sending| indicates whether we are sending or
-// receiving a file. |msg_buf| must point to the last message sent, which is
-// |msg_len| bytes long. |buf_sz| represents the total size of |msg_buf|,
-// which may be used to assemble the next packet to send. |timeout_ms| is set
-// to the next timeout value the user of the library should use when waiting
-// for a response. |file_cookie| will be passed to the tftp callback functions.
-// On return, TFTP_ERR_TIMED out is returned if the maximum number of timeouts
-// has been exceeded. If a message should be sent out, |msg_len| will be set
-// to the size of the message.
+// (e.g., retransmit or cancel). |msg_buf| must point to the last message sent,
+// which is |msg_len| bytes long. |buf_sz| represents the total size of
+// |msg_buf|, which may be used to assemble the next packet to send.
+// |timeout_ms| is set to the next timeout value the user of the library should
+// use when waiting for a response. |file_cookie| will be passed to the tftp
+// callback functions. On return, TFTP_ERR_TIMED out is returned if the maximum
+// number of timeouts has been exceeded. If a message should be sent out,
+// |msg_len| will be set to the size of the message.
 tftp_status tftp_timeout(tftp_session* session,
-                         bool sending,
                          void* msg_buf,
                          size_t* msg_len,
                          size_t buf_sz,
                          uint32_t* timeout_ms,
                          void* file_cookie);
 
-// Request to send the file |local_filename| across an existing session
-// to |remote_filename| on the target. If |options| is NULL, all values are
-// set to some (semi-)reasonable defaults. Otherwise, all non-NULL members of
-// |options| are used to override defaults. Before calling this function, the
-// client transport interface should be configured as needed.
+// Request to send the file |local_filename| across an existing session to
+// |remote_filename| on the target. |options| are required for the input and
+// output buffers, but other options can be left as NULL to use the session
+// defaults. Before calling this function, the client transport interface
+// should be configured as needed.
 tftp_status tftp_push_file(tftp_session* session,
                            void* transport_cookie,
                            void* file_cookie,
@@ -252,14 +291,26 @@ tftp_status tftp_push_file(tftp_session* session,
                            const char* remote_filename,
                            tftp_request_opts* options);
 
+// Request to retrieve the target file |remote_filename| across an existing
+// session to |local_filename| on the host. |options| are required for the
+// input and output buffers, but other options can be left as NULL to use the
+// session defaults. Before calling this function, the client transport
+// interface should be configured as needed.
+tftp_status tftp_pull_file(tftp_session* session,
+                           void* transport_cookie,
+                           void* file_cookie,
+                           const char* remote_filename,
+                           const char* local_filename,
+                           tftp_request_opts* options);
+
 // Wait for a client to request an operation, then service that request.
 // Returns (with TFTP_TRANSFER_COMPLETED) after each successful operation, or
 // on error. This function will call the transport send, recv, and timeout_set
 // operations as needed to facilitate communication with the requestor.
-tftp_status tftp_handle_request(tftp_session* session,
-                                void* transport_cookie,
-                                void* file_cookie,
-                                tftp_handler_opts* opts);
+tftp_status tftp_service_request(tftp_session* session,
+                                 void* transport_cookie,
+                                 void* file_cookie,
+                                 tftp_handler_opts* opts);
 
 // Processes a single message from the requestor, which is passed in as the
 // inbuf component of |opts|. Responds to the request and updates the

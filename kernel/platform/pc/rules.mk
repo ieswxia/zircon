@@ -24,6 +24,7 @@ MODULE_SRCS += \
     $(LOCAL_DIR)/platform.cpp \
     $(LOCAL_DIR)/platform_pcie.cpp \
     $(LOCAL_DIR)/power.cpp \
+    $(LOCAL_DIR)/smbios.cpp \
     $(LOCAL_DIR)/timer.cpp \
 
 MODULE_DEPS += \
@@ -35,14 +36,13 @@ MODULE_DEPS += \
     kernel/lib/memory_limit \
     kernel/lib/fbl \
     kernel/lib/pow2_range_allocator \
+    kernel/lib/smbios \
     kernel/lib/version \
     kernel/dev/interrupt \
     kernel/dev/pcie \
 
 KERNEL_DEFINES += \
     PLATFORM_SUPPORTS_PANIC_SHELL=1
-
-SMP_MAX_CPUS ?= 8
 
 include make/module.mk
 

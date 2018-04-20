@@ -12,19 +12,21 @@
 #include <zircon/rights.h>
 #include <fbl/alloc_checker.h>
 #include <fbl/auto_lock.h>
-#include <object/state_tracker.h>
-
-constexpr uint32_t kUserSignalMask = ZX_EVENT_SIGNALED | ZX_USER_SIGNAL_ALL;
 
 zx_status_t EventPairDispatcher::Create(fbl::RefPtr<Dispatcher>* dispatcher0,
                                         fbl::RefPtr<Dispatcher>* dispatcher1,
                                         zx_rights_t* rights) {
     fbl::AllocChecker ac;
-    auto disp0 = fbl::AdoptRef(new (&ac) EventPairDispatcher());
+    auto holder0 = fbl::AdoptRef(new (&ac) PeerHolder<EventPairDispatcher>());
+    if (!ac.check())
+        return ZX_ERR_NO_MEMORY;
+    auto holder1 = holder0;
+
+    auto disp0 = fbl::AdoptRef(new (&ac) EventPairDispatcher(fbl::move(holder0)));
     if (!ac.check())
         return ZX_ERR_NO_MEMORY;
 
-    auto disp1 = fbl::AdoptRef(new (&ac) EventPairDispatcher());
+    auto disp1 = fbl::AdoptRef(new (&ac) EventPairDispatcher(fbl::move(holder1)));
     if (!ac.check())
         return ZX_ERR_NO_MEMORY;
 
@@ -40,46 +42,28 @@ zx_status_t EventPairDispatcher::Create(fbl::RefPtr<Dispatcher>* dispatcher0,
 
 EventPairDispatcher::~EventPairDispatcher() {}
 
-void EventPairDispatcher::on_zero_handles() {
+void EventPairDispatcher::on_zero_handles()
+    TA_NO_THREAD_SAFETY_ANALYSIS {
     canary_.Assert();
 
-    fbl::AutoLock locker(&lock_);
-    DEBUG_ASSERT(other_);
+    fbl::AutoLock locker(get_lock());
+    DEBUG_ASSERT(peer_);
 
-    other_->state_tracker_.InvalidateCookie(other_->get_cookie_jar());
-    other_->state_tracker_.UpdateState(0u, ZX_EPAIR_PEER_CLOSED);
-    other_.reset();
+    peer_->InvalidateCookieLocked(peer_->get_cookie_jar());
+    peer_->UpdateStateLocked(0u, ZX_EPAIR_PEER_CLOSED);
+    peer_.reset();
 }
 
-zx_status_t EventPairDispatcher::user_signal(uint32_t clear_mask, uint32_t set_mask, bool peer) {
-    canary_.Assert();
-
-    if ((set_mask & ~kUserSignalMask) || (clear_mask & ~kUserSignalMask))
-        return ZX_ERR_INVALID_ARGS;
-
-    if (!peer) {
-        state_tracker_.UpdateState(clear_mask, set_mask);
-        return ZX_OK;
-    }
-
-    fbl::AutoLock locker(&lock_);
-    // object_signal() may race with handle_close() on another thread.
-    if (!other_)
-        return ZX_ERR_PEER_CLOSED;
-    other_->state_tracker_.UpdateState(clear_mask, set_mask);
-    return ZX_OK;
-}
-
-EventPairDispatcher::EventPairDispatcher()
-        : state_tracker_(0u),
-          other_koid_(0ull) {}
+EventPairDispatcher::EventPairDispatcher(fbl::RefPtr<PeerHolder<EventPairDispatcher>> holder)
+    : PeeredDispatcher(fbl::move(holder))
+{}
 
 // This is called before either EventPairDispatcher is accessible from threads other than the one
 // initializing the event pair, so it does not need locking.
 void EventPairDispatcher::Init(fbl::RefPtr<EventPairDispatcher> other) TA_NO_THREAD_SAFETY_ANALYSIS {
     DEBUG_ASSERT(other);
     // No need to take |lock_| here.
-    DEBUG_ASSERT(!other_);
-    other_koid_ = other->get_koid();
-    other_ = fbl::move(other);
+    DEBUG_ASSERT(!peer_);
+    peer_koid_ = other->get_koid();
+    peer_ = fbl::move(other);
 }

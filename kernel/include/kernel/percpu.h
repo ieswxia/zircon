@@ -6,12 +6,14 @@
 #pragma once
 
 #include <arch/ops.h>
+#include <kernel/align.h>
+#include <kernel/event.h>
 #include <kernel/stats.h>
 #include <kernel/thread.h>
 #include <kernel/timer.h>
 #include <list.h>
-#include <zircon/compiler.h>
 #include <sys/types.h>
+#include <zircon/compiler.h>
 
 __BEGIN_CDECLS
 
@@ -22,15 +24,29 @@ struct percpu {
     /* per cpu preemption timer */
     timer_t preempt_timer;
 
+    /* per cpu run queue and bitmap to indicate which queues are non empty */
+    struct list_node run_queue[NUM_PRIORITIES];
+    uint32_t run_queue_bitmap;
+
     /* thread/cpu level statistics */
     struct cpu_stats stats;
 
     /* per cpu idle thread */
     thread_t idle_thread;
-} __CPU_MAX_ALIGN;
+
+    /* kernel counters arena */
+    uint64_t* counters;
+
+    /* dpc context */
+    list_node_t dpc_list;
+    event_t dpc_event;
+} __CPU_ALIGN;
 
 /* the kernel per-cpu structure */
 extern struct percpu percpu[SMP_MAX_CPUS];
+
+/* make sure the bitmap is large enough to cover our number of priorities */
+static_assert(NUM_PRIORITIES <= sizeof(percpu[0].run_queue_bitmap) * CHAR_BIT, "");
 
 static inline struct percpu* get_local_percpu(void) {
     return &percpu[arch_curr_cpu_num()];

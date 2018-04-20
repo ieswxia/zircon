@@ -214,7 +214,7 @@ zx_status_t process_block_device(const char* device_name) {
     switch (disk_format) {
     case DISK_FORMAT_BLOBFS: {
         mount_options.create_mountpoint = true;
-        check_and_remount(device_path, PATH_BLOBSTORE, disk_format, &mount_options);
+        check_and_remount(device_path, PATH_BLOB, disk_format, &mount_options);
         break;
     }
     case DISK_FORMAT_MINFS: {
@@ -226,6 +226,11 @@ zx_status_t process_block_device(const char* device_name) {
         } else if (gpt_is_data_guid(guid, len)) {
             mount_options.wait_until_ready = true;
             check_and_remount(device_path, PATH_DATA, disk_format, &mount_options);
+        } else if (gpt_is_install_guid(guid, len)) {
+            mount_options.readonly = true;
+            mount_options.wait_until_ready = true;
+            mount_options.create_mountpoint = true;
+            check_and_remount(device_path, PATH_INSTALL, disk_format, &mount_options);
         }
         break;
     }

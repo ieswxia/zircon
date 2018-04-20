@@ -2,14 +2,13 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <threads.h>
 
 #include <fs/vfs.h>
-#include <zircon/thread_annotations.h>
+#include <fs/vnode.h>
 #include <fdio/debug.h>
 #include <fdio/remoteio.h>
 #include <fdio/vfs.h>
@@ -21,6 +20,29 @@
 #include <fbl/unique_ptr.h>
 
 namespace fs {
+
+constexpr Vfs::MountNode::MountNode() : vn_(nullptr) {}
+
+Vfs::MountNode::~MountNode() {
+    ZX_DEBUG_ASSERT(vn_ == nullptr);
+}
+
+void Vfs::MountNode::SetNode(fbl::RefPtr<Vnode> vn) {
+    ZX_DEBUG_ASSERT(vn_ == nullptr);
+    vn_ = vn;
+}
+
+zx::channel Vfs::MountNode::ReleaseRemote() {
+    ZX_DEBUG_ASSERT(vn_ != nullptr);
+    zx::channel h = vn_->DetachRemote();
+    vn_ = nullptr;
+    return h;
+}
+
+bool Vfs::MountNode::VnodeMatch(fbl::RefPtr<Vnode> vn) const {
+    ZX_DEBUG_ASSERT(vn_ != nullptr);
+    return vn == vn_;
+}
 
 // Installs a remote filesystem on vn and adds it to the remote_list_.
 zx_status_t Vfs::InstallRemote(fbl::RefPtr<Vnode> vn, MountChannel h) {
@@ -67,18 +89,18 @@ zx_status_t Vfs::InstallRemoteLocked(fbl::RefPtr<Vnode> vn, MountChannel h) {
     return ZX_OK;
 }
 
-zx_status_t Vfs::MountMkdir(fbl::RefPtr<Vnode> vn, const mount_mkdir_config_t* config) {
+zx_status_t Vfs::MountMkdir(fbl::RefPtr<Vnode> vn, fbl::StringPiece name, MountChannel h,
+                            uint32_t flags) {
     fbl::AutoLock lock(&vfs_lock_);
-    const char* name = config->name;
-    MountChannel h = MountChannel(config->fs_root);
-    zx_status_t r = OpenLocked(vn, &vn, name, &name,
-                               O_CREAT | O_RDONLY | O_DIRECTORY | O_NOREMOTE, S_IFDIR);
+    zx_status_t r = OpenLocked(vn, &vn, name, &name, ZX_FS_FLAG_CREATE |
+                               ZX_FS_RIGHT_READABLE | ZX_FS_FLAG_DIRECTORY |
+                               ZX_FS_FLAG_NOREMOTE, S_IFDIR);
     ZX_DEBUG_ASSERT(r <= ZX_OK); // Should not be accessing remote nodes
     if (r < 0) {
         return r;
     }
     if (vn->IsRemote()) {
-        if (config->flags & MOUNT_MKDIR_FLAG_REPLACE) {
+        if (flags & MOUNT_MKDIR_FLAG_REPLACE) {
             // There is an old remote handle on this vnode; shut it down and
             // replace it with our own.
             zx::channel old_remote;
@@ -94,6 +116,21 @@ zx_status_t Vfs::MountMkdir(fbl::RefPtr<Vnode> vn, const mount_mkdir_config_t* c
 zx_status_t Vfs::UninstallRemote(fbl::RefPtr<Vnode> vn, zx::channel* h) {
     fbl::AutoLock lock(&vfs_lock_);
     return UninstallRemoteLocked(fbl::move(vn), h);
+}
+
+zx_status_t Vfs::ForwardMessageRemote(fbl::RefPtr<Vnode> vn, zx::channel channel,
+                                      zxrio_msg_t* msg) {
+    fbl::AutoLock lock(&vfs_lock_);
+    zx_handle_t h = vn->GetRemote();
+    if (h == ZX_HANDLE_INVALID) {
+        return ZX_ERR_NOT_FOUND;
+    }
+    zx_status_t r = zxrio_txn_handoff(h, channel.release(), msg);
+    if (r == ZX_ERR_PEER_CLOSED) {
+        zx::channel c;
+        UninstallRemoteLocked(fbl::move(vn), &c);
+    }
+    return r;
 }
 
 // Uninstall the remote filesystem mounted on vn. Removes vn from the
@@ -115,7 +152,7 @@ zx_status_t Vfs::UninstallRemoteLocked(fbl::RefPtr<Vnode> vn, zx::channel* h) {
 // Uninstall all remote filesystems. Acts like 'UninstallRemote' for all
 // known remotes.
 zx_status_t Vfs::UninstallAll(zx_time_t deadline) {
-    fbl::unique_ptr<fs::MountNode> mount_point;
+    fbl::unique_ptr<MountNode> mount_point;
     for (;;) {
         {
             fbl::AutoLock lock(&vfs_lock_);

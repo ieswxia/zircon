@@ -4,10 +4,14 @@
 
 #include "handler_impl.h"
 
+#include <stdio.h>
+
 #include <zircon/assert.h>
+#include <zircon/status.h>
 #include <zircon/syscalls.h>
 
-#include <zx/vmar.h>
+#include <trace-provider/provider.h>
+#include <lib/zx/vmar.h>
 #include <fbl/type_support.h>
 
 namespace trace {
@@ -66,11 +70,26 @@ zx_status_t TraceHandlerImpl::StartEngine(async_t* async,
 }
 
 zx_status_t TraceHandlerImpl::StopEngine() {
-    return trace_stop_engine(ZX_OK);
+    auto status = trace_stop_engine(ZX_OK);
+    if (status != ZX_OK) {
+        printf("Failed to stop engine, status %s(%d)\n",
+               zx_status_get_string(status), status);
+    }
+    return status;
 }
 
 bool TraceHandlerImpl::IsCategoryEnabled(const char* category) {
+    if (enabled_categories_.size() == 0) {
+      // If none are specified, enable all categories.
+      return true;
+    }
     return enabled_category_set_.find(category) != enabled_category_set_.end();
+}
+
+void TraceHandlerImpl::TraceStarted() {
+    auto status = fence_.signal_peer(0u, TRACE_PROVIDER_SIGNAL_STARTED);
+    ZX_DEBUG_ASSERT(status == ZX_OK ||
+                    status == ZX_ERR_PEER_CLOSED);
 }
 
 void TraceHandlerImpl::TraceStopped(async_t* async, zx_status_t disposition,
@@ -78,6 +97,12 @@ void TraceHandlerImpl::TraceStopped(async_t* async, zx_status_t disposition,
     // TODO: Report the disposition and bytes written back to the tracing system
     // so it has a better idea of what happened.
     delete this;
+}
+
+void TraceHandlerImpl::BufferOverflow() {
+    auto status = fence_.signal_peer(0u, TRACE_PROVIDER_SIGNAL_BUFFER_OVERFLOW);
+    ZX_DEBUG_ASSERT(status == ZX_OK ||
+                    status == ZX_ERR_PEER_CLOSED);
 }
 
 } // namespace internal

@@ -26,6 +26,10 @@
 // plain data afterwards.
 #define IOCTL_KIND_SET_HANDLE       0x3
 
+// SET_TWO_HANDLES ioctls accepts two handles, and
+// optionally plain data afterwards.
+#define IOCTL_KIND_SET_TWO_HANDLES  0x5
+
 // core device/vfs ioctl families
 #define IOCTL_FAMILY_RESERVED       0x00
 #define IOCTL_FAMILY_DEVICE         0x01
@@ -42,7 +46,7 @@
 #define IOCTL_FAMILY_TPM            0x15
 #define IOCTL_FAMILY_USB            0x16
 #define IOCTL_FAMILY_HID            0x17
-#define IOCTL_FAMILY_BCM            0x18  // ioctls for BCM28xx chipset
+// 0x18 unused
 #define IOCTL_FAMILY_AUDIO          0x19
 #define IOCTL_FAMILY_MIDI           0x1A
 #define IOCTL_FAMILY_KTRACE         0x1B
@@ -60,7 +64,14 @@
 #define IOCTL_FAMILY_ETHERTAP       0x27
 #define IOCTL_FAMILY_USB_DEVICE     0x28
 #define IOCTL_FAMILY_USB_VIRT_BUS   0x29
+#define IOCTL_FAMILY_CPUPERF        0x2A
 #define IOCTL_FAMILY_POWER          0x30
+#define IOCTL_FAMILY_THERMAL        0x31
+#define IOCTL_FAMILY_CAMERA         0x32
+#define IOCTL_FAMILY_BT_HOST        0x33
+#define IOCTL_FAMILY_WLANPHY        0x34
+#define IOCTL_FAMILY_SERIAL         0x35
+#define IOCTL_FAMILY_WLANTAP        0x36
 
 // IOCTL constructor
 // --K-FFNN

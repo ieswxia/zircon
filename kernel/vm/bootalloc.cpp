@@ -5,29 +5,39 @@
 // license that can be found in the LICENSE file or at
 // https://opensource.org/licenses/MIT
 
+#include <vm/bootalloc.h>
+
 #include "vm_priv.h"
-#include <kernel/vm.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <sys/types.h>
 #include <trace.h>
+#include <vm/vm.h>
+#include <vm/physmap.h>
+#include <vm/pmm.h>
 
 #define LOCAL_TRACE MAX(VM_GLOBAL_TRACE, 0)
 
-/* cheezy allocator that chews up space just after the end of the kernel mapping */
+// Simple boot time allocator that starts by allocating physical memory off
+// the end of wherever the kernel is loaded in physical space.
+//
+// Pointers are returned from the kernel's physmap
 
-/* track how much memory we've used */
-extern int _end;
+// store the start and current pointer to the boot allocator in physical address
+paddr_t boot_alloc_start;
+paddr_t boot_alloc_end;
 
-uintptr_t boot_alloc_start = (uintptr_t)&_end;
-uintptr_t boot_alloc_end = (uintptr_t)&_end;
+// run in physical space without the mmu set up, so by computing the address of _end
+// and saving it, we've effectively computed the physical address of the end of the
+// kernel.
+__NO_SAFESTACK
+void boot_alloc_init() {
+    boot_alloc_start = reinterpret_cast<paddr_t>(_end);
+    boot_alloc_end = reinterpret_cast<paddr_t>(_end);
+}
 
-void boot_alloc_reserve(uintptr_t start, size_t len) {
+void boot_alloc_reserve(paddr_t start, size_t len) {
     uintptr_t end = ALIGN((start + len), PAGE_SIZE);
-
-    // Adjust physical addresses to kernel memory map
-    start += KERNEL_BASE;
-    end += KERNEL_BASE;
 
     if (end >= boot_alloc_start) {
         if ((start > boot_alloc_start) &&
@@ -47,7 +57,18 @@ void* boot_alloc_mem(size_t len) {
     ptr = ALIGN(boot_alloc_end, 8);
     boot_alloc_end = (ptr + ALIGN(len, 8));
 
-    LTRACEF("len %zu, ptr %p\n", len, (void*)ptr);
+    LTRACEF("len %zu, phys ptr %#" PRIxPTR " ptr %p\n", len, ptr, paddr_to_physmap(ptr));
 
-    return (void*)ptr;
+    return paddr_to_physmap(ptr);
 }
+
+// called from arch start.S
+// run in physical space without the mmu set up, so stick to basic, relocatable code
+__NO_SAFESTACK
+paddr_t boot_alloc_page_phys() {
+    paddr_t ptr = ALIGN(boot_alloc_end, PAGE_SIZE);
+    boot_alloc_end = ptr + PAGE_SIZE;
+
+    return ptr;
+}
+

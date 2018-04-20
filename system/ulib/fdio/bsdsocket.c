@@ -14,6 +14,7 @@
 #include <threads.h>
 #include <unistd.h>
 
+#include <zircon/device/vfs.h>
 #include <zircon/syscalls.h>
 
 #include <fdio/debug.h>
@@ -24,6 +25,8 @@
 
 #include "private.h"
 #include "unistd.h"
+
+zx_status_t zxsio_accept(fdio_t* io, zx_handle_t* s2);
 
 static zx_status_t fdio_getsockopt(fdio_t* io, int level, int optname,
                                    void* restrict optval,
@@ -42,13 +45,14 @@ int get_netstack(void) {
 }
 
 int socket(int domain, int type, int protocol) {
-
     fdio_t* io = NULL;
     zx_status_t r;
 
+    // SOCK_NONBLOCK and SOCK_CLOEXEC in type are handled locally rather than
+    // remotely so do not include them in path.
     char path[1024];
     int n = snprintf(path, sizeof(path), "%s/%d/%d/%d", ZXRIO_SOCKET_DIR_SOCKET,
-                     domain, type & ~SOCK_NONBLOCK, protocol);
+                     domain, type & ~(SOCK_NONBLOCK|SOCK_CLOEXEC), protocol);
     if (n < 0 || n >= (int)sizeof(path)) {
         return ERRNO(EINVAL);
     }
@@ -75,8 +79,12 @@ int socket(int domain, int type, int protocol) {
     }
 
     if (type & SOCK_NONBLOCK) {
-        io->flags |= FDIO_FLAG_NONBLOCK;
+        io->ioflag |= IOFLAG_NONBLOCK;
     }
+
+    // TODO(ZX-973): Implement CLOEXEC.
+    // if (type & SOCK_CLOEXEC) {
+    // }
 
     int fd;
     if ((fd = fdio_bind_to_fd(io, -1, 0)) < 0) {
@@ -96,15 +104,15 @@ int connect(int fd, const struct sockaddr* addr, socklen_t len) {
     zx_status_t r;
     r = io->ops->misc(io, ZXRIO_CONNECT, 0, 0, (void*)addr, len);
     if (r == ZX_ERR_SHOULD_WAIT) {
-        if (io->flags & FDIO_FLAG_NONBLOCK) {
-            io->flags |= FDIO_FLAG_SOCKET_CONNECTING;
+        if (io->ioflag & IOFLAG_NONBLOCK) {
+            io->ioflag |= IOFLAG_SOCKET_CONNECTING;
             fdio_release(io);
             return ERRNO(EINPROGRESS);
         }
         // going to wait for the completion
     } else {
         if (r == ZX_OK) {
-            io->flags |= FDIO_FLAG_SOCKET_CONNECTED;
+            io->ioflag |= IOFLAG_SOCKET_CONNECTED;
         }
         fdio_release(io);
         return STATUS(r);
@@ -127,19 +135,19 @@ int connect(int fd, const struct sockaddr* addr, socklen_t len) {
     }
 
     // check the result
-    int errno_;
-    socklen_t errno_len = sizeof(errno_);
-    r = fdio_getsockopt(io, SOL_SOCKET, SO_ERROR, &errno_, &errno_len);
+    zx_status_t status;
+    socklen_t status_len = sizeof(status);
+    r = fdio_getsockopt(io, SOL_SOCKET, SO_ERROR, &status, &status_len);
     if (r < 0) {
         fdio_release(io);
         return ERRNO(EIO);
     }
-    if (errno_ == 0) {
-        io->flags |= FDIO_FLAG_SOCKET_CONNECTED;
+    if (status == ZX_OK) {
+        io->ioflag |= IOFLAG_SOCKET_CONNECTED;
     }
     fdio_release(io);
-    if (errno_ != 0) {
-        return ERRNO(errno_);
+    if (status != ZX_OK) {
+        return ERRNO(fdio_status_to_errno(status));
     }
     return 0;
 }
@@ -179,40 +187,25 @@ int accept4(int fd, struct sockaddr* restrict addr, socklen_t* restrict len,
         return ERRNO(EBADF);
     }
 
-    fdio_t* io2;
-    zx_status_t r;
-    for (;;) {
-        r = io->ops->open(io, ZXRIO_SOCKET_DIR_ACCEPT, 0, 0, &io2);
-        if (r == ZX_ERR_SHOULD_WAIT) {
-            if (io->flags & FDIO_FLAG_NONBLOCK) {
-                fdio_release(io);
-                return ERRNO(EWOULDBLOCK);
-            }
-            // wait for an incoming connection
-            uint32_t events = POLLIN;
-            zx_handle_t h;
-            zx_signals_t sigs;
-            io->ops->wait_begin(io, events, &h, &sigs);
-            r = zx_object_wait_one(h, sigs, ZX_TIME_INFINITE, &sigs);
-            io->ops->wait_end(io, sigs, &events);
-            if (!(events & POLLIN)) {
-                fdio_release(io);
-                return ERRNO(EIO);
-            }
-            continue;
-        } else if (r == ZX_OK) {
-            break;
-        }
-        fdio_release(io);
+    zx_handle_t s2;
+    zx_status_t r = zxsio_accept(io, &s2);
+    fdio_release(io);
+    if (r == ZX_ERR_SHOULD_WAIT) {
+        return ERRNO(EWOULDBLOCK);
+    } else if (r != ZX_OK) {
         return ERROR(r);
     }
-    fdio_release(io);
+
+    fdio_t* io2;
+    if ((io2 = fdio_socket_create(s2, IOFLAG_SOCKET_CONNECTED)) == NULL) {
+        return ERROR(ZX_ERR_NO_RESOURCES);
+    }
 
     fdio_socket_set_stream_ops(io2);
-    io2->flags |= FDIO_FLAG_SOCKET_CONNECTED;
+    io2->ioflag |= IOFLAG_SOCKET_CONNECTED;
 
     if (flags & SOCK_NONBLOCK) {
-        io2->flags |= FDIO_FLAG_NONBLOCK;
+        io2->ioflag |= IOFLAG_NONBLOCK;
     }
 
     if (addr != NULL && len != NULL) {
@@ -397,7 +390,25 @@ int getsockopt(int fd, int level, int optname, void* restrict optval,
     }
 
     zx_status_t r;
-    r = fdio_getsockopt(io, level, optname, optval, optlen);
+    if (level == SOL_SOCKET && optname == SO_ERROR) {
+        if (optval == NULL || optlen == NULL || *optlen < sizeof(int)) {
+            r = ZX_ERR_INVALID_ARGS;
+        } else {
+            zx_status_t status;
+            socklen_t status_len = sizeof(status);
+            r = fdio_getsockopt(io, SOL_SOCKET, SO_ERROR, &status, &status_len);
+            if (r == ZX_OK) {
+                int errno_ = 0;
+                if (status != ZX_OK) {
+                    errno_ = fdio_status_to_errno(status);
+                }
+                *(int*)optval = errno_;
+                *optlen = sizeof(int);
+            }
+        }
+    } else {
+        r = fdio_getsockopt(io, level, optname, optval, optlen);
+    }
     fdio_release(io);
 
     return STATUS(r);

@@ -95,6 +95,7 @@ zx_status_t AudioOutput::Play(AudioSource& source) {
                     printf("Error packing frames (res %d)\n", res);
                     break;
                 }
+                zx_cache_flush(buf + wr, done, ZX_CACHE_FLUSH_DATA);
                 wr += done;
 
                 if (source.finished()) {
@@ -129,7 +130,7 @@ zx_status_t AudioOutput::Play(AudioSource& source) {
         }
 
         res = rb_ch_.wait_one(ZX_CHANNEL_READABLE | ZX_CHANNEL_PEER_CLOSED,
-                              ZX_TIME_INFINITE, &sigs);
+                              zx::time::infinite(), &sigs);
 
         if (res != ZX_OK) {
             printf("Failed to wait for notificiation (res %d)\n", res);

@@ -3,7 +3,7 @@
 This document describes the binary format used to collect, store, and
 transmit Fuchsia trace records.
 
-See [Fuchsia Tracing](tracing.md) for an overview.
+See [Fuchsia Tracing](design.md) for an overview.
 
 ## Purpose
 
@@ -262,7 +262,7 @@ same provider.
 _header word_
 - `[0 .. 3]`: record type (0)
 - `[4 .. 15]`: record size (inclusive of this word) as a multiple of 8 bytes
-- `[16 .. 19]`: metadata type
+- `[16 .. 19]`: metadata type (1)
 - `[20 .. 51]`: provider id (token used to identify the provider in the trace)
 - `[52 .. 59]`: name length in bytes
 - `[60 .. 63]`: reserved (must be zero)
@@ -290,9 +290,32 @@ whenever it encounters a new **Provider Section Metadata** record.
 _header word_
 - `[0 .. 3]`: record type (0)
 - `[4 .. 15]`: record size (inclusive of this word) as a multiple of 8 bytes
-- `[16 .. 19]`: metadata type
+- `[16 .. 19]`: metadata type (2)
 - `[20 .. 51]`: provider id (token used to identify the provider in the trace)
 - `[52 .. 63]`: reserved (must be zero)
+
+#### Provider Event Metadata (metadata type = 3)
+
+This metadata provides running notification of events that the provider
+wants to report.
+This record may appear anywhere in the output, and does not delimit what
+came before it or what comes after it.
+
+##### Format
+
+_header word_
+- `[0 .. 3]`: record type (0)
+- `[4 .. 15]`: record size (inclusive of this word) as a multiple of 8 bytes
+- `[16 .. 19]`: metadata type (3)
+- `[20 .. 51]`: provider id (token used to identify the provider in the trace)
+- `[52 .. 55]`: the event id
+- `[56 .. 63]`: reserved (must be zero)
+
+##### Events
+
+The following events are defined.
+
+- `0`: a buffer filled up, records were likely dropped
 
 ### Initialization Record (record type = 1)
 
@@ -524,7 +547,8 @@ _header word_
 - `[0 .. 3]`: record type (5)
 - `[4 .. 15]`: record size (inclusive of this word) as a multiple of 8 bytes
 - `[16 .. 31]`: blob name (string ref)
-- `[32 .. 47]`: blob payload size in bytes (excluding padding)
+- `[32 .. 46]`: blob payload size in bytes (excluding padding)
+- `[47 .. 47]`: reserved (must be zero)
 - `[48 .. 55]`: blob type
 - `[56 .. 63]`: reserved (must be zero)
 
@@ -537,7 +561,7 @@ _payload stream_ (variable size)
 ##### Blob Types
 
 The following blob types are defined:
-- `0x01`: Catapult trace event data represented in JSON format
+- `0x01`: Raw untyped data. Consumer is expected to know how to consume it, perhaps based on context.
 
 ### Userspace Object Record (record type = 6)
 
@@ -546,7 +570,7 @@ key/value data with it as arguments.  Information about the object is added
 to a per-process userspace object table.
 
 When a trace consumer encounters an event with a **Pointer Argument** whose
-value matches an entry the process’s object table, it can cross-reference
+value matches an entry in the process’s object table, it can cross-reference
 the argument’s pointer value with a prior **Userspace Object Record** to find a
 description of the referent.
 

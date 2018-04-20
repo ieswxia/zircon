@@ -4,10 +4,35 @@
 // license that can be found in the LICENSE file or at
 // https://opensource.org/licenses/MIT
 
-#include <object/state_tracker.h>
+#include <object/dispatcher.h>
 
+#include <lib/unittest/unittest.h>
 #include <object/state_observer.h>
-#include <unittest.h>
+
+namespace {
+
+class TestDispatcher final : public SoloDispatcher {
+public:
+    TestDispatcher() {}
+    ~TestDispatcher() final = default;
+    zx_obj_type_t get_type() const final { return ZX_OBJ_TYPE_NONE; }
+    bool has_state_tracker() const final { return true; }
+
+    // Heler: Causes OnStateChange() to be called.
+    void CallUpdateState() {
+        UpdateState(0, 1);
+    }
+
+    // Helper: Causes most On*() hooks (except for OnInitialized) to
+    // be called on all of |st|'s observers.
+    void CallAllOnHooks() {
+        UpdateState(0, 7);
+        Cancel(/* handle= */ nullptr);
+        CancelByKey(/* handle= */ nullptr, /* port= */ nullptr, /* key= */ 2u);
+    }
+};
+
+} // namespace
 
 // Tests for observer removal
 namespace removal {
@@ -26,8 +51,8 @@ private:
         return 0;
     }
     Flags OnStateChange(zx_signals_t new_state) override { return 0; }
-    Flags OnCancel(Handle* handle) override { return 0; }
-    Flags OnCancelByKey(Handle* handle, const void* port, uint64_t key)
+    Flags OnCancel(const Handle* handle) override { return 0; }
+    Flags OnCancelByKey(const Handle* handle, const void* port, uint64_t key)
         override { return 0; }
 
     void OnRemoved() override { removals_++; }
@@ -35,19 +60,7 @@ private:
     int removals_ = 0;
 };
 
-// Helper: Causes most On*() hooks (except for OnInitialized) to be called on
-// all of |st|'s observers.
-void call_all_on_hooks(StateTracker* st) {
-    st->UpdateState(0, 7);
-    uint32_t count = 5;
-    st->UpdateLastHandleSignal(&count);
-    count = 1;
-    st->UpdateLastHandleSignal(&count);
-    st->Cancel(/* handle= */ nullptr);
-    st->CancelByKey(/* handle= */ nullptr, /* port= */ nullptr, /* key= */ 2u);
-}
-
-bool on_initialize(void* context) {
+bool on_initialize() {
     BEGIN_TEST;
 
     class RmOnInitialize : public RemovableObserver {
@@ -62,14 +75,14 @@ bool on_initialize(void* context) {
     EXPECT_EQ(0, obs.removals(), "");
 
     // Cause OnInitialize() to be called.
-    StateTracker st;
+    TestDispatcher st;
     st.AddObserver(&obs, nullptr);
 
     // Should have been removed.
     EXPECT_EQ(1, obs.removals(), "");
 
     // Further On hook calls should not re-remove.
-    call_all_on_hooks(&st);
+    st.CallAllOnHooks();
     EXPECT_EQ(1, obs.removals(), "");
 
     END_TEST;
@@ -82,62 +95,35 @@ public:
     }
 };
 
-bool on_state_change_via_update_state(void* context) {
+bool on_state_change_via_update_state() {
     BEGIN_TEST;
 
     RmOnStateChange obs;
     EXPECT_EQ(0, obs.removals(), "");
 
-    StateTracker st;
+    TestDispatcher st;
     st.AddObserver(&obs, nullptr);
     EXPECT_EQ(0, obs.removals(), ""); // Not removed yet.
 
     // Cause OnStateChange() to be called.
-    st.UpdateState(0, 1);
+    st.CallUpdateState();
 
     // Should have been removed.
     EXPECT_EQ(1, obs.removals(), "");
 
     // Further On hook calls should not re-remove.
-    call_all_on_hooks(&st);
+    st.CallAllOnHooks();
     EXPECT_EQ(1, obs.removals(), "");
 
     END_TEST;
 }
 
-bool on_state_change_via_last_handle(void* context) {
-    BEGIN_TEST;
-
-    RmOnStateChange obs;
-    EXPECT_EQ(0, obs.removals(), "");
-
-    StateTracker st;
-    st.AddObserver(&obs, nullptr);
-    EXPECT_EQ(0, obs.removals(), ""); // Not removed yet.
-
-    // Cause OnStateChange() to be called. Need to transition out of and
-    // back into ZX_SIGNAL_LAST_HANDLE, because it's asserted by default.
-    uint32_t count = 2;
-    st.UpdateLastHandleSignal(&count);
-    count = 1;
-    st.UpdateLastHandleSignal(&count);
-
-    // Should have been removed.
-    EXPECT_EQ(1, obs.removals(), "");
-
-    // Further On hook calls should not re-remove.
-    call_all_on_hooks(&st);
-    EXPECT_EQ(1, obs.removals(), "");
-
-    END_TEST;
-}
-
-bool on_cancel(void* context) {
+bool on_cancel() {
     BEGIN_TEST;
 
     class RmOnCancel : public RemovableObserver {
     public:
-        Flags OnCancel(Handle* handle) {
+        Flags OnCancel(const Handle* handle) override {
             return kNeedRemoval;
         }
     };
@@ -145,7 +131,7 @@ bool on_cancel(void* context) {
     RmOnCancel obs;
     EXPECT_EQ(0, obs.removals(), "");
 
-    StateTracker st;
+    TestDispatcher st;
     st.AddObserver(&obs, nullptr);
     EXPECT_EQ(0, obs.removals(), ""); // Not removed yet.
 
@@ -156,18 +142,18 @@ bool on_cancel(void* context) {
     EXPECT_EQ(1, obs.removals(), "");
 
     // Further On hook calls should not re-remove.
-    call_all_on_hooks(&st);
+    st.CallAllOnHooks();
     EXPECT_EQ(1, obs.removals(), "");
 
     END_TEST;
 }
 
-bool on_cancel_by_key(void* context) {
+bool on_cancel_by_key() {
     BEGIN_TEST;
 
     class RmOnCancelByKey : public RemovableObserver {
     public:
-        Flags OnCancelByKey(Handle* handle, const void* port, uint64_t key)
+        Flags OnCancelByKey(const Handle* handle, const void* port, uint64_t key)
             override {
             return kNeedRemoval;
         }
@@ -176,7 +162,7 @@ bool on_cancel_by_key(void* context) {
     RmOnCancelByKey obs;
     EXPECT_EQ(0, obs.removals(), "");
 
-    StateTracker st;
+    TestDispatcher st;
     st.AddObserver(&obs, nullptr);
     EXPECT_EQ(0, obs.removals(), ""); // Not removed yet.
 
@@ -187,7 +173,7 @@ bool on_cancel_by_key(void* context) {
     EXPECT_EQ(1, obs.removals(), "");
 
     // Further On hook calls should not re-remove.
-    call_all_on_hooks(&st);
+    st.CallAllOnHooks();
     EXPECT_EQ(1, obs.removals(), "");
 
     END_TEST;
@@ -201,9 +187,8 @@ UNITTEST_START_TESTCASE(state_tracker_tests)
 
 ST_UNITTEST(removal::on_initialize)
 ST_UNITTEST(removal::on_state_change_via_update_state)
-ST_UNITTEST(removal::on_state_change_via_last_handle)
 ST_UNITTEST(removal::on_cancel)
 ST_UNITTEST(removal::on_cancel_by_key)
 
 UNITTEST_END_TESTCASE(
-    state_tracker_tests, "statetracker", "StateTracker test", nullptr, nullptr);
+    state_tracker_tests, "statetracker", "StateTracker test");

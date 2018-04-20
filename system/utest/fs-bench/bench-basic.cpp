@@ -20,7 +20,7 @@
 #include <fbl/unique_ptr.h>
 #include <unittest/unittest.h>
 
-#define MOUNT_POINT "/benchmark"
+#define MOUNT_POINT "/tmp/benchmark"
 
 constexpr size_t KB = (1 << 10);
 constexpr size_t MB = (1 << 20);
@@ -42,9 +42,9 @@ bool benchmark_banned(int fd, const char (&banned_fs)[len]) {
     return strncmp(banned_fs, name, len - 1) == 0;
 }
 
-inline void time_end(const char *str, uint64_t start) {
-    uint64_t end = zx_ticks_get();
-    uint64_t ticks_per_msec = zx_ticks_per_second() / 1000;
+inline void time_end(const char *str, zx_ticks_t start) {
+    zx_ticks_t end = zx_ticks_get();
+    zx_ticks_t ticks_per_msec = zx_ticks_per_second() / 1000;
     printf("Benchmark %s: [%10lu] msec\n", str, (end - start) / ticks_per_msec);
 }
 
@@ -59,7 +59,8 @@ template <size_t DataSize, size_t NumOps>
 bool benchmark_write_read(void) {
     BEGIN_TEST;
     int fd = open(MOUNT_POINT "/bigfile", O_CREAT | O_RDWR, 0644);
-    ASSERT_GT(fd, 0, "Cannot create file (FS benchmarks assume mounted FS exists at '/benchmark')");
+    ASSERT_GT(fd, 0, "Cannot create file (FS benchmarks assume mounted FS"
+              "exists at '/tmp/benchmark')");
     const size_t size_mb = (DataSize * NumOps) / MB;
     if (size_mb > 64 && benchmark_banned(fd, "memfs")) {
         return true;
@@ -71,7 +72,7 @@ bool benchmark_write_read(void) {
     ASSERT_EQ(ac.check(), true);
     memset(data.get(), kMagicByte, DataSize);
 
-    uint64_t start;
+    zx_ticks_t start;
     size_t count;
 
     for (int i = 0; i < kWriteReadCycles; i++) {
@@ -99,6 +100,7 @@ bool benchmark_write_read(void) {
         ASSERT_EQ(lseek(fd, 0, SEEK_SET), 0);
     }
 
+    ASSERT_EQ(syncfs(fd), 0);
     ASSERT_EQ(close(fd), 0);
     ASSERT_EQ(unlink(MOUNT_POINT "/bigfile"), 0);
 
@@ -125,6 +127,7 @@ void increment_str(char* str) {
 
 template <size_t MaxComponents>
 bool walk_down_path_components(char* path, bool (*cb)(const char* path)) {
+    BEGIN_HELPER;
     static_assert(MaxComponents * kComponentLength + fbl::constexpr_strlen(MOUNT_POINT) < PATH_MAX,
                   "Path depth is too long");
     size_t path_len = strlen(path);
@@ -138,10 +141,11 @@ bool walk_down_path_components(char* path, bool (*cb)(const char* path)) {
 
         increment_str<kComponentLength>(path_component);
     }
-    return true;
+    END_HELPER;
 }
 
 bool walk_up_path_components(char* path, bool (*cb)(const char* path)) {
+    BEGIN_HELPER;
     size_t path_len = strlen(path);
 
     while (path_len != fbl::constexpr_strlen(MOUNT_POINT)) {
@@ -149,23 +153,26 @@ bool walk_up_path_components(char* path, bool (*cb)(const char* path)) {
         path[path_len - kComponentLength] = 0;
         path_len -= kComponentLength;
     }
-    return true;
+    END_HELPER;
 }
 
 bool mkdir_callback(const char* path) {
+    BEGIN_HELPER;
     ASSERT_EQ(mkdir(path, 0666), 0, "Could not make directory");
-    return true;
+    END_HELPER;
 }
 
 bool stat_callback(const char* path) {
+    BEGIN_HELPER;
     struct stat buf;
     ASSERT_EQ(stat(path, &buf), 0, "Could not stat directory");
-    return true;
+    END_HELPER;
 }
 
 bool unlink_callback(const char* path) {
+    BEGIN_HELPER;
     ASSERT_EQ(unlink(path), 0, "Could not unlink directory");
-    return true;
+    END_HELPER;
 }
 
 template <size_t MaxComponents>
@@ -174,7 +181,7 @@ bool benchmark_path_walk(void) {
     printf("\nBenchmarking Long path walk (%lu components)\n", MaxComponents);
     char path[PATH_MAX];
     strcpy(path, MOUNT_POINT);
-    uint64_t start;
+    zx_ticks_t start;
 
     start = zx_ticks_get();
     ASSERT_TRUE(walk_down_path_components<MaxComponents>(path, mkdir_callback));
@@ -188,6 +195,11 @@ bool benchmark_path_walk(void) {
     start = zx_ticks_get();
     ASSERT_TRUE(walk_up_path_components(path, unlink_callback));
     time_end("unlink", start);
+
+    int fd = open(MOUNT_POINT, O_DIRECTORY | O_RDONLY);
+    ASSERT_GE(fd, 0);
+    ASSERT_EQ(syncfs(fd), 0);
+    ASSERT_EQ(close(fd), 0);
     END_TEST;
 }
 

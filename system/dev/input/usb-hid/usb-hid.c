@@ -2,18 +2,19 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#include <ddk/debug.h>
 #include <ddk/device.h>
 #include <ddk/driver.h>
 #include <ddk/binding.h>
-#include <ddk/iotxn.h>
 #include <ddk/protocol/hidbus.h>
+#include <ddk/usb-request.h>
 #include <driver/usb.h>
 #include <zircon/hw/usb-hid.h>
 
+#include <zircon/status.h>
 #include <zircon/types.h>
 #include <pretty/hexdump.h>
 
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <threads.h>
@@ -22,7 +23,6 @@
 #define USB_HID_PROTOCOL_KBD    0x01
 #define USB_HID_PROTOCOL_MOUSE  0x02
 
-#define USB_HID_DEBUG 0
 #define to_usb_hid(d) containerof(d, usb_hid_device_t, hiddev)
 
 typedef struct usb_hid_device {
@@ -31,8 +31,8 @@ typedef struct usb_hid_device {
     usb_protocol_t usb;
 
     hid_info_t info;
-    iotxn_t* txn;
-    bool txn_queued;
+    usb_request_t* req;
+    bool req_queued;
 
     mtx_t lock;
     hidbus_ifc_t* ifc;
@@ -42,38 +42,43 @@ typedef struct usb_hid_device {
     usb_hid_descriptor_t* hid_desc;
 } usb_hid_device_t;
 
-static void usb_interrupt_callback(iotxn_t* txn, void* cookie) {
+static void usb_interrupt_callback(usb_request_t* req, void* cookie) {
     usb_hid_device_t* hid = (usb_hid_device_t*)cookie;
-    // TODO use iotxn copyfrom instead of mmap
+    // TODO use usb request copyfrom instead of mmap
     void* buffer;
-    iotxn_mmap(txn, &buffer);
-#if USB_HID_DEBUG
-    printf("usb-hid: callback request status %d\n", txn->status);
-    hexdump(buffer, txn->actual);
-#endif
+    zx_status_t status = usb_request_mmap(req, &buffer);
+    if (status != ZX_OK) {
+        zxlogf(ERROR, "usb-hid: usb_request_mmap failed: %s\n", zx_status_get_string(status));
+        return;
+    }
+    zxlogf(SPEW, "usb-hid: callback request status %d\n", req->response.status);
+    if (driver_get_log_flags() & DDK_LOG_SPEW) {
+        hexdump(buffer, req->response.actual);
+    }
 
     bool requeue = true;
-    switch (txn->status) {
+    switch (req->response.status) {
     case ZX_ERR_IO_NOT_PRESENT:
         requeue = false;
         break;
     case ZX_OK:
         mtx_lock(&hid->lock);
         if (hid->ifc) {
-            hid->ifc->io_queue(hid->cookie, buffer, txn->actual);
+            hid->ifc->io_queue(hid->cookie, buffer, req->response.actual);
         }
         mtx_unlock(&hid->lock);
         break;
     default:
-        printf("usb-hid: unknown interrupt status %d; not requeuing iotxn\n", txn->status);
+        zxlogf(ERROR, "usb-hid: unknown interrupt status %d; not requeuing req\n",
+                req->response.status);
         requeue = false;
         break;
     }
 
     if (requeue) {
-        iotxn_queue(hid->usbdev, txn);
+        usb_request_queue(&hid->usb, req);
     } else {
-        hid->txn_queued = false;
+        hid->req_queued = false;
     }
 }
 
@@ -97,9 +102,9 @@ static zx_status_t usb_hid_start(void* ctx, hidbus_ifc_t* ifc, void* cookie) {
     }
     hid->ifc = ifc;
     hid->cookie = cookie;
-    if (!hid->txn_queued) {
-        hid->txn_queued = true;
-        iotxn_queue(hid->usbdev, hid->txn);
+    if (!hid->req_queued) {
+        hid->req_queued = true;
+        usb_request_queue(&hid->usb, hid->req);
     }
     mtx_unlock(&hid->lock);
     return ZX_OK;
@@ -113,6 +118,17 @@ static void usb_hid_stop(void* ctx) {
     hid->ifc = NULL;
     hid->cookie = NULL;
     mtx_unlock(&hid->lock);
+}
+
+static zx_status_t usb_hid_control(usb_hid_device_t* hid, uint8_t req_type, uint8_t request,
+                                   uint16_t value, uint16_t index, void* data, size_t length,
+                                   size_t* out_length) {
+    zx_status_t status = usb_control(&hid->usb, req_type, request, value, index, data, length,
+                                     ZX_TIME_INFINITE, out_length);
+    if (status == ZX_ERR_IO_REFUSED || status == ZX_ERR_IO_INVALID) {
+        usb_reset_endpoint(&hid->usb, 0);
+    }
+    return status;
 }
 
 static zx_status_t usb_hid_get_descriptor(void* ctx, uint8_t desc_type,
@@ -131,69 +147,64 @@ static zx_status_t usb_hid_get_descriptor(void* ctx, uint8_t desc_type,
 
     size_t desc_len = hid->hid_desc->descriptors[desc_idx].wDescriptorLength;
     uint8_t* desc_buf = malloc(desc_len);
-    zx_status_t status = usb_control(&hid->usb,
-                                     (USB_DIR_IN | USB_TYPE_STANDARD | USB_RECIP_INTERFACE),
-                                     USB_REQ_GET_DESCRIPTOR, desc_type << 8, hid->interface,
-                                     desc_buf, desc_len, ZX_TIME_INFINITE);
+    zx_status_t status = usb_hid_control(hid, USB_DIR_IN | USB_TYPE_STANDARD | USB_RECIP_INTERFACE,
+                                         USB_REQ_GET_DESCRIPTOR, desc_type << 8,
+                                         hid->interface, desc_buf, desc_len, len);
     if (status < 0) {
-        printf("usb-hid: error reading report descriptor 0x%02x: %d\n", desc_type, status);
+        zxlogf(ERROR, "usb-hid: error reading report descriptor 0x%02x: %d\n", desc_type, status);
         free(desc_buf);
         return status;
     } else {
         *data = desc_buf;
-        *len = desc_len;
     }
     return ZX_OK;
 }
 
 static zx_status_t usb_hid_get_report(void* ctx, uint8_t rpt_type, uint8_t rpt_id,
-                                      void* data, size_t len) {
+                                      void* data, size_t len, size_t* out_len) {
+    if (out_len == NULL) {
+        return ZX_ERR_INVALID_ARGS;
+    }
+
     usb_hid_device_t* hid = ctx;
-    return usb_control(&hid->usb, (USB_DIR_IN | USB_TYPE_CLASS | USB_RECIP_INTERFACE),
-            USB_HID_GET_REPORT, (rpt_type << 8 | rpt_id), hid->interface, data, len,
-            ZX_TIME_INFINITE);
+    return usb_hid_control(hid, USB_DIR_IN | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
+                           USB_HID_GET_REPORT, (rpt_type << 8 | rpt_id),
+                           hid->interface, data, len, out_len);
 }
 
 static zx_status_t usb_hid_set_report(void* ctx, uint8_t rpt_type, uint8_t rpt_id,
                                       void* data, size_t len) {
     usb_hid_device_t* hid = ctx;
-    return usb_control(&hid->usb, (USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE),
-            USB_HID_SET_REPORT, (rpt_type << 8 | rpt_id), hid->interface, data, len,
-            ZX_TIME_INFINITE);
+    return usb_hid_control(hid, USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
+                           USB_HID_SET_REPORT, (rpt_type << 8 | rpt_id),
+                           hid->interface, data, len, NULL);
 }
 
 static zx_status_t usb_hid_get_idle(void* ctx, uint8_t rpt_id, uint8_t* duration) {
     usb_hid_device_t* hid = ctx;
-    return usb_control(&hid->usb, (USB_DIR_IN | USB_TYPE_CLASS | USB_RECIP_INTERFACE),
-            USB_HID_GET_IDLE, rpt_id, hid->interface, duration, sizeof(*duration),
-            ZX_TIME_INFINITE);
+    return usb_hid_control(hid, USB_DIR_IN | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
+                           USB_HID_GET_IDLE, rpt_id, hid->interface,
+                           duration, sizeof(*duration), NULL);
 }
 
 static zx_status_t usb_hid_set_idle(void* ctx, uint8_t rpt_id, uint8_t duration) {
-    zx_status_t status;
     usb_hid_device_t* hid = ctx;
-    status = usb_control(&hid->usb, (USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE),
-            USB_HID_SET_IDLE, (duration << 8) | rpt_id, hid->interface, NULL, 0,
-            ZX_TIME_INFINITE);
-    if (status == ZX_ERR_IO_REFUSED) {
-        // The SET_IDLE command is optional, so this may stall.
-        // If that occurs, reset the endpoint and ignore the error
-        status = usb_reset_endpoint(&hid->usb, 0);
-    }
-    return status;
+    return usb_hid_control(hid, USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
+                           USB_HID_SET_IDLE, (duration << 8) | rpt_id,
+                           hid->interface, NULL, 0, NULL);
 }
 
 static zx_status_t usb_hid_get_protocol(void* ctx, uint8_t* protocol) {
     usb_hid_device_t* hid = ctx;
-    return usb_control(&hid->usb, (USB_DIR_IN | USB_TYPE_CLASS | USB_RECIP_INTERFACE),
-            USB_HID_GET_PROTOCOL, 0, hid->interface, protocol, sizeof(*protocol),
-            ZX_TIME_INFINITE);
+    return usb_hid_control(hid, USB_DIR_IN, USB_HID_GET_PROTOCOL, 0, hid->interface, protocol,
+                           sizeof(*protocol), NULL);
 }
 
 static zx_status_t usb_hid_set_protocol(void* ctx, uint8_t protocol) {
     usb_hid_device_t* hid = ctx;
-    return usb_control(&hid->usb, (USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE),
-            USB_HID_SET_PROTOCOL, protocol, hid->interface, NULL, 0,ZX_TIME_INFINITE);
+    return usb_hid_control(hid, USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
+                           USB_HID_SET_PROTOCOL, protocol, hid->interface, NULL,
+                           0, NULL);
 }
 
 static hidbus_protocol_ops_t usb_hid_bus_ops = {
@@ -216,7 +227,7 @@ static void usb_hid_unbind(void* ctx) {
 
 static void usb_hid_release(void* ctx) {
     usb_hid_device_t* hid = ctx;
-    iotxn_release(hid->txn);
+    usb_request_release(hid->req);
     free(hid);
 }
 
@@ -226,7 +237,7 @@ static zx_protocol_device_t usb_hid_dev_ops = {
     .release = usb_hid_release,
 };
 
-static zx_status_t usb_hid_bind(void* ctx, zx_device_t* dev, void** cookie) {
+static zx_status_t usb_hid_bind(void* ctx, zx_device_t* dev) {
     usb_protocol_t usb;
 
     zx_status_t status = device_get_protocol(dev, ZX_PROTOCOL_USB, &usb);
@@ -261,7 +272,7 @@ static zx_status_t usb_hid_bind(void* ctx, zx_device_t* dev, void** cookie) {
                 hid_desc = (usb_hid_descriptor_t *)header;
             } else if (header->bDescriptorType == USB_DT_ENDPOINT) {
                 endpt = (usb_endpoint_descriptor_t *)header;
-                if (usb_ep_direction(endpt) != USB_ENDPOINT_IN &&
+                if (usb_ep_direction(endpt) != USB_ENDPOINT_IN ||
                     usb_ep_type(endpt) != USB_ENDPOINT_INTERRUPT) {
                     endpt = NULL;
                 }
@@ -294,15 +305,15 @@ static zx_status_t usb_hid_bind(void* ctx, zx_device_t* dev, void** cookie) {
             usbhid->info.dev_class = HID_DEV_CLASS_POINTER;
         }
 
-        usbhid->txn = usb_alloc_iotxn(endpt->bEndpointAddress, usb_ep_max_packet(endpt));
-        if (usbhid->txn == NULL) {
+        status = usb_req_alloc(&usb, &usbhid->req, usb_ep_max_packet(endpt),
+                                   endpt->bEndpointAddress);
+        if (status != ZX_OK) {
             usb_desc_iter_release(&iter);
             free(usbhid);
             return ZX_ERR_NO_MEMORY;
         }
-        usbhid->txn->length = usb_ep_max_packet(endpt);
-        usbhid->txn->complete_cb = usb_interrupt_callback;
-        usbhid->txn->cookie = usbhid;
+        usbhid->req->complete_cb = usb_interrupt_callback;
+        usbhid->req->cookie = usbhid;
 
         device_add_args_t args = {
             .version = DEVICE_ADD_ARGS_VERSION,
@@ -316,7 +327,7 @@ static zx_status_t usb_hid_bind(void* ctx, zx_device_t* dev, void** cookie) {
         status = device_add(dev, &args, &usbhid->zxdev);
         if (status != ZX_OK) {
             usb_desc_iter_release(&iter);
-            iotxn_release(usbhid->txn);
+            usb_request_release(usbhid->req);
             free(usbhid);
             return status;
         }

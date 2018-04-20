@@ -4,27 +4,38 @@
 
 #include "usb-mass-storage.h"
 
+#include <ddk/debug.h>
+
 #include <stdio.h>
 #include <string.h>
 
-static void ums_block_queue(void* ctx, iotxn_t* txn) {
+static void ums_block_queue(void* ctx, block_op_t* op) {
     ums_block_t* dev = ctx;
+    ums_txn_t* txn = block_op_to_txn(op);
 
-    if (txn->offset % dev->block_size) {
-        iotxn_complete(txn, ZX_ERR_INVALID_ARGS, 0);
+    switch (op->command & BLOCK_OP_MASK) {
+    case BLOCK_OP_READ:
+    case BLOCK_OP_WRITE:
+        zxlogf(TRACE, "UMS QUEUE %s %u @%zu (%p)\n",
+               (op->command & BLOCK_OP_MASK) == BLOCK_OP_READ ? "RD" : "WR",
+               op->rw.length, op->rw.offset_dev, op);
+        break;
+    case BLOCK_OP_FLUSH:
+        zxlogf(TRACE, "UMS QUEUE FLUSH (%p)\n", op);
+        break;
+    default:
+        zxlogf(ERROR, "ums_block_queue: unsupported command %u\n", op->command);
+        op->completion_cb(&txn->op, ZX_ERR_NOT_SUPPORTED);
         return;
     }
-    if (txn->length % dev->block_size) {
-        iotxn_complete(txn, ZX_ERR_INVALID_ARGS, 0);
-        return;
-    }
-    txn->context = dev;
 
     ums_t* ums = block_to_ums(dev);
-    mtx_lock(&ums->iotxn_lock);
-    list_add_tail(&ums->queued_iotxns, &txn->node);
-    mtx_unlock(&ums->iotxn_lock);
-    completion_signal(&ums->iotxn_completion);
+    txn->dev = dev;
+
+    mtx_lock(&ums->txn_lock);
+    list_add_tail(&ums->queued_txns, &txn->node);
+    mtx_unlock(&ums->txn_lock);
+    completion_signal(&ums->txn_completion);
 }
 
 static void ums_get_info(void* ctx, block_info_t* info) {
@@ -34,6 +45,16 @@ static void ums_get_info(void* ctx, block_info_t* info) {
     info->block_count = dev->total_blocks;
     info->flags = dev->flags;
 }
+
+static void ums_block_query(void* ctx, block_info_t* info_out, size_t* block_op_size_out) {
+    ums_get_info(ctx, info_out);
+    *block_op_size_out = sizeof(ums_txn_t);
+}
+
+static block_protocol_ops_t ums_block_ops = {
+    .query = ums_block_query,
+    .queue = ums_block_queue,
+};
 
 static zx_status_t ums_block_ioctl(void* ctx, uint32_t op, const void* cmd, size_t cmdlen,
                                    void* reply, size_t max, size_t* out_actual) {
@@ -49,30 +70,8 @@ static zx_status_t ums_block_ioctl(void* ctx, uint32_t op, const void* cmd, size
         *out_actual = sizeof(*info);
         return ZX_OK;
     }
-    case IOCTL_BLOCK_RR_PART: {
-        // rebind to reread the partition table
-        return device_rebind(dev->zxdev);
-    }
     case IOCTL_DEVICE_SYNC: {
-        ums_sync_node_t node;
-
-        ums_t* ums = block_to_ums(dev);
-        mtx_lock(&ums->iotxn_lock);
-        iotxn_t* txn = list_peek_tail_type(&ums->queued_iotxns, iotxn_t, node);
-        if (!txn) {
-            txn = ums->curr_txn;
-        }
-        if (!txn) {
-            mtx_unlock(&ums->iotxn_lock);
-            return ZX_OK;
-        }
-        // queue a stack allocated sync node on ums_t.sync_nodes
-        node.iotxn = txn;
-        completion_reset(&node.completion);
-        list_add_head(&ums->sync_nodes, &node.node);
-        mtx_unlock(&ums->iotxn_lock);
-
-        return completion_wait(&node.completion, ZX_TIME_INFINITE);
+        return ZX_OK;
     }
     default:
         return ZX_ERR_NOT_SUPPORTED;
@@ -86,68 +85,11 @@ static zx_off_t ums_block_get_size(void* ctx) {
 
 static zx_protocol_device_t ums_block_proto = {
     .version = DEVICE_OPS_VERSION,
-    .iotxn_queue = ums_block_queue,
     .ioctl = ums_block_ioctl,
     .get_size = ums_block_get_size,
 };
 
-static void ums_async_set_callbacks(void* ctx, block_callbacks_t* cb) {
-    ums_block_t* dev = ctx;
-    dev->cb = cb;
-}
-
-static void ums_async_complete(iotxn_t* txn, void* cookie) {
-    ums_block_t* dev = (ums_block_t*)txn->extra[0];
-    dev->cb->complete(cookie, txn->status);
-    iotxn_release(txn);
-}
-
-static void ums_async_read(void* ctx, zx_handle_t vmo, uint64_t length,
-                           uint64_t vmo_offset, uint64_t dev_offset, void* cookie) {
-    ums_block_t* dev = ctx;
-
-    iotxn_t* txn;
-    zx_status_t status = iotxn_alloc_vmo(&txn, IOTXN_ALLOC_POOL, vmo, vmo_offset, length);
-    if (status != ZX_OK) {
-        dev->cb->complete(cookie, status);
-        return;
-    }
-    txn->opcode = IOTXN_OP_READ;
-    txn->offset = dev_offset;
-    txn->complete_cb = ums_async_complete;
-    txn->cookie = cookie;
-    txn->extra[0] = (uintptr_t)dev;
-    iotxn_queue(dev->zxdev, txn);
-}
-
-static void ums_async_write(void* ctx, zx_handle_t vmo, uint64_t length,
-                            uint64_t vmo_offset, uint64_t dev_offset, void* cookie) {
-    ums_block_t* dev = ctx;
-
-    iotxn_t* txn;
-    zx_status_t status = iotxn_alloc_vmo(&txn, IOTXN_ALLOC_POOL, vmo, vmo_offset, length);
-    if (status != ZX_OK) {
-        dev->cb->complete(cookie, status);
-        return;
-    }
-    txn->opcode = IOTXN_OP_WRITE;
-    txn->offset = dev_offset;
-    txn->complete_cb = ums_async_complete;
-    txn->cookie = cookie;
-    txn->extra[0] = (uintptr_t)dev;
-    iotxn_queue(dev->zxdev, txn);
-}
-
-static block_protocol_ops_t ums_block_ops = {
-    .set_callbacks = ums_async_set_callbacks,
-    .get_info = ums_get_info,
-    .read = ums_async_read,
-    .write = ums_async_write,
-};
-
 zx_status_t ums_block_add_device(ums_t* ums, ums_block_t* dev) {
-    dev->cb = NULL;
-
     char name[16];
     snprintf(name, sizeof(name), "lun-%03d", dev->lun);
 
@@ -156,7 +98,7 @@ zx_status_t ums_block_add_device(ums_t* ums, ums_block_t* dev) {
         .name = name,
         .ctx = dev,
         .ops = &ums_block_proto,
-        .proto_id = ZX_PROTOCOL_BLOCK_CORE,
+        .proto_id = ZX_PROTOCOL_BLOCK_IMPL,
         .proto_ops = &ums_block_ops,
     };
 

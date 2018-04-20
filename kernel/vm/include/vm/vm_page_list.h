@@ -11,7 +11,7 @@
 #include <fbl/intrusive_wavl_tree.h>
 #include <fbl/macros.h>
 #include <fbl/unique_ptr.h>
-#include <kernel/vm.h>
+#include <vm/vm.h>
 #include <zircon/types.h>
 
 struct vm_page;
@@ -191,6 +191,7 @@ public:
     vm_page* GetPage(uint64_t offset);
     zx_status_t FreePage(uint64_t offset);
     size_t FreeAllPages();
+    bool IsEmpty();
 
 private:
     fbl::WAVLTree<uint64_t, fbl::unique_ptr<VmPageListNode>> list_;

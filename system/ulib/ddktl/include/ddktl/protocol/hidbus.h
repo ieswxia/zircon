@@ -104,7 +104,7 @@ class HidBusProtocol : public internal::base_protocol {
         ops_.set_protocol = SetProtocol;
 
         // Can only inherit from one base_protocol implemenation
-        ZX_ASSERT(ddk_proto_ops_ == nullptr);
+        ZX_ASSERT(ddk_proto_id_ == 0);
         ddk_proto_id_ = ZX_PROTOCOL_HIDBUS;
         ddk_proto_ops_ = &ops_;
     }
@@ -128,8 +128,8 @@ class HidBusProtocol : public internal::base_protocol {
     }
 
     static zx_status_t GetReport(void* ctx, uint8_t rpt_type, uint8_t rpt_id, void* data,
-                                 size_t len) {
-        return static_cast<D*>(ctx)->HidBusGetReport(rpt_type, rpt_id, data, len);
+                                 size_t len, size_t* out_len) {
+        return static_cast<D*>(ctx)->HidBusGetReport(rpt_type, rpt_id, data, len, out_len);
     }
 
     static zx_status_t SetReport(void* ctx, uint8_t rpt_type, uint8_t rpt_id, void* data,

@@ -17,7 +17,7 @@
 #include <platform.h>
 #include <platform/debug.h>
 #include <kernel/thread.h>
-#include <kernel/vm.h>
+#include <vm/vm.h>
 
 #if WITH_LIB_DEBUGLOG
 #include <lib/debuglog.h>
@@ -39,18 +39,18 @@
 #endif
 
 
-static spin_lock_t dputc_spin_lock = 0;
+static spin_lock_t dputc_spin_lock = SPIN_LOCK_INITIAL_VALUE;
 
 void __kernel_serial_write(const char *str, size_t len) {
     spin_lock_saved_state_t state;
     spin_lock_save(&dputc_spin_lock, &state, PRINT_LOCK_FLAGS);
     /* write out the serial port */
-    platform_dputs(str, len);
+    platform_dputs_irq(str, len);
     spin_unlock_restore(&dputc_spin_lock, state, PRINT_LOCK_FLAGS);
 }
 
 
-static spin_lock_t print_spin_lock = 0;
+static spin_lock_t print_spin_lock = SPIN_LOCK_INITIAL_VALUE;
 static struct list_node print_callbacks = LIST_INITIAL_VALUE(print_callbacks);
 
 void __kernel_console_write(const char *str, size_t len)

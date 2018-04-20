@@ -4,12 +4,12 @@
 
 #pragma once
 
-#include <fs/dispatcher.h>
-#include <fs/vfs.h>
-#include <zircon/types.h>
 #include <fbl/array.h>
 #include <fbl/ref_ptr.h>
 #include <fbl/string_piece.h>
+#include <fs/vfs.h>
+#include <fs/vnode.h>
+#include <zircon/types.h>
 
 namespace vmofs {
 
@@ -31,12 +31,12 @@ public:
               zx_off_t length);
     ~VnodeFile() override;
 
-    zx_status_t Open(uint32_t flags) final;
+    zx_status_t ValidateFlags(uint32_t flags) final;
     zx_status_t Serve(fs::Vfs* vfs, zx::channel channel, uint32_t flags) final;
-    ssize_t Read(void* data, size_t len, size_t off) final;
+    zx_status_t Read(void* data, size_t len, size_t off, size_t* out_actual) final;
     zx_status_t Getattr(vnattr_t* a) final;
-    zx_status_t GetHandles(uint32_t flags, zx_handle_t* hnds,
-                           uint32_t* type, void* extra, uint32_t* esize) final;
+    zx_status_t GetHandles(uint32_t flags, zx_handle_t* hnd, uint32_t* type,
+                           zxrio_object_info_t* extra) final;
 
     uint32_t GetVType() final;
 
@@ -55,10 +55,11 @@ public:
              fbl::Array<fbl::RefPtr<Vnode>> children);
     ~VnodeDir() override;
 
-    zx_status_t Open(uint32_t flags) final;
-    zx_status_t Lookup(fbl::RefPtr<fs::Vnode>* out, const char* name, size_t len) final;
+    zx_status_t ValidateFlags(uint32_t flags) final;
+    zx_status_t Lookup(fbl::RefPtr<fs::Vnode>* out, fbl::StringPiece name) final;
     zx_status_t Getattr(vnattr_t* a) final;
-    zx_status_t Readdir(void* cookie, void* dirents, size_t len) final;
+    zx_status_t Readdir(fs::vdircookie_t* cookie, void* dirents, size_t len,
+                        size_t* out_actual) final;
 
     uint32_t GetVType() final;
 

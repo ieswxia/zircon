@@ -2,12 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#include <ddk/device.h>
-#include <ddk/driver.h>
-#include <ddk/binding.h>
 #include <ddk/iotxn.h>
-#include <ddk/protocol/test.h>
-
 #include <unittest/unittest.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -54,6 +49,27 @@ static bool test_physmap_clone(void) {
     ASSERT_EQ(txn->phys_count, clone->phys_count, "unexpected clone phys_count");
     iotxn_release(txn);
     iotxn_release(clone);
+    END_TEST;
+}
+
+static bool test_physmap_clone_partial(void) {
+    BEGIN_TEST;
+    iotxn_t* txn;
+    ASSERT_EQ(iotxn_alloc(&txn, 0, PAGE_SIZE * 3), ZX_OK, "");
+    ASSERT_NONNULL(txn, "");
+    ASSERT_EQ(iotxn_physmap(txn), ZX_OK, "");
+    ASSERT_NONNULL(txn->phys, "expected phys to be set");
+    ASSERT_EQ(txn->phys_count, 3u, "unexpected phys_count");
+
+    iotxn_t* clone = NULL;
+    txn->length = PAGE_SIZE * 3;
+    ASSERT_EQ(iotxn_clone_partial(txn, PAGE_SIZE * 2, PAGE_SIZE * 2, &clone),
+              ZX_ERR_INVALID_ARGS, "expected vmo not to be large enough");
+    ASSERT_EQ(iotxn_clone_partial(txn, PAGE_SIZE * 2, PAGE_SIZE * 1, &clone),
+              ZX_OK, "");
+
+    ASSERT_NONNULL(clone->phys, "expected phys to be set");
+    ASSERT_EQ(clone->phys_count, 1u, "");
     END_TEST;
 }
 
@@ -425,6 +441,7 @@ BEGIN_TEST_CASE(iotxn_tests)
 RUN_TEST(test_physmap_simple)
 RUN_TEST(test_physmap_contiguous)
 RUN_TEST(test_physmap_clone)
+RUN_TEST(test_physmap_clone_partial)
 RUN_TEST(test_physmap_aligned_offset)
 RUN_TEST(test_physmap_unaligned_offset)
 RUN_TEST(test_physmap_unaligned_offset2)
@@ -436,50 +453,4 @@ RUN_TEST(test_phys_iter_tiny_aligned)
 RUN_TEST(test_phys_iter_tiny_unaligned)
 END_TEST_CASE(iotxn_tests)
 
-static void iotxn_test_output_func(const char* line, int len, void* arg) {
-    zx_handle_t h = *(zx_handle_t*)arg;
-    // len is not actually the number of bytes to output
-    zx_socket_write(h, 0u, line, strlen(line), NULL);
-}
-
-static zx_status_t iotxn_test_func(void* cookie, test_report_t* report, const void* arg, size_t arglen) {
-    zx_device_t* dev = (zx_device_t*)cookie;
-
-    test_protocol_t proto;
-    zx_status_t status = device_get_protocol(dev, ZX_PROTOCOL_TEST, &proto);
-    if (status != ZX_OK) {
-        return status;
-    }
-
-    zx_handle_t output = proto.ops->get_output_socket(proto.ctx);
-    if (output != ZX_HANDLE_INVALID) {
-        unittest_set_output_function(iotxn_test_output_func, &output);
-    }
-
-    bool success = unittest_run_one_test(TEST_CASE_ELEMENT(iotxn_tests), TEST_ALL);
-    report->n_tests = 1;
-    report->n_success = success ? 1 : 0;
-    report->n_failed = success ? 0 : 1;
-    return success ? ZX_OK : ZX_ERR_INTERNAL;
-}
-
-static zx_status_t iotxn_test_bind(void* ctx, zx_device_t* dev, void** cookie) {
-    test_protocol_t proto;
-    zx_status_t status = device_get_protocol(dev, ZX_PROTOCOL_TEST, &proto);
-    if (status != ZX_OK) {
-        return status;
-    }
-
-    proto.ops->set_test_func(proto.ctx, iotxn_test_func, dev);
-    return ZX_OK;
-}
-
-static zx_driver_ops_t iotxn_test_driver_ops = {
-    .version = DRIVER_OPS_VERSION,
-    .bind = iotxn_test_bind,
-};
-
-ZIRCON_DRIVER_BEGIN(iotxn_test, iotxn_test_driver_ops, "zircon", "0.1", 2)
-    BI_ABORT_IF_AUTOBIND,
-    BI_MATCH_IF(EQ, BIND_PROTOCOL, ZX_PROTOCOL_TEST),
-ZIRCON_DRIVER_END(iotxn_test)
+struct test_case_element* test_case_ddk_iotxn = TEST_CASE_ELEMENT(iotxn_tests);

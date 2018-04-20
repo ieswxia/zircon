@@ -10,28 +10,27 @@ MODULE := $(LOCAL_DIR)
 
 MODULE_SRCS += \
 	$(LOCAL_DIR)/platform.cpp \
-	$(LOCAL_DIR)/bcm28xx-spin.S \
-
-LINKER_SCRIPT += \
-	$(BUILDDIR)/system-onesegment.ld
 
 ARCH := arm64
-ARM_CPU := cortex-a53
+
+KERNEL_DEFINES += \
+	PLATFORM_SUPPORTS_PANIC_SHELL=1
 
 MODULE_DEPS += \
 	kernel/lib/cbuf \
-	kernel/lib/mdi \
 	kernel/lib/memory_limit \
-	kernel/dev/bcm28xx \
 	kernel/dev/pcie \
 	kernel/dev/pdev \
+	kernel/dev/pdev/power \
 	kernel/dev/timer/arm_generic \
-	kernel/dev/interrupt/arm_gicv2 \
-	kernel/dev/interrupt/arm_gicv3 \
-	kernel/dev/interrupt/bcm28xx \
+	kernel/dev/interrupt/arm_gic/v2 \
+	kernel/dev/interrupt/arm_gic/v3 \
+	kernel/dev/interrupt/arm_gic/common \
+	kernel/dev/power/hisi \
 	kernel/dev/psci \
 	kernel/dev/uart/amlogic_s905 \
-	kernel/dev/uart/bcm28xx \
+	kernel/dev/uart/nxp-imx \
 	kernel/dev/uart/pl011 \
+	kernel/dev/hdcp/amlogic_s912 \
 
 include make/module.mk

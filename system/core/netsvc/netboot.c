@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <threads.h>
 #include <unistd.h>
 
 #include <inet6/inet6.h>
@@ -21,7 +22,9 @@
 #include <zircon/processargs.h>
 #include <zircon/syscalls.h>
 
+#include <zircon/boot/bootdata.h>
 #include <zircon/boot/netboot.h>
+#include <zircon/device/dmctl.h>
 
 static uint32_t last_cookie = 0;
 static uint32_t last_cmd = 0;
@@ -135,7 +138,7 @@ void netboot_advertise(const char* nodename) {
              BOOTLOADER_VERSION, nodename);
     const size_t data_len = strlen((char*)msg->data) + 1;
     udp6_send(buffer, sizeof(nbmsg) + data_len, &ip6_ll_all_nodes,
-              NB_ADVERT_PORT, NB_SERVER_PORT);
+              NB_ADVERT_PORT, NB_SERVER_PORT, false);
 }
 
 static void nb_open(const char* filename, uint32_t cookie, uint32_t arg,
@@ -144,8 +147,8 @@ static void nb_open(const char* filename, uint32_t cookie, uint32_t arg,
     m.magic = NB_MAGIC;
     m.cookie = cookie;
     m.cmd = NB_ACK;
-    m.arg = netfile_open(filename, arg);
-    udp6_send(&m, sizeof(m), saddr, sport, dport);
+    m.arg = netfile_open(filename, arg, NULL);
+    udp6_send(&m, sizeof(m), saddr, sport, dport, false);
 }
 
 static void nb_read(uint32_t cookie, uint32_t arg,
@@ -178,7 +181,7 @@ static void nb_read(uint32_t cookie, uint32_t arg,
         // Ignore bogus read requests -- host will timeout if they're confused
         return;
     }
-    udp6_send(&m, msg_size, saddr, sport, dport);
+    udp6_send(&m, msg_size, saddr, sport, dport, false);
 }
 
 static void nb_write(const char* data, size_t len, uint32_t cookie, uint32_t arg,
@@ -196,7 +199,7 @@ static void nb_write(const char* data, size_t len, uint32_t cookie, uint32_t arg
         blocknum = arg;
     }
     m.cookie = cookie;
-    udp6_send(&m, sizeof(m), saddr, sport, dport);
+    udp6_send(&m, sizeof(m), saddr, sport, dport, false);
 }
 
 static void nb_close(uint32_t cookie,
@@ -206,7 +209,73 @@ static void nb_close(uint32_t cookie,
     m.cookie = cookie;
     m.cmd = NB_ACK;
     m.arg = netfile_close();
-    udp6_send(&m, sizeof(m), saddr, sport, dport);
+    udp6_send(&m, sizeof(m), saddr, sport, dport, false);
+}
+
+static zx_status_t do_dmctl_mexec(void) {
+    // append the cmdline to the bootdata
+    uint32_t section_length = BOOTDATA_ALIGN(nbcmdline.file.size) + sizeof(bootdata_t);
+    uint64_t new_size = nbbootdata.file.size + section_length;
+    zx_status_t st = zx_vmo_set_size(nbbootdata.data, new_size);
+    if (st != ZX_OK) {
+        printf("netbootloader: failed to allocate space to append cmdline to bootdata\n");
+        return st;
+    }
+
+    bootdata_t new_hdr = {
+        .type = BOOTDATA_CMDLINE,
+        .length = nbcmdline.file.size,
+        .extra = 0,
+        .flags = BOOTDATA_FLAG_V2,
+        .reserved0 = 0,
+        .reserved1 = 0,
+        .magic = BOOTITEM_MAGIC,
+        .crc32 = BOOTITEM_NO_CRC32,
+    };
+    bootdata_t* hdr = (bootdata_t*)nbbootdata.file.data;
+
+    st = zx_vmo_write(nbbootdata.data, &new_hdr, hdr->length + sizeof(bootdata_t),
+                      sizeof(bootdata_t));
+    if (st != ZX_OK) {
+        printf("netbootloader: failed to write cmdline header\n");
+        return st;
+    }
+    st = zx_vmo_write(nbbootdata.data, nbcmdline.file.data,
+                      hdr->length + 2 * sizeof(bootdata_t), nbcmdline.file.size);
+    if (st != ZX_OK) {
+        printf("netbootloader: failed to write cmdline\n");
+        return st;
+    }
+
+    hdr->length += section_length;
+
+    zx_handle_t wait_handle;
+    st = zx_handle_duplicate(nbkernel.data, ZX_RIGHT_SAME_RIGHTS, &wait_handle);
+    if (st != ZX_OK) {
+        return st;
+    }
+
+    int fd = open("/dev/misc/dmctl", O_WRONLY);
+    if (fd < 0) {
+        return fd;
+    }
+    dmctl_mexec_args_t args = {
+        .kernel = nbkernel.data,
+        .bootdata = nbbootdata.data,
+    };
+    int r = ioctl_dmctl_mexec(fd, &args);
+    close(fd);
+    if (r < 0) {
+        return r;
+    }
+
+    r = zx_object_wait_one(wait_handle, ZX_USER_SIGNAL_0, ZX_TIME_INFINITE, NULL);
+    zx_handle_close(wait_handle);
+    if (r != ZX_OK) {
+        return r;
+    }
+    // if we get here, mexec failed
+    return ZX_ERR_INTERNAL;
 }
 
 static void bootloader_recv(void* data, size_t len,
@@ -299,6 +368,10 @@ static void bootloader_recv(void* data, size_t len,
         break;
     case NB_BOOT:
         do_boot = true;
+        // Wait for the paver to complete
+        while (atomic_load(&paving_in_progress)) {
+            thrd_yield();
+        }
         printf("netboot: Boot Kernel...\n");
         break;
     default:
@@ -316,12 +389,17 @@ static void bootloader_recv(void* data, size_t len,
     ack.magic = NB_MAGIC;
 transmit:
     if (do_transmit) {
-        udp6_send(&ack, sizeof(ack), saddr, sport, NB_SERVER_PORT);
+        udp6_send(&ack, sizeof(ack), saddr, sport, NB_SERVER_PORT, false);
     }
 
     if (do_boot) {
-        zx_system_mexec(nbkernel.data, nbbootdata.data, (char*)nbcmdline.file.data,
-                        nbcmdline.file.size);
+        if (do_dmctl_mexec() != ZX_OK) {
+            // TODO: This will return before the system actually mexecs.
+            // We can't pass an event to wait on here because fdio
+            // has a limit of 3 handles, and we're already using
+            // all 3 to pass boot parameters.
+            printf("netboot: Boot failed\n");
+        }
     }
 }
 
@@ -354,7 +432,7 @@ void netboot_recv(void *data, size_t len, bool is_mcast,
         msg->cmd = NB_ACK;
         memcpy(buf, msg, sizeof(nbmsg));
         memcpy(buf + sizeof(nbmsg), nodename, dlen);
-        udp6_send(buf, sizeof(nbmsg) + dlen, saddr, sport, dport);
+        udp6_send(buf, sizeof(nbmsg) + dlen, saddr, sport, dport, false);
         break;
     case NB_SHELL_CMD:
         if (!is_mcast) {

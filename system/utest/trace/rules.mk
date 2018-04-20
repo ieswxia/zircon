@@ -16,15 +16,18 @@ MODULE_SRCS += \
     $(LOCAL_DIR)/event_tests.cpp \
     $(LOCAL_DIR)/fields_tests.cpp \
     $(LOCAL_DIR)/fixture.cpp \
-    $(LOCAL_DIR)/main.c
+    $(LOCAL_DIR)/main.c \
+    $(LOCAL_DIR)/record_tests.cpp
 
 MODULE_NAME := trace-test
 
 MODULE_STATIC_LIBS := \
     system/ulib/trace \
     system/ulib/trace-reader \
+    system/ulib/async.cpp \
     system/ulib/async \
-    system/ulib/async.loop \
+    system/ulib/async-loop.cpp \
+    system/ulib/async-loop \
     system/ulib/zx \
     system/ulib/zxcpp \
     system/ulib/fbl

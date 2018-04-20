@@ -8,7 +8,6 @@
 #include <zircon/device/device.h>
 #include <zircon/syscalls.h>
 #include <zircon/types.h>
-#include <ddk/iotxn.h>
 #include <zircon/listnode.h>
 
 __BEGIN_CDECLS;
@@ -23,6 +22,17 @@ typedef struct zx_protocol_device zx_protocol_device_t;
 
 // echo -n "zx_device_ops_v0.5" | sha256sum | cut -c1-16
 #define DEVICE_OPS_VERSION 0Xc9410d2a24f57424
+
+// TODO: temporary flags used by devcoord to communicate
+// with the system bus device.
+#define DEVICE_SUSPEND_FLAG_REBOOT      0xdcdc0100
+#define DEVICE_SUSPEND_FLAG_POWEROFF    0xdcdc0200
+#define DEVICE_SUSPEND_FLAG_MEXEC       0xdcdc0300
+#define DEVICE_SUSPEND_FLAG_SUSPEND_RAM 0xdcdc0400
+#define DEVICE_SUSPEND_REASON_MASK      0xffffff00
+
+// reboot modifiers
+#define DEVICE_SUSPEND_FLAG_REBOOT_BOOTLOADER   (DEVICE_SUSPEND_FLAG_REBOOT | 0x01)
 
 //@doc(docs/ddk/device-ops.md)
 
@@ -87,6 +97,10 @@ typedef struct zx_protocol_device {
     // possible for further open or open_at calls to occur, but io operations, etc
     // may continue until those client connections are closed.
     //
+    // The driver should avoid further method calls to its parent device or any
+    // protocols obtained from that device, and expect that any further such calls
+    // will return with an error.
+    //
     // The driver should adjust its state to encourage its client connections to close
     // (cause IO to error out, etc), and call **device_remove()** on itself when ready.
     //
@@ -101,8 +115,8 @@ typedef struct zx_protocol_device {
     // removed and released.
     //
     // At the point release is invoked, the driver will not receive any further calls
-    // and absolutely must not use the underlying **zx_device_t** once this method
-    // returns.
+    // and absolutely must not use the underlying **zx_device_t** or any protocols obtained
+    // from that device once this method returns.
     //
     // The driver must free all memory and release all resources related to this device
     // before returning.
@@ -121,8 +135,7 @@ typedef struct zx_protocol_device {
     // data becomes available `device_state_set(DEVICE_STATE_READABLE)` may be used to
     // signal waiting clients.
     //
-    // This hook **must not block**.  Use `iotxn_queue` to handle IO which
-    // requires processing and delayed status.
+    // This hook **must not block**.
     //
     // The default read implementation returns **ZX_ERR_NOT_SUPPORTED**.
     //
@@ -139,31 +152,12 @@ typedef struct zx_protocol_device {
     // be returned and when it is again possible to write,
     // `device_state_set(DEVICE_STATE_WRITABLE)` may be used to signal waiting clients.
     //
-    // This hook **must not block**.  Use `iotxn_queue` to handle IO which
-    // requires processing and delayed status.
+    // This hook **must not block**.
     //
     // The default write implementation returns **ZX_ERR_NOT_SUPPORTED**.
     //
     zx_status_t (*write)(void* ctx, const void* buf, size_t count,
                          zx_off_t off, size_t* actual);
-
-    //@ ## iotxn_queue
-    // The iotxn_queue hook is the core mechanism for asynchronous IO.  A driver that
-    // implements iotxn_queue should not implement read or write, as iotxn_queue takes
-    // precedence over them.
-    //
-    // The iotxn_queue hook may not block.  It is expected to start the IO operation
-    // and return immediately, having taken ownership of *txn*.
-    //
-    // When the operation succeeds or fails, the completion callback on *txn* must be
-    // called to finish the operation.  If the request is invalid, the completion
-    // callback may be called from within the iotxn_queue hook.  Otherwise it is
-    // usually called from an irq handler or worker thread that observes the success
-    // or failure of the requested IO operation.
-    //
-    // There is no default iotxn_queue implementation.
-    //
-    void (*iotxn_queue)(void* ctx, iotxn_t* txn);
 
     //@ ## get_size
     // If the device is seekable, the get_size hook should return the size of the device.
@@ -176,7 +170,7 @@ typedef struct zx_protocol_device {
     //@ ## ioctl
     // The ioctl hook allows support for device-specific operations.
     //
-    // These, like read, write, and iotxn_queue, must not block.
+    // These, like read and write, must not block.
     //
     // On success, **ZX_OK** must be returned and *out_actual* must be set
     // to the number of output bytes provided (0 if none).
@@ -198,8 +192,13 @@ typedef struct zx_protocol_device {
     // device that is shadowing is notified by the rxrpc op and
     // should attempt to read and respond to a single message on
     // the provided channel.
+    //
     // Any error return from this method will result in the channel
     // being closed and the remote "shadow" losing its connection.
+    //
+    // This method is called with ZX_HANDLE_INVALID for the channel
+    // when a new client connects -- at which point any state from
+    // the previous client should be torn down.
     zx_status_t (*rxrpc)(void* ctx, zx_handle_t channel);
 } zx_protocol_device_t;
 
@@ -208,8 +207,6 @@ typedef struct zx_protocol_device {
 const char* device_get_name(zx_device_t* dev);
 
 zx_device_t* device_get_parent(zx_device_t* dev);
-
-zx_handle_t device_get_resource(zx_device_t* dev);
 
 // protocols look like:
 // typedef struct {
@@ -231,10 +228,6 @@ zx_off_t device_get_size(zx_device_t* dev);
 zx_status_t device_ioctl(zx_device_t* dev, uint32_t op,
                          const void* in_buf, size_t in_len,
                          void* out_buf, size_t out_len, size_t* out_actual);
-
-// return ZX_ERR_NOT_SUPPORTED if this device does not support the iotxn_queue op
-// otherwise returns ZX_OK aftering queuing the iotxn
-zx_status_t device_iotxn_queue(zx_device_t* dev, iotxn_t* txn);
 
 // Device State Change Functions
 //@ #### Device State Bits

@@ -117,6 +117,9 @@ AcpiHwLegacySleep (
     UINT8                   SleepState);
 
 ACPI_STATUS
+AcpiHwLegacySleepFinal(UINT8 SleepState, UINT8 SleepTypeA, UINT8 SleepTypeB);
+
+ACPI_STATUS
 AcpiHwLegacyWakePrep (
     UINT8                   SleepState);
 
@@ -124,6 +127,13 @@ ACPI_STATUS
 AcpiHwLegacyWake (
     UINT8                   SleepState);
 
+#if (!ACPI_REDUCED_HARDWARE)
+ACPI_STATUS
+AcpiHwSetFirmwareWakingVector (
+    ACPI_TABLE_FACS         *Facs,
+    ACPI_PHYSICAL_ADDRESS   PhysicalAddress,
+    ACPI_PHYSICAL_ADDRESS   PhysicalAddress64);
+#endif
 
 /*
  * hwesleep - sleep/wake support (Extended FADT-V5 sleep registers)

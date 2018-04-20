@@ -28,6 +28,19 @@ static bool socket_basic(void) {
     status = zx_socket_create(0, h, h + 1);
     ASSERT_EQ(status, ZX_OK, "");
 
+    // Check that koids line up.
+    zx_info_handle_basic_t info[2] = {};
+    status = zx_object_get_info(h[0], ZX_INFO_HANDLE_BASIC, &info[0], sizeof(info[0]), NULL, NULL);
+    ASSERT_EQ(status, ZX_OK, "");
+    status = zx_object_get_info(h[1], ZX_INFO_HANDLE_BASIC, &info[1], sizeof(info[1]), NULL, NULL);
+    ASSERT_EQ(status, ZX_OK, "");
+    ASSERT_NE(info[0].koid, 0u, "zero koid!");
+    ASSERT_NE(info[0].related_koid, 0u, "zero peer koid!");
+    ASSERT_NE(info[1].koid, 0u, "zero koid!");
+    ASSERT_NE(info[1].related_koid, 0u, "zero peer koid!");
+    ASSERT_EQ(info[0].koid, info[1].related_koid, "mismatched koids!");
+    ASSERT_EQ(info[1].koid, info[0].related_koid, "mismatched koids!");
+
     status = zx_socket_read(h[0], 0u, read_data, sizeof(read_data), &count);
     EXPECT_EQ(status, ZX_ERR_SHOULD_WAIT, "");
 
@@ -75,8 +88,8 @@ static bool socket_signals(void) {
     zx_signals_t signals0 = get_satisfied_signals(h0);
     zx_signals_t signals1 = get_satisfied_signals(h1);
 
-    EXPECT_EQ(signals0, ZX_SOCKET_WRITABLE | ZX_SIGNAL_LAST_HANDLE, "");
-    EXPECT_EQ(signals1, ZX_SOCKET_WRITABLE | ZX_SIGNAL_LAST_HANDLE, "");
+    EXPECT_EQ(signals0, ZX_SOCKET_WRITABLE, "");
+    EXPECT_EQ(signals1, ZX_SOCKET_WRITABLE, "");
 
     const size_t kAllSize = 128 * 1024;
     char* big_buf =  (char*) malloc(kAllSize);
@@ -91,8 +104,8 @@ static bool socket_signals(void) {
     signals0 = get_satisfied_signals(h0);
     signals1 = get_satisfied_signals(h1);
 
-    EXPECT_EQ(signals0, ZX_SOCKET_WRITABLE | ZX_SIGNAL_LAST_HANDLE, "");
-    EXPECT_EQ(signals1, ZX_SOCKET_READABLE | ZX_SOCKET_WRITABLE | ZX_SIGNAL_LAST_HANDLE, "");
+    EXPECT_EQ(signals0, ZX_SOCKET_WRITABLE, "");
+    EXPECT_EQ(signals1, ZX_SOCKET_READABLE | ZX_SOCKET_WRITABLE, "");
 
     status = zx_socket_read(h1, 0u, big_buf, kAllSize, &count);
     EXPECT_EQ(status, ZX_OK, "");
@@ -101,8 +114,8 @@ static bool socket_signals(void) {
     signals0 = get_satisfied_signals(h0);
     signals1 = get_satisfied_signals(h1);
 
-    EXPECT_EQ(signals0, ZX_SOCKET_WRITABLE | ZX_SIGNAL_LAST_HANDLE, "");
-    EXPECT_EQ(signals1, ZX_SOCKET_WRITABLE | ZX_SIGNAL_LAST_HANDLE, "");
+    EXPECT_EQ(signals0, ZX_SOCKET_WRITABLE, "");
+    EXPECT_EQ(signals1, ZX_SOCKET_WRITABLE, "");
 
     status = zx_object_signal_peer(h0, ZX_SOCKET_WRITABLE, 0u);
     EXPECT_EQ(status, ZX_ERR_INVALID_ARGS, "");
@@ -113,13 +126,13 @@ static bool socket_signals(void) {
     signals0 = get_satisfied_signals(h0);
     signals1 = get_satisfied_signals(h1);
 
-    EXPECT_EQ(signals0, ZX_SOCKET_WRITABLE | ZX_SIGNAL_LAST_HANDLE, "");
-    EXPECT_EQ(signals1, ZX_SOCKET_WRITABLE | ZX_USER_SIGNAL_1 | ZX_SIGNAL_LAST_HANDLE, "");
+    EXPECT_EQ(signals0, ZX_SOCKET_WRITABLE, "");
+    EXPECT_EQ(signals1, ZX_SOCKET_WRITABLE | ZX_USER_SIGNAL_1, "");
 
     zx_handle_close(h1);
 
     signals0 = get_satisfied_signals(h0);
-    EXPECT_EQ(signals0, ZX_SOCKET_PEER_CLOSED | ZX_SIGNAL_LAST_HANDLE, "");
+    EXPECT_EQ(signals0, ZX_SOCKET_PEER_CLOSED, "");
 
     zx_handle_close(h0);
 
@@ -141,8 +154,8 @@ static bool socket_shutdown_write(void) {
     signals0 = get_satisfied_signals(h0);
     signals1 = get_satisfied_signals(h1);
 
-    EXPECT_EQ(signals0, ZX_SOCKET_WRITABLE | ZX_SIGNAL_LAST_HANDLE, "");
-    EXPECT_EQ(signals1, ZX_SOCKET_WRITABLE | ZX_SIGNAL_LAST_HANDLE, "");
+    EXPECT_EQ(signals0, ZX_SOCKET_WRITABLE, "");
+    EXPECT_EQ(signals1, ZX_SOCKET_WRITABLE, "");
 
     status = zx_socket_write(h1, 0u, "12345", 5u, &count);
     EXPECT_EQ(status, ZX_OK, "");
@@ -155,16 +168,16 @@ static bool socket_shutdown_write(void) {
     signals1 = get_satisfied_signals(h1);
 
     EXPECT_EQ(signals0,
-        ZX_SOCKET_WRITABLE | ZX_SOCKET_READABLE | ZX_SIGNAL_LAST_HANDLE,
+        ZX_SOCKET_WRITABLE | ZX_SOCKET_READABLE,
         "");
-    EXPECT_EQ(signals1, ZX_SOCKET_WRITE_DISABLED | ZX_SIGNAL_LAST_HANDLE, "");
+    EXPECT_EQ(signals1, ZX_SOCKET_WRITE_DISABLED, "");
 
     status = zx_socket_write(h0, 0u, "abcde", 5u, &count);
     EXPECT_EQ(status, ZX_OK, "");
     EXPECT_EQ(count, 5u, "");
 
     signals1 = get_satisfied_signals(h1);
-    EXPECT_EQ(signals1, ZX_SOCKET_READABLE | ZX_SOCKET_WRITE_DISABLED | ZX_SIGNAL_LAST_HANDLE, "");
+    EXPECT_EQ(signals1, ZX_SOCKET_READABLE | ZX_SOCKET_WRITE_DISABLED, "");
 
     status = zx_socket_write(h1, 0u, "fghij", 5u, &count);
     EXPECT_EQ(status, ZX_ERR_BAD_STATE, "");
@@ -180,7 +193,7 @@ static bool socket_shutdown_write(void) {
     EXPECT_EQ(status, ZX_ERR_BAD_STATE, "");
 
     signals0 = get_satisfied_signals(h0);
-    EXPECT_EQ(signals0, ZX_SOCKET_WRITABLE | ZX_SOCKET_READ_DISABLED | ZX_SIGNAL_LAST_HANDLE, "");
+    EXPECT_EQ(signals0, ZX_SOCKET_WRITABLE | ZX_SOCKET_READ_DISABLED, "");
 
     status = zx_socket_read(h1, 0u, rbuf, sizeof(rbuf), &count);
     EXPECT_EQ(status, ZX_OK, "");
@@ -194,7 +207,7 @@ static bool socket_shutdown_write(void) {
     EXPECT_EQ(status, ZX_OK, "");
 
     signals1 = get_satisfied_signals(h1);
-    EXPECT_EQ(signals1, ZX_SOCKET_READ_DISABLED | ZX_SOCKET_WRITE_DISABLED | ZX_SOCKET_PEER_CLOSED | ZX_SIGNAL_LAST_HANDLE, "");
+    EXPECT_EQ(signals1, ZX_SOCKET_READ_DISABLED | ZX_SOCKET_WRITE_DISABLED | ZX_SOCKET_PEER_CLOSED, "");
 
     zx_handle_close(h1);
 
@@ -215,8 +228,8 @@ static bool socket_shutdown_read(void) {
     signals0 = get_satisfied_signals(h0);
     signals1 = get_satisfied_signals(h1);
 
-    EXPECT_EQ(signals0, ZX_SOCKET_WRITABLE | ZX_SIGNAL_LAST_HANDLE, "");
-    EXPECT_EQ(signals1, ZX_SOCKET_WRITABLE | ZX_SIGNAL_LAST_HANDLE, "");
+    EXPECT_EQ(signals0, ZX_SOCKET_WRITABLE, "");
+    EXPECT_EQ(signals1, ZX_SOCKET_WRITABLE, "");
 
     status = zx_socket_write(h1, 0u, "12345", 5u, &count);
     EXPECT_EQ(status, ZX_OK, "");
@@ -228,15 +241,15 @@ static bool socket_shutdown_read(void) {
     signals0 = get_satisfied_signals(h0);
     signals1 = get_satisfied_signals(h1);
 
-    EXPECT_EQ(signals0, ZX_SOCKET_WRITABLE | ZX_SOCKET_READABLE | ZX_SIGNAL_LAST_HANDLE, "");
-    EXPECT_EQ(signals1, ZX_SOCKET_WRITE_DISABLED | ZX_SIGNAL_LAST_HANDLE, "");
+    EXPECT_EQ(signals0, ZX_SOCKET_WRITABLE | ZX_SOCKET_READABLE, "");
+    EXPECT_EQ(signals1, ZX_SOCKET_WRITE_DISABLED, "");
 
     status = zx_socket_write(h0, 0u, "abcde", 5u, &count);
     EXPECT_EQ(status, ZX_OK, "");
     EXPECT_EQ(count, 5u, "");
 
     signals1 = get_satisfied_signals(h1);
-    EXPECT_EQ(signals1, ZX_SOCKET_READABLE | ZX_SOCKET_WRITE_DISABLED | ZX_SIGNAL_LAST_HANDLE, "");
+    EXPECT_EQ(signals1, ZX_SOCKET_READABLE | ZX_SOCKET_WRITE_DISABLED, "");
 
     status = zx_socket_write(h1, 0u, "fghij", 5u, &count);
     EXPECT_EQ(status, ZX_ERR_BAD_STATE, "");
@@ -252,7 +265,7 @@ static bool socket_shutdown_read(void) {
     EXPECT_EQ(status, ZX_ERR_BAD_STATE, "");
 
     signals0 = get_satisfied_signals(h0);
-    EXPECT_EQ(signals0, ZX_SOCKET_WRITABLE | ZX_SOCKET_READ_DISABLED | ZX_SIGNAL_LAST_HANDLE, "");
+    EXPECT_EQ(signals0, ZX_SOCKET_WRITABLE | ZX_SOCKET_READ_DISABLED, "");
 
     status = zx_socket_read(h1, 0u, rbuf, sizeof(rbuf), &count);
     EXPECT_EQ(status, ZX_OK, "");
@@ -324,8 +337,8 @@ static bool socket_bytes_outstanding_shutdown_write(void) {
     signals0 = get_satisfied_signals(h0);
     signals1 = get_satisfied_signals(h1);
 
-    EXPECT_EQ(signals0, ZX_SOCKET_WRITABLE | ZX_SIGNAL_LAST_HANDLE, "");
-    EXPECT_EQ(signals1, ZX_SOCKET_WRITABLE | ZX_SIGNAL_LAST_HANDLE, "");
+    EXPECT_EQ(signals0, ZX_SOCKET_WRITABLE, "");
+    EXPECT_EQ(signals1, ZX_SOCKET_WRITABLE, "");
 
     status = zx_socket_write(h1, 0u, "12345", 5u, &count);
     EXPECT_EQ(status, ZX_OK, "");
@@ -338,16 +351,16 @@ static bool socket_bytes_outstanding_shutdown_write(void) {
     signals1 = get_satisfied_signals(h1);
 
     EXPECT_EQ(signals0,
-        ZX_SOCKET_WRITABLE | ZX_SOCKET_READABLE | ZX_SIGNAL_LAST_HANDLE,
+        ZX_SOCKET_WRITABLE | ZX_SOCKET_READABLE,
         "");
-    EXPECT_EQ(signals1, ZX_SOCKET_WRITE_DISABLED | ZX_SIGNAL_LAST_HANDLE, "");
+    EXPECT_EQ(signals1, ZX_SOCKET_WRITE_DISABLED, "");
 
     status = zx_socket_write(h0, 0u, "abcde", 5u, &count);
     EXPECT_EQ(status, ZX_OK, "");
     EXPECT_EQ(count, 5u, "");
 
     signals1 = get_satisfied_signals(h1);
-    EXPECT_EQ(signals1, ZX_SOCKET_READABLE | ZX_SOCKET_WRITE_DISABLED | ZX_SIGNAL_LAST_HANDLE, "");
+    EXPECT_EQ(signals1, ZX_SOCKET_READABLE | ZX_SOCKET_WRITE_DISABLED, "");
 
     status = zx_socket_write(h1, 0u, "fghij", 5u, &count);
     EXPECT_EQ(status, ZX_ERR_BAD_STATE, "");
@@ -368,7 +381,7 @@ static bool socket_bytes_outstanding_shutdown_write(void) {
     EXPECT_EQ(status, ZX_ERR_BAD_STATE, "");
 
     signals0 = get_satisfied_signals(h0);
-    EXPECT_EQ(signals0, ZX_SOCKET_WRITABLE | ZX_SOCKET_READ_DISABLED | ZX_SIGNAL_LAST_HANDLE, "");
+    EXPECT_EQ(signals0, ZX_SOCKET_WRITABLE | ZX_SOCKET_READ_DISABLED, "");
 
     status = zx_socket_read(h1, 0u, rbuf, sizeof(rbuf), &count);
     EXPECT_EQ(status, ZX_OK, "");
@@ -396,8 +409,8 @@ static bool socket_bytes_outstanding_shutdown_read(void) {
     signals0 = get_satisfied_signals(h0);
     signals1 = get_satisfied_signals(h1);
 
-    EXPECT_EQ(signals0, ZX_SOCKET_WRITABLE | ZX_SIGNAL_LAST_HANDLE, "");
-    EXPECT_EQ(signals1, ZX_SOCKET_WRITABLE | ZX_SIGNAL_LAST_HANDLE, "");
+    EXPECT_EQ(signals0, ZX_SOCKET_WRITABLE, "");
+    EXPECT_EQ(signals1, ZX_SOCKET_WRITABLE, "");
 
     status = zx_socket_write(h1, 0u, "12345", 5u, &count);
     EXPECT_EQ(status, ZX_OK, "");
@@ -409,15 +422,15 @@ static bool socket_bytes_outstanding_shutdown_read(void) {
     signals0 = get_satisfied_signals(h0);
     signals1 = get_satisfied_signals(h1);
 
-    EXPECT_EQ(signals0, ZX_SOCKET_WRITABLE | ZX_SOCKET_READABLE | ZX_SIGNAL_LAST_HANDLE, "");
-    EXPECT_EQ(signals1, ZX_SOCKET_WRITE_DISABLED | ZX_SIGNAL_LAST_HANDLE, "");
+    EXPECT_EQ(signals0, ZX_SOCKET_WRITABLE | ZX_SOCKET_READABLE, "");
+    EXPECT_EQ(signals1, ZX_SOCKET_WRITE_DISABLED, "");
 
     status = zx_socket_write(h0, 0u, "abcde", 5u, &count);
     EXPECT_EQ(status, ZX_OK, "");
     EXPECT_EQ(count, 5u, "");
 
     signals1 = get_satisfied_signals(h1);
-    EXPECT_EQ(signals1, ZX_SOCKET_READABLE | ZX_SOCKET_WRITE_DISABLED | ZX_SIGNAL_LAST_HANDLE, "");
+    EXPECT_EQ(signals1, ZX_SOCKET_READABLE | ZX_SOCKET_WRITE_DISABLED, "");
 
     status = zx_socket_write(h1, 0u, "fghij", 5u, &count);
     EXPECT_EQ(status, ZX_ERR_BAD_STATE, "");
@@ -438,7 +451,7 @@ static bool socket_bytes_outstanding_shutdown_read(void) {
     EXPECT_EQ(status, ZX_ERR_BAD_STATE, "");
 
     signals0 = get_satisfied_signals(h0);
-    EXPECT_EQ(signals0, ZX_SOCKET_WRITABLE | ZX_SOCKET_READ_DISABLED | ZX_SIGNAL_LAST_HANDLE, "");
+    EXPECT_EQ(signals0, ZX_SOCKET_WRITABLE | ZX_SOCKET_READ_DISABLED, "");
 
     status = zx_socket_read(h1, 0u, rbuf, sizeof(rbuf), &count);
     EXPECT_EQ(status, ZX_OK, "");
@@ -607,8 +620,8 @@ static bool socket_control_plane(void) {
 
     zx_signals_t signals0 = get_satisfied_signals(h0);
     zx_signals_t signals1 = get_satisfied_signals(h1);
-    EXPECT_EQ(signals0, ZX_SOCKET_WRITABLE | ZX_SOCKET_CONTROL_WRITABLE | ZX_SIGNAL_LAST_HANDLE, "");
-    EXPECT_EQ(signals1, ZX_SOCKET_WRITABLE | ZX_SOCKET_CONTROL_WRITABLE | ZX_SIGNAL_LAST_HANDLE, "");
+    EXPECT_EQ(signals0, ZX_SOCKET_WRITABLE | ZX_SOCKET_CONTROL_WRITABLE, "");
+    EXPECT_EQ(signals1, ZX_SOCKET_WRITABLE | ZX_SOCKET_CONTROL_WRITABLE, "");
 
     // Write to the control plane.
     size_t count;
@@ -618,8 +631,8 @@ static bool socket_control_plane(void) {
 
     signals0 = get_satisfied_signals(h0);
     signals1 = get_satisfied_signals(h1);
-    EXPECT_EQ(signals0, ZX_SOCKET_WRITABLE | ZX_SIGNAL_LAST_HANDLE, "");
-    EXPECT_EQ(signals1, ZX_SOCKET_WRITABLE | ZX_SOCKET_CONTROL_READABLE | ZX_SOCKET_CONTROL_WRITABLE | ZX_SIGNAL_LAST_HANDLE, "");
+    EXPECT_EQ(signals0, ZX_SOCKET_WRITABLE, "");
+    EXPECT_EQ(signals1, ZX_SOCKET_WRITABLE | ZX_SOCKET_CONTROL_READABLE | ZX_SOCKET_CONTROL_WRITABLE, "");
 
     status = zx_socket_write(h0, ZX_SOCKET_CONTROL, "hi", 2u, NULL);
     EXPECT_EQ(status, ZX_ERR_SHOULD_WAIT, "");
@@ -630,8 +643,8 @@ static bool socket_control_plane(void) {
 
     signals0 = get_satisfied_signals(h0);
     signals1 = get_satisfied_signals(h1);
-    EXPECT_EQ(signals0, ZX_SOCKET_WRITABLE | ZX_SOCKET_CONTROL_READABLE | ZX_SIGNAL_LAST_HANDLE, "");
-    EXPECT_EQ(signals1, ZX_SOCKET_WRITABLE | ZX_SOCKET_CONTROL_READABLE | ZX_SIGNAL_LAST_HANDLE, "");
+    EXPECT_EQ(signals0, ZX_SOCKET_WRITABLE | ZX_SOCKET_CONTROL_READABLE, "");
+    EXPECT_EQ(signals1, ZX_SOCKET_WRITABLE | ZX_SOCKET_CONTROL_READABLE, "");
 
     status = zx_socket_write(h1, ZX_SOCKET_CONTROL, "hi", 2u, NULL);
     EXPECT_EQ(status, ZX_ERR_SHOULD_WAIT, "");
@@ -670,8 +683,8 @@ static bool socket_control_plane(void) {
 
     signals0 = get_satisfied_signals(h0);
     signals1 = get_satisfied_signals(h1);
-    EXPECT_EQ(signals0, ZX_SOCKET_WRITABLE | ZX_SOCKET_CONTROL_WRITABLE | ZX_SIGNAL_LAST_HANDLE, "");
-    EXPECT_EQ(signals1, ZX_SOCKET_WRITABLE | ZX_SOCKET_CONTROL_WRITABLE | ZX_SIGNAL_LAST_HANDLE, "");
+    EXPECT_EQ(signals0, ZX_SOCKET_WRITABLE | ZX_SOCKET_CONTROL_WRITABLE, "");
+    EXPECT_EQ(signals1, ZX_SOCKET_WRITABLE | ZX_SOCKET_CONTROL_WRITABLE, "");
 
     END_TEST;
 }
@@ -688,8 +701,8 @@ static bool socket_control_plane_shutdown(void) {
 
     zx_signals_t signals0 = get_satisfied_signals(h0);
     zx_signals_t signals1 = get_satisfied_signals(h1);
-    EXPECT_EQ(signals0, ZX_SOCKET_WRITABLE | ZX_SOCKET_CONTROL_WRITABLE | ZX_SIGNAL_LAST_HANDLE, "");
-    EXPECT_EQ(signals1, ZX_SOCKET_WRITABLE | ZX_SOCKET_CONTROL_WRITABLE | ZX_SIGNAL_LAST_HANDLE, "");
+    EXPECT_EQ(signals0, ZX_SOCKET_WRITABLE | ZX_SOCKET_CONTROL_WRITABLE, "");
+    EXPECT_EQ(signals1, ZX_SOCKET_WRITABLE | ZX_SOCKET_CONTROL_WRITABLE, "");
 
     status = zx_socket_write(h1, 0u, "12345", 5u, &count);
     EXPECT_EQ(status, ZX_OK, "");
@@ -700,8 +713,8 @@ static bool socket_control_plane_shutdown(void) {
 
     signals0 = get_satisfied_signals(h0);
     signals1 = get_satisfied_signals(h1);
-    EXPECT_EQ(signals0, ZX_SOCKET_WRITABLE | ZX_SOCKET_CONTROL_WRITABLE | ZX_SOCKET_READABLE | ZX_SIGNAL_LAST_HANDLE, "");
-    EXPECT_EQ(signals1, ZX_SOCKET_WRITE_DISABLED | ZX_SOCKET_CONTROL_WRITABLE | ZX_SIGNAL_LAST_HANDLE, "");
+    EXPECT_EQ(signals0, ZX_SOCKET_WRITABLE | ZX_SOCKET_CONTROL_WRITABLE | ZX_SOCKET_READABLE, "");
+    EXPECT_EQ(signals1, ZX_SOCKET_WRITE_DISABLED | ZX_SOCKET_CONTROL_WRITABLE, "");
 
     status = zx_socket_write(h0, ZX_SOCKET_CONTROL, "hello1", 6u, &count);
     EXPECT_EQ(status, ZX_OK, "");
@@ -713,12 +726,91 @@ static bool socket_control_plane_shutdown(void) {
 
     signals0 = get_satisfied_signals(h0);
     signals1 = get_satisfied_signals(h1);
-    EXPECT_EQ(signals0, ZX_SOCKET_WRITABLE | ZX_SOCKET_CONTROL_READABLE | ZX_SOCKET_READABLE | ZX_SIGNAL_LAST_HANDLE, "");
-    EXPECT_EQ(signals1, ZX_SOCKET_WRITE_DISABLED | ZX_SOCKET_CONTROL_READABLE | ZX_SIGNAL_LAST_HANDLE, "");
+    EXPECT_EQ(signals0, ZX_SOCKET_WRITABLE | ZX_SOCKET_CONTROL_READABLE | ZX_SOCKET_READABLE, "");
+    EXPECT_EQ(signals1, ZX_SOCKET_WRITE_DISABLED | ZX_SOCKET_CONTROL_READABLE, "");
 
     END_TEST;
 }
 
+static bool socket_accept(void) {
+    BEGIN_TEST;
+
+    zx_status_t status;
+
+    zx_handle_t a0, a1;
+    status = zx_socket_create(ZX_SOCKET_HAS_ACCEPT, &a0, &a1);
+    ASSERT_EQ(status, ZX_OK, "");
+
+    zx_handle_t b0, b1;
+    status = zx_socket_create(0, &b0, &b1);
+    ASSERT_EQ(status, ZX_OK, "");
+
+    zx_handle_t c0, c1;
+    status = zx_socket_create(0, &c0, &c1);
+    ASSERT_EQ(status, ZX_OK, "");
+
+    zx_signals_t signals0 = get_satisfied_signals(a0);
+    zx_signals_t signals1 = get_satisfied_signals(a1);
+    EXPECT_EQ(signals0, ZX_SOCKET_WRITABLE | ZX_SOCKET_SHARE, "");
+    EXPECT_EQ(signals1, ZX_SOCKET_WRITABLE | ZX_SOCKET_SHARE, "");
+
+    // cannot share a HAS_ACCEPT socket
+    status = zx_socket_share(b0, a0);
+    EXPECT_EQ(status, ZX_ERR_BAD_STATE, "");
+
+    // cannot share via a non-HAS_ACCEPT socket
+    status = zx_socket_share(b0, c0);
+    EXPECT_EQ(status, ZX_ERR_NOT_SUPPORTED, "");
+
+    // cannot share a socket via itself (either direction)
+    status = zx_socket_share(a0, a0);
+    EXPECT_EQ(status, ZX_ERR_BAD_STATE, "");
+    status = zx_socket_share(a0, a1);
+    EXPECT_EQ(status, ZX_ERR_BAD_STATE, "");
+    status = zx_socket_share(a1, a0);
+    EXPECT_EQ(status, ZX_ERR_BAD_STATE, "");
+    status = zx_socket_share(a1, a1);
+    EXPECT_EQ(status, ZX_ERR_BAD_STATE, "");
+
+    // cannot accept from a non-HAS_ACCEPT socket
+    zx_handle_t h;
+    status = zx_socket_accept(b0, &h);
+    EXPECT_EQ(status, ZX_ERR_NOT_SUPPORTED, "");
+
+    status = zx_socket_share(a0, b0);
+    EXPECT_EQ(status, ZX_OK, "");
+
+    signals0 = get_satisfied_signals(a0);
+    signals1 = get_satisfied_signals(a1);
+    EXPECT_EQ(signals0, ZX_SOCKET_WRITABLE, "");
+    EXPECT_EQ(signals1, ZX_SOCKET_WRITABLE | ZX_SOCKET_SHARE | ZX_SOCKET_ACCEPT, "");
+
+    // queue is only one deep
+    status = zx_socket_share(a0, b1);
+    EXPECT_EQ(status, ZX_ERR_SHOULD_WAIT, "");
+
+    status = zx_socket_accept(a1, &h);
+    EXPECT_EQ(status, ZX_OK, "");
+    b0 = h;
+
+    // queue is only one deep
+    status = zx_socket_accept(a0, &h);
+    EXPECT_EQ(status, ZX_ERR_SHOULD_WAIT, "");
+
+    signals0 = get_satisfied_signals(a0);
+    signals1 = get_satisfied_signals(a1);
+    EXPECT_EQ(signals0, ZX_SOCKET_WRITABLE | ZX_SOCKET_SHARE, "");
+    EXPECT_EQ(signals1, ZX_SOCKET_WRITABLE | ZX_SOCKET_SHARE, "");
+
+    zx_handle_close(a0);
+    zx_handle_close(a1);
+    zx_handle_close(b0);
+    zx_handle_close(b1);
+    zx_handle_close(c0);
+    zx_handle_close(c1);
+
+    END_TEST;
+}
 
 BEGIN_TEST_CASE(socket_tests)
 RUN_TEST(socket_basic)
@@ -734,6 +826,7 @@ RUN_TEST(socket_datagram_no_short_write)
 RUN_TEST(socket_control_plane_absent)
 RUN_TEST(socket_control_plane)
 RUN_TEST(socket_control_plane_shutdown)
+RUN_TEST(socket_accept)
 END_TEST_CASE(socket_tests)
 
 #ifndef BUILD_COMBINED_TESTS

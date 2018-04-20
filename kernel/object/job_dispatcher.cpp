@@ -4,16 +4,23 @@
 // license that can be found in the LICENSE file or at
 // https://opensource.org/licenses/MIT
 
+#include <inttypes.h>
+
 #include <object/job_dispatcher.h>
 
 #include <err.h>
 
 #include <zircon/rights.h>
 #include <zircon/syscalls/policy.h>
+
 #include <fbl/alloc_checker.h>
+#include <fbl/array.h>
 #include <fbl/auto_lock.h>
 #include <fbl/mutex.h>
+
 #include <object/process_dispatcher.h>
+
+#include <platform.h>
 
 using fbl::AutoLock;
 
@@ -21,6 +28,84 @@ using fbl::AutoLock;
 static constexpr uint32_t kRootJobMaxHeight = 32;
 
 static constexpr char kRootJobName[] = "<superroot>";
+
+template <>
+uint32_t JobDispatcher::ChildCountLocked<JobDispatcher>() const {
+    return job_count_;
+}
+
+template <>
+uint32_t JobDispatcher::ChildCountLocked<ProcessDispatcher>() const {
+    return process_count_;
+}
+
+// Calls the provided |zx_status_t func(fbl::RefPtr<DISPATCHER_TYPE>)|
+// function on all live elements of |children|, which must be one of |jobs_|
+// or |procs_|. Stops iterating early if |func| returns a value other than
+// ZX_OK, returning that value from this method. |lock_| must be held when
+// calling this method, and it will still be held while the callback is
+// called.
+//
+// The returned |LiveRefsArray| needs to be destructed when |lock_| is not
+// held anymore. The recommended pattern is:
+//
+//  LiveRefsArray refs;
+//  {
+//      AutoLock lock(get_lock());
+//      refs = ForEachChildInLocked(...);
+//  }
+//
+template <typename T, typename Fn>
+JobDispatcher::LiveRefsArray JobDispatcher::ForEachChildInLocked(
+    T& children, zx_status_t* result, Fn func) {
+    // Convert child raw pointers into RefPtrs. This is tricky and requires
+    // special logic on the RefPtr class to handle a ref count that can be
+    // zero.
+    //
+    // The main requirement is that |lock_| is both controlling child
+    // list lookup and also making sure that the child destructor cannot
+    // make progress when doing so. In other words, when inspecting the
+    // |children| list we can be sure that a given child process or child
+    // job is either
+    //   - alive, with refcount > 0
+    //   - in destruction process but blocked, refcount == 0
+
+    const uint32_t count = ChildCountLocked<typename T::ValueType>();
+
+    if (!count) {
+        *result = ZX_OK;
+        return LiveRefsArray();
+    }
+
+    fbl::AllocChecker ac;
+    LiveRefsArray refs(new (&ac) fbl::RefPtr<Dispatcher>[count], count);
+    if (!ac.check()) {
+        *result = ZX_ERR_NO_MEMORY;
+        return LiveRefsArray();
+    }
+
+    size_t ix = 0;
+
+    for (auto& craw : children) {
+        auto cref = ::fbl::internal::MakeRefPtrUpgradeFromRaw(&craw, lock_);
+        if (!cref)
+            continue;
+
+        *result = func(cref);
+        // |cref| might be the last reference at this point. If so,
+        // when we drop it in the next iteration the object dtor
+        // would be called here with the |get_lock()| held. To avoid that
+        // we keep the reference alive in the |refs| array and pass
+        // the responsibility of releasing them outside the lock to
+        // the caller.
+        refs[ix++] = fbl::move(cref);
+
+        if (*result != ZX_OK)
+            break;
+    }
+
+    return refs;
+}
 
 fbl::RefPtr<JobDispatcher> JobDispatcher::CreateRootJob() {
     fbl::AllocChecker ac;
@@ -58,7 +143,8 @@ zx_status_t JobDispatcher::Create(uint32_t flags,
 JobDispatcher::JobDispatcher(uint32_t /*flags*/,
                              fbl::RefPtr<JobDispatcher> parent,
                              pol_cookie_t policy)
-    : parent_(fbl::move(parent)),
+    : SoloDispatcher(ZX_JOB_NO_PROCESSES | ZX_JOB_NO_JOBS),
+      parent_(fbl::move(parent)),
       max_height_(parent_ ? parent_->max_height() - 1 : kRootJobMaxHeight),
       state_(State::READY),
       process_count_(0u),
@@ -66,7 +152,6 @@ JobDispatcher::JobDispatcher(uint32_t /*flags*/,
       importance_(parent != nullptr
                       ? ZX_JOB_IMPORTANCE_INHERITED
                       : ZX_JOB_IMPORTANCE_MAX),
-      state_tracker_(ZX_JOB_NO_PROCESSES | ZX_JOB_NO_JOBS),
       policy_(policy) {
 
     // Set the initial relative importance.
@@ -76,7 +161,7 @@ JobDispatcher::JobDispatcher(uint32_t /*flags*/,
         AutoLock lock(&importance_lock_);
         importance_list_.push_back(this);
     } else {
-        AutoLock plock(&parent_->lock_);
+        AutoLock plock(parent_->get_lock());
         JobDispatcher* neighbor;
         if (!parent_->jobs_.is_empty()) {
             // Our youngest sibling.
@@ -84,7 +169,7 @@ JobDispatcher::JobDispatcher(uint32_t /*flags*/,
             // IMPORTANT: We must hold the parent's lock during list insertion
             // to ensure that our sibling stays alive until we're done with it.
             // The sibling may be in its dtor right now, trying to remove itself
-            // from parent_->jobs_ but blocked on parent_->lock_, and could be
+            // from parent_->jobs_ but blocked on parent_->get_lock(), and could be
             // freed if we released the lock.
             neighbor = &parent_->jobs_.back();
 
@@ -115,10 +200,6 @@ JobDispatcher::~JobDispatcher() {
     }
 }
 
-void JobDispatcher::on_zero_handles() {
-    canary_.Assert();
-}
-
 zx_koid_t JobDispatcher::get_related_koid() const {
     return parent_ ? parent_->get_koid() : 0u;
 }
@@ -126,7 +207,7 @@ zx_koid_t JobDispatcher::get_related_koid() const {
 bool JobDispatcher::AddChildProcess(ProcessDispatcher* process) {
     canary_.Assert();
 
-    AutoLock lock(&lock_);
+    AutoLock lock(get_lock());
     if (state_ != State::READY)
         return false;
     procs_.push_back(process);
@@ -138,7 +219,7 @@ bool JobDispatcher::AddChildProcess(ProcessDispatcher* process) {
 bool JobDispatcher::AddChildJob(JobDispatcher* job) {
     canary_.Assert();
 
-    AutoLock lock(&lock_);
+    AutoLock lock(get_lock());
     if (state_ != State::READY)
         return false;
 
@@ -151,7 +232,7 @@ bool JobDispatcher::AddChildJob(JobDispatcher* job) {
 void JobDispatcher::RemoveChildProcess(ProcessDispatcher* process) {
     canary_.Assert();
 
-    AutoLock lock(&lock_);
+    AutoLock lock(get_lock());
     // The process dispatcher can call us in its destructor, Kill(),
     // or RemoveThread().
     if (!ProcessDispatcher::JobListTraitsRaw::node_state(*process).InContainer())
@@ -164,7 +245,7 @@ void JobDispatcher::RemoveChildProcess(ProcessDispatcher* process) {
 void JobDispatcher::RemoveChildJob(JobDispatcher* job) {
     canary_.Assert();
 
-    AutoLock lock(&lock_);
+    AutoLock lock(get_lock());
     if (!JobDispatcher::ListTraitsRaw::node_state(*job).InContainer())
         return;
     jobs_.erase(*job);
@@ -175,7 +256,7 @@ void JobDispatcher::RemoveChildJob(JobDispatcher* job) {
 void JobDispatcher::UpdateSignalsDecrementLocked() {
     canary_.Assert();
 
-    DEBUG_ASSERT(lock_.IsHeld());
+    DEBUG_ASSERT(get_lock()->IsHeld());
     // removing jobs or processes.
     zx_signals_t set = 0u;
     if (process_count_ == 0u) {
@@ -189,18 +270,24 @@ void JobDispatcher::UpdateSignalsDecrementLocked() {
 
     if ((job_count_ == 0) && (process_count_ == 0)) {
         if (state_ == State::KILLING)
-            state_ = State::READY;
-        if (!parent_)
-            panic("No user processes left!\n");
+            state_ = State::DEAD;
+
+        if (!parent_) {
+            // There are no userspace process left. From here, there's
+            // no particular context as to whether this was
+            // intentional, or if a core devhost crashed due to a
+            // bug. Either way, shut down the kernel.
+            platform_halt(HALT_ACTION_HALT, HALT_REASON_SW_RESET);
+        }
     }
 
-    state_tracker_.UpdateState(0u, set);
+    UpdateStateLocked(0u, set);
 }
 
 void JobDispatcher::UpdateSignalsIncrementLocked() {
     canary_.Assert();
 
-    DEBUG_ASSERT(lock_.IsHeld());
+    DEBUG_ASSERT(get_lock()->IsHeld());
     // Adding jobs or processes.
     zx_signals_t clear = 0u;
     if (process_count_ == 1u) {
@@ -211,11 +298,11 @@ void JobDispatcher::UpdateSignalsIncrementLocked() {
         DEBUG_ASSERT(!jobs_.is_empty());
         clear |= ZX_JOB_NO_JOBS;
     }
-    state_tracker_.UpdateState(clear, 0u);
+    UpdateStateLocked(clear, 0u);
 }
 
 pol_cookie_t JobDispatcher::GetPolicy() {
-    AutoLock lock(&lock_);
+    AutoLock lock(get_lock());
     return policy_;
 }
 
@@ -225,8 +312,11 @@ void JobDispatcher::Kill() {
     JobList jobs_to_kill;
     ProcessList procs_to_kill;
 
+    LiveRefsArray jobs_refs;
+    LiveRefsArray proc_refs;
+
     {
-        AutoLock lock(&lock_);
+        AutoLock lock(get_lock());
         if (state_ != State::READY)
             return;
 
@@ -236,30 +326,17 @@ void JobDispatcher::Kill() {
             return;
 
         state_ = State::KILLING;
+        zx_status_t result;
 
-        // Convert our raw pointers into refcounted. We will do the killing
-        // outside the lock.  This is tricky and requires special logic on
-        // the RefPtr class to handle a refcount that can be zero.
-        //
-        // The main requirement is that |lock_| is both controlling child
-        // list lookup and also making sure that the child destructor cannot
-        // make progress when doing so.  In other words, when inspecting
-        // the |jobs_| or |procs_| list we can be sure that a given child
-        // process or child job is either
-        //   - alive, with refcount > 0
-        //   - in destruction process but blocked, refcount == 0
-        //
-        for (auto& j : jobs_) {
-            auto jd = ::fbl::internal::MakeRefPtrUpgradeFromRaw(&j, lock_);
-            if (jd)
-                jobs_to_kill.push_front(fbl::move(jd));
-        }
-
-        for (auto& p : procs_) {
-            auto pd = ::fbl::internal::MakeRefPtrUpgradeFromRaw(&p, lock_);
-            if (pd)
-                procs_to_kill.push_front(fbl::move(pd));
-        }
+        // Safely gather refs to the children.
+        jobs_refs = ForEachChildInLocked(jobs_, &result, [&](fbl::RefPtr<JobDispatcher> job) {
+            jobs_to_kill.push_front(fbl::move(job));
+            return ZX_OK;
+        });
+        proc_refs = ForEachChildInLocked(procs_, &result, [&](fbl::RefPtr<ProcessDispatcher> proc) {
+            procs_to_kill.push_front(fbl::move(proc));
+            return ZX_OK;
+        });
     }
 
     // Since we kill the child jobs first we have a depth-first massacre.
@@ -276,7 +353,7 @@ void JobDispatcher::Kill() {
 zx_status_t JobDispatcher::SetPolicy(
     uint32_t mode, const zx_policy_basic* in_policy, size_t policy_count) {
     // Can't set policy when there are active processes or jobs.
-    AutoLock lock(&lock_);
+    AutoLock lock(get_lock());
 
     if (!procs_.is_empty() || !jobs_.is_empty())
         return ZX_ERR_BAD_STATE;
@@ -295,49 +372,81 @@ zx_status_t JobDispatcher::SetPolicy(
 bool JobDispatcher::EnumerateChildren(JobEnumerator* je, bool recurse) {
     canary_.Assert();
 
-    AutoLock lock(&lock_);
+    LiveRefsArray jobs_refs;
+    LiveRefsArray proc_refs;
 
-    for (auto& proc : procs_) {
-        if (!je->OnProcess(&proc)) {
+    zx_status_t result = ZX_OK;
+
+    {
+        AutoLock lock(get_lock());
+
+        proc_refs = ForEachChildInLocked(
+            procs_, &result, [&](fbl::RefPtr<ProcessDispatcher> proc) {
+                return je->OnProcess(proc.get()) ? ZX_OK : ZX_ERR_STOP;
+            });
+        if (result != ZX_OK) {
             return false;
         }
-    }
 
-    for (auto& job : jobs_) {
-        if (!je->OnJob(&job)) {
-            return false;
-        }
-        if (recurse) {
-            // TODO(kulakowski): This recursive call can overflow the stack.
-            if (!job.EnumerateChildren(je, /* recurse */ true)) {
-                return false;
+        jobs_refs = ForEachChildInLocked(jobs_, &result, [&](fbl::RefPtr<JobDispatcher> job) {
+            if (!je->OnJob(job.get())) {
+                return ZX_ERR_STOP;
             }
-        }
+            if (recurse) {
+                // TODO(kulakowski): This recursive call can overflow the stack.
+                return job->EnumerateChildren(je, /* recurse */ true)
+                           ? ZX_OK
+                           : ZX_ERR_STOP;
+            }
+            return ZX_OK;
+        });
     }
-    return true;
+
+    return result == ZX_OK;
 }
 
-fbl::RefPtr<ProcessDispatcher> JobDispatcher::LookupProcessById(zx_koid_t koid) {
+fbl::RefPtr<ProcessDispatcher>
+JobDispatcher::LookupProcessById(zx_koid_t koid) {
     canary_.Assert();
 
-    AutoLock lock(&lock_);
-    for (auto& proc : procs_) {
-        if (proc.get_koid() == koid)
-            return fbl::RefPtr<ProcessDispatcher>(&proc);
+    LiveRefsArray proc_refs;
+
+    fbl::RefPtr<ProcessDispatcher> found_proc;
+    {
+        AutoLock lock(get_lock());
+        zx_status_t result;
+
+        proc_refs = ForEachChildInLocked(procs_, &result, [&](fbl::RefPtr<ProcessDispatcher> proc) {
+            if (proc->get_koid() == koid) {
+                found_proc = fbl::move(proc);
+                return ZX_ERR_STOP;
+            }
+            return ZX_OK;
+        });
     }
-    return nullptr;
+    return found_proc; // Null if not found.
 }
 
-fbl::RefPtr<JobDispatcher> JobDispatcher::LookupJobById(zx_koid_t koid) {
+fbl::RefPtr<JobDispatcher>
+JobDispatcher::LookupJobById(zx_koid_t koid) {
     canary_.Assert();
 
-    AutoLock lock(&lock_);
-    for (auto& job : jobs_) {
-        if (job.get_koid() == koid) {
-            return fbl::RefPtr<JobDispatcher>(&job);
-        }
+    LiveRefsArray jobs_refs;
+
+    fbl::RefPtr<JobDispatcher> found_job;
+    {
+        AutoLock lock(get_lock());
+        zx_status_t result;
+
+        jobs_refs = ForEachChildInLocked(jobs_, &result, [&](fbl::RefPtr<JobDispatcher> job) {
+            if (job->get_koid() == koid) {
+                found_job = fbl::move(job);
+                return ZX_ERR_STOP;
+            }
+            return ZX_OK;
+        });
     }
-    return nullptr;
+    return found_job; // Null if not found.
 }
 
 void JobDispatcher::get_name(char out_name[ZX_MAX_NAME_LEN]) const {
@@ -378,7 +487,7 @@ zx_status_t JobDispatcher::get_importance(zx_job_importance_t* out) const {
 // Does not resolve ZX_JOB_IMPORTANCE_INHERITED.
 zx_job_importance_t JobDispatcher::GetRawImportance() const {
     canary_.Assert();
-    AutoLock lock(&lock_);
+    AutoLock lock(get_lock());
     return importance_;
 }
 
@@ -390,7 +499,7 @@ zx_status_t JobDispatcher::set_importance(zx_job_importance_t importance) {
         importance != ZX_JOB_IMPORTANCE_INHERITED) {
         return ZX_ERR_OUT_OF_RANGE;
     }
-    AutoLock lock(&lock_);
+    AutoLock lock(get_lock());
     // No-one is allowed to change the importance of the root job.  Note that
     // the actual root job ("<superroot>") typically isn't seen by userspace, so
     // no userspace program should see this error.  The job that userspace calls
@@ -440,7 +549,7 @@ zx_status_t JobDispatcher::SetExceptionPort(fbl::RefPtr<ExceptionPort> eport) {
 
     DEBUG_ASSERT(eport->type() == ExceptionPort::Type::JOB);
 
-    AutoLock lock(&lock_);
+    AutoLock lock(get_lock());
     if (exception_port_)
         return ZX_ERR_BAD_STATE;
     exception_port_ = fbl::move(eport);
@@ -469,7 +578,7 @@ bool JobDispatcher::ResetExceptionPort(bool quietly) {
 
     fbl::RefPtr<ExceptionPort> eport;
     {
-        AutoLock lock(&lock_);
+        AutoLock lock(get_lock());
         exception_port_.swap(eport);
         if (eport == nullptr) {
             // Attempted to unbind when no exception port is bound.
@@ -506,6 +615,6 @@ bool JobDispatcher::ResetExceptionPort(bool quietly) {
 }
 
 fbl::RefPtr<ExceptionPort> JobDispatcher::exception_port() {
-    AutoLock lock(&lock_);
+    AutoLock lock(get_lock());
     return exception_port_;
 }

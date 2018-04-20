@@ -19,16 +19,11 @@ zx_handle_t bootdata_get_bootfs(zx_handle_t log, zx_handle_t vmar_self,
     size_t off = 0;
     for (;;) {
         bootdata_t bootdata;
-        size_t actual;
         zx_status_t status = zx_vmo_read(bootdata_vmo, &bootdata,
-                                         off, sizeof(bootdata), &actual);
+                                         off, sizeof(bootdata));
         check(log, status, "zx_vmo_read failed on bootdata VMO");
-        if (actual != sizeof(bootdata))
-            fail(log, "short read on bootdata VMO");
-
-        size_t hdrsz = sizeof(bootdata);
-        if (bootdata.flags & BOOTDATA_FLAG_EXTRA) {
-            hdrsz += sizeof(bootextra_t);
+        if (!(bootdata.flags & BOOTDATA_FLAG_V2)) {
+            fail(log, "bootdata v1 no longer supported");
         }
 
         switch (bootdata.type) {
@@ -45,7 +40,7 @@ zx_handle_t bootdata_get_bootfs(zx_handle_t log, zx_handle_t vmar_self,
             const char* errmsg;
             zx_handle_t bootfs_vmo;
             status = decompress_bootdata(vmar_self, bootdata_vmo, off,
-                                         bootdata.length + hdrsz,
+                                         bootdata.length + sizeof(bootdata),
                                          &bootfs_vmo, &errmsg);
             check(log, status, "%s", errmsg);
 
@@ -53,13 +48,13 @@ zx_handle_t bootdata_get_bootfs(zx_handle_t log, zx_handle_t vmar_self,
             bootdata.type = BOOTDATA_BOOTFS_DISCARD;
             check(log, zx_vmo_write(bootdata_vmo, &bootdata.type,
                                     off + offsetof(bootdata_t, type),
-                                    sizeof(bootdata.type), &actual),
+                                    sizeof(bootdata.type)),
                   "zx_vmo_write failed on bootdata VMO\n");
 
             return bootfs_vmo;
         }
 
-        off += BOOTDATA_ALIGN(hdrsz + bootdata.length);
+        off += BOOTDATA_ALIGN(sizeof(bootdata) + bootdata.length);
     }
 
     fail(log, "no '/boot' bootfs in bootstrap message\n");

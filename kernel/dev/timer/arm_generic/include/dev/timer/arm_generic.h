@@ -9,5 +9,8 @@
 
 #include <sys/types.h>
 
-/* if freq_override != 0, use that as the operating frequency instead of CNTFRQ register */
-void arm_generic_timer_init(int irq, uint32_t freq_override);
+__BEGIN_CDECLS
+
+zx_time_t cntpct_to_zx_time(uint64_t cntpct);
+
+__END_CDECLS

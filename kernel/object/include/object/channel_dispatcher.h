@@ -11,7 +11,6 @@
 #include <kernel/event.h>
 #include <object/dispatcher.h>
 #include <object/message_packet.h>
-#include <object/state_tracker.h>
 
 #include <zircon/types.h>
 #include <fbl/canary.h>
@@ -20,7 +19,7 @@
 #include <fbl/ref_counted.h>
 #include <fbl/unique_ptr.h>
 
-class ChannelDispatcher final : public Dispatcher {
+class ChannelDispatcher final : public PeeredDispatcher<ChannelDispatcher> {
 public:
     class MessageWaiter;
 
@@ -29,10 +28,8 @@ public:
 
     ~ChannelDispatcher() final;
     zx_obj_type_t get_type() const final { return ZX_OBJ_TYPE_CHANNEL; }
-    StateTracker* get_state_tracker() final { return &state_tracker_; }
+    bool has_state_tracker() const final { return true; }
     zx_status_t add_observer(StateObserver* observer) final;
-    zx_koid_t get_related_koid() const final TA_REQ(lock_) { return other_koid_; }
-    zx_status_t user_signal(uint32_t clear_mask, uint32_t set_mask, bool peer) final;
 
     void on_zero_handles() final;
 
@@ -47,15 +44,20 @@ public:
                      bool may_disard);
 
     // Write to the opposing endpoint's message queue.
-    zx_status_t Write(fbl::unique_ptr<MessagePacket> msg);
+    zx_status_t Write(fbl::unique_ptr<MessagePacket> msg) TA_NO_THREAD_SAFETY_ANALYSIS;
     zx_status_t Call(fbl::unique_ptr<MessagePacket> msg,
                      zx_time_t deadline, bool* return_handles,
-                     fbl::unique_ptr<MessagePacket>* reply);
+                     fbl::unique_ptr<MessagePacket>* reply) TA_NO_THREAD_SAFETY_ANALYSIS;
 
     // Performs the wait-then-read half of Call.  This is meant for retrying
     // after an interruption caused by suspending.
     zx_status_t ResumeInterruptedCall(MessageWaiter* waiter, zx_time_t deadline,
                                       fbl::unique_ptr<MessagePacket>* reply);
+
+    // Returns the maximum depth this channel endpoint will queue
+    // messages to. This value is accessible to userspace via the
+    // ZX_PROP_CHANNEL_TX_MSG_MAX object property.
+    size_t TxMessageMax() const;
 
     // MessageWaiter's state is guarded by the lock of the
     // owning ChannelDispatcher, and Deliver(), Signal(), Cancel(),
@@ -79,7 +81,7 @@ public:
         int Cancel(zx_status_t status);
         fbl::RefPtr<ChannelDispatcher> get_channel() { return channel_; }
         zx_txid_t get_txid() const { return txid_; }
-        zx_status_t Wait(lk_time_t deadline);
+        zx_status_t Wait(zx_time_t deadline);
         // Returns any delivered message via out and the status.
         zx_status_t EndWait(fbl::unique_ptr<MessagePacket>* out);
 
@@ -99,18 +101,16 @@ private:
 
     void RemoveWaiter(MessageWaiter* waiter);
 
-    ChannelDispatcher();
+    explicit ChannelDispatcher(fbl::RefPtr<PeerHolder<ChannelDispatcher>> holder);
     void Init(fbl::RefPtr<ChannelDispatcher> other);
-    int WriteSelf(fbl::unique_ptr<MessagePacket> msg);
-    zx_status_t UserSignalSelf(uint32_t clear_mask, uint32_t set_mask);
-    void OnPeerZeroHandles();
+    int WriteSelf(fbl::unique_ptr<MessagePacket> msg) TA_REQ(get_lock());
+    zx_status_t UserSignalSelf(uint32_t clear_mask, uint32_t set_mask) TA_REQ(get_lock());
+    void OnPeerZeroHandlesLocked();
 
     fbl::Canary<fbl::magic("CHAN")> canary_;
 
-    fbl::Mutex lock_;
-    MessageList messages_ TA_GUARDED(lock_);
-    WaiterList waiters_ TA_GUARDED(lock_);
-    StateTracker state_tracker_;
-    fbl::RefPtr<ChannelDispatcher> other_ TA_GUARDED(lock_);
-    zx_koid_t other_koid_ TA_GUARDED(lock_);
+    MessageList messages_ TA_GUARDED(get_lock());
+    uint64_t message_count_ TA_GUARDED(get_lock()) = 0;
+    uint64_t max_message_count_ TA_GUARDED(get_lock()) = 0;
+    WaiterList waiters_ TA_GUARDED(get_lock());
 };

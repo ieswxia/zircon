@@ -9,9 +9,9 @@ are specific to the type of object.
 For example, the signal *ZX_CHANNEL_READABLE* indicates "this channel endpoint has
 messages to read", and **ZX_PROCESS_TERMINATED** indicates "this process stopped running."
 
-The signals for an object are stored in a uint32 bitmask, and their values (which are object-specific) are defined in the header
-[`zircon/types.h`](../system/public/zircon/types.h).  The typedef `zx_signals_t`
-is used to refer to signal bitmasks in syscalls and other APIs.
+The signals for an object are stored in a uint32 bitmask, and their values (which are
+object-specific) are defined in the header[`zircon/types.h`](../system/public/zircon/types.h).
+The typedef `zx_signals_t` is used to refer to signal bitmasks in syscalls and other APIs.
 
 Most objects are waitable.  Ports are an example of a non-waitable object.
 To determine if an object is waitable, call [object_get_info](syscalls/object_get_info.md)
@@ -23,7 +23,7 @@ A signal is said to be **Active** when its bit is 1 and **Inactive** when its bi
 
 A signal is said to be **Asserted** when it is made **Active** in response to an event
 (even if it was already **Active**), and is said to be **Deasserted** when it is made
-**Inactive* in response to an event (even if it was already **Inactive**).
+**Inactive** in response to an event (even if it was already **Inactive**).
 
 For example:  When a message is written into a Channel endpoint, the *ZX_CHANNEL_READABLE*
 signal of the opposing endpoint is **asserted** (which causes that signal to become **active**,
@@ -33,20 +33,10 @@ queue is read from that endpoint, the *ZX_CHANNEL_READABLE* signal of that endpo
 
 ## Observing Signals
 
-The syscalls **zx_object_wait_one**(), **zx_object_wait_many**(), and **zx_object_wait_async**() (in combination with a Port), can be used to wait for specified signals on one or more objects.
+The syscalls **zx_object_wait_one**(), **zx_object_wait_many**(), and **zx_object_wait_async**() (in
+combination with a Port), can be used to wait for specified signals on one or more objects.
 
 ## Common Signals
-
-### ZX_SIGNAL_LAST_HANDLE
-
-This signal is asserted when there is only a single handle referencing the object.  Thus it
-is always active on newly created objects.
-
-This signal is deasserted when there are more than one handles referencing the object, for
-example, if the initial handle were duplicated.  The process observing this event is, at
-the moment of observation, the last handle holder. This signal can be used to reap local
-resources associated with an object whose handle was duplicated and shared with another
-process.
 
 ### ZX_SIGNAL_HANDLE_CLOSED
 
@@ -72,4 +62,3 @@ the object signal syscalls.
 [object_wait_async](syscalls/object_wait_async.md),
 [object_wait_many](syscalls/object_wait_many.md),
 [object_wait_one](syscalls/object_wait_one.md).
-

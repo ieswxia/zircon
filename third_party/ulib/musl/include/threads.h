@@ -31,6 +31,8 @@ enum {
     thrd_timedout = 4,
 };
 
+// These are bitfield values; initialize with e.g. (mtx_plain|mtx_timed).
+// mtx_recursive is not implemented.
 enum {
     mtx_plain = 0,
     mtx_recursive = 1,
@@ -70,10 +72,18 @@ void call_once(once_flag*, void (*)(void));
 int mtx_init(mtx_t*, int);
 void mtx_destroy(mtx_t*);
 
-int mtx_lock(mtx_t*);
+int mtx_lock(mtx_t* __m)
+#ifdef __clang__
+    __attribute__((__acquire_capability__(__m)))
+#endif
+;
 int mtx_timedlock(mtx_t* __restrict, const struct timespec* __restrict);
 int mtx_trylock(mtx_t*);
-int mtx_unlock(mtx_t*);
+int mtx_unlock(mtx_t* __m)
+#ifdef __clang__
+    __attribute__((__release_capability__(__m)))
+#endif
+;
 
 int cnd_init(cnd_t*);
 void cnd_destroy(cnd_t*);

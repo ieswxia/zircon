@@ -118,6 +118,11 @@ __BEGIN_CDECLS;
 #define BIND_IHDA_CODEC_VENDOR_REV  0x0504
 #define BIND_IHDA_CODEC_VENDOR_STEP 0x0505
 
+// Serial binding variables at 0x06XX
+#define BIND_SERIAL_CLASS           0x0600
+#define BIND_SERIAL_VID             0x0601
+#define BIND_SERIAL_PID             0x0602
+
 // TEMPORARY binding variables at 0xfXX
 // I2C_ADDR is a temporary way to bind the i2c touchscreen on the Acer12. This
 // binding will eventually be made via some sort of ACPI device enumeration.
@@ -226,7 +231,7 @@ static_assert(offsetof(zircon_driver_note_t, payload) ==
 zx_driver_rec_t __zircon_driver_rec__ __EXPORT = {\
     /* .ops = */ &(Ops),\
     /* .driver = */ NULL,\
-    /* .log_flags = */ 3, /* DDK_LOG_ERROR | DDK_LOG_INFO */\
+    /* .log_flags = */ 7, /* DDK_LOG_ERROR | DDK_LOG_WARN | DDK_LOG_INFO */\
 };\
 extern const struct zircon_driver_note __zircon_driver_note__ __EXPORT;\
 __SECTION(".note.zircon.driver." #Driver) ZIRCON_DRIVER_NOTE_ASAN \

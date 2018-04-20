@@ -5,6 +5,7 @@
 #pragma once
 
 #include <ddk/device.h>
+#include <ddk/driver.h>
 #include <ddktl/device-internal.h>
 #include <zircon/assert.h>
 #include <fbl/type_support.h>
@@ -50,8 +51,6 @@
 // | ddk::Writable        | zx_status_t DdkWrite(const void* buf,              |
 // |                      |                      size_t count, zx_off_t off,   |
 // |                      |                      size_t* actual)               |
-// |                      |                                                    |
-// | ddk::IotxnQueueable  | void DdkIotxnQueue(iotxn_t* txn)                   |
 // |                      |                                                    |
 // | ddk::GetSizable      | zx_off_t DdkGetSize()                              |
 // |                      |                                                    |
@@ -219,20 +218,6 @@ class Writable : public internal::base_mixin {
 };
 
 template <typename D>
-class IotxnQueueable : public internal::base_mixin {
-  protected:
-    explicit IotxnQueueable(zx_protocol_device_t* proto) {
-        internal::CheckIotxnQueueable<D>();
-        proto->iotxn_queue = IotxnQueue;
-    }
-
-  private:
-    static void IotxnQueue(void* ctx, iotxn_t* txn) {
-        static_cast<D*>(ctx)->DdkIotxnQueue(txn);
-    }
-};
-
-template <typename D>
 class GetSizable : public internal::base_mixin {
   protected:
     explicit GetSizable(zx_protocol_device_t* proto) {
@@ -297,7 +282,7 @@ class Resumable : public internal::base_mixin {
 template <class D, template <typename> class... Mixins>
 class Device : public ::ddk::internal::base_device, public Mixins<D>... {
   public:
-    zx_status_t DdkAdd(const char* name) {
+    zx_status_t DdkAdd(const char* name, uint32_t flags = 0) {
         if (zxdev_ != nullptr) {
             return ZX_ERR_BAD_STATE;
         }
@@ -309,19 +294,29 @@ class Device : public ::ddk::internal::base_device, public Mixins<D>... {
         // the callback functions and cast it directly to a D*.
         args.ctx = static_cast<D*>(this);
         args.ops = &ddk_device_proto_;
+        args.flags = flags;
         AddProtocol(&args);
 
         return device_add(parent_, &args, &zxdev_);
     }
 
+    void DdkMakeVisible() {
+        device_make_visible(zxdev());
+    }
+
+    // Removes the device.
+    // This method may have the side-effect of destroying this object if the
+    // device's reference count drops to zero.
     zx_status_t DdkRemove() {
         if (zxdev_ == nullptr) {
             return ZX_ERR_BAD_STATE;
         }
 
-        zx_status_t res = device_remove(zxdev_);
+        // The call to |device_remove| must be last since it decrements the
+        // device's reference count when successful.
+        zx_device_t* dev = zxdev_;
         zxdev_ = nullptr;
-        return res;
+        return device_remove(dev);
     }
 
     const char* name() const { return zxdev() ? device_get_name(zxdev()) : nullptr; }
@@ -388,7 +383,6 @@ using FullDevice = Device<D,
                           Unbindable,
                           Readable,
                           Writable,
-                          IotxnQueueable,
                           GetSizable,
                           Ioctlable,
                           Suspendable,

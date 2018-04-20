@@ -6,9 +6,9 @@
 
 #include <ddk/protocol/block.h>
 #include <ddktl/protocol/block-internal.h>
-#include <zircon/assert.h>
 #include <fbl/type_support.h>
 #include <fbl/unique_ptr.h>
+#include <zircon/assert.h>
 
 // DDK block protocol support
 //
@@ -20,7 +20,7 @@
 //
 // :: Examples ::
 //
-// // A driver that implements a ZX_PROTOCOL_BLOCK_CORE device
+// // A driver that implements a ZX_PROTOCOL_BLOCK_IMPL device
 // class BlockDevice;
 // using BlockDeviceType = ddk::Device<BlockDevice, /* ddk mixins */>;
 //
@@ -38,10 +38,6 @@
 //         // Clean up
 //     }
 //
-//     void BlockSetCallbacks(block_callbacks_t* cb) {
-//         // Fill out callbacks
-//     }
-//
 //     ...
 //   private:
 //     ...
@@ -54,34 +50,22 @@ class BlockProtocol : public internal::base_protocol {
   public:
     BlockProtocol() {
         internal::CheckBlockProtocolSubclass<D>();
-        ops_.set_callbacks = SetCallbacks;
-        ops_.get_info = GetInfo;
-        ops_.read = Read;
-        ops_.write = Write;
+        ops_.query = Query;
+        ops_.queue = Queue;
 
         // Can only inherit from one base_protocol implemenation
-        ZX_ASSERT(ddk_proto_ops_ == nullptr);
-        ddk_proto_id_ = ZX_PROTOCOL_BLOCK_CORE;
+        ZX_ASSERT(ddk_proto_id_ == 0);
+        ddk_proto_id_ = ZX_PROTOCOL_BLOCK_IMPL;
         ddk_proto_ops_ = &ops_;
     }
 
   private:
-    static void SetCallbacks(void* ctx, block_callbacks_t* cb) {
-        static_cast<D*>(ctx)->BlockSetCallbacks(cb);
+    static void Query(void* ctx, block_info_t* info_out, size_t* block_op_size_out) {
+        static_cast<D*>(ctx)->BlockQuery(info_out, block_op_size_out);
     }
 
-    static void GetInfo(void* ctx, block_info_t* info) {
-        static_cast<D*>(ctx)->BlockGetInfo(info);
-    }
-
-    static void Read(void* ctx, zx_handle_t vmo, uint64_t length, uint64_t vmo_offset,
-                     uint64_t dev_offset, void* cookie) {
-        static_cast<D*>(ctx)->BlockRead(vmo, length, vmo_offset, dev_offset, cookie);
-    }
-
-    static void Write(void* ctx, zx_handle_t vmo, uint64_t length, uint64_t vmo_offset,
-                      uint64_t dev_offset, void* cookie) {
-        static_cast<D*>(ctx)->BlockWrite(vmo, length, vmo_offset, dev_offset, cookie);
+    static void Queue(void* ctx, block_op_t* txn) {
+        static_cast<D*>(ctx)->BlockQueue(txn);
     }
 
     block_protocol_ops_t ops_ = {};

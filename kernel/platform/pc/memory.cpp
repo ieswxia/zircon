@@ -4,27 +4,29 @@
 // license that can be found in the LICENSE file or at
 // https://opensource.org/licenses/MIT
 
+#include <arch/x86/bootstrap16.h>
 #include <arch/x86/mmu.h>
 #include <assert.h>
 #include <efi/boot-services.h>
 #include <err.h>
-#include <inttypes.h>
-#include <kernel/vm.h>
-#include <lib/memory_limit.h>
-#include <zircon/boot/multiboot.h>
 #include <fbl/algorithm.h>
+#include <inttypes.h>
+#include <lib/memory_limit.h>
 #include <platform.h>
 #include <platform/pc/bootloader.h>
 #include <platform/pc/memory.h>
 #include <string.h>
 #include <trace.h>
+#include <vm/vm.h>
+#include <zircon/boot/multiboot.h>
+#include <zircon/types.h>
 
 #include "platform_p.h"
 
 #define LOCAL_TRACE 0
 
 /* multiboot information passed in, if present */
-extern multiboot_info_t *_multiboot_info;
+extern multiboot_info_t* _multiboot_info;
 
 struct addr_range {
     uint64_t base;
@@ -37,7 +39,7 @@ struct addr_range {
 paddr_t pcie_mem_lo_base;
 size_t pcie_mem_lo_size;
 
-#define DEFAULT_MEMEND (16*1024*1024)
+#define DEFAULT_MEMEND (16 * 1024 * 1024)
 
 /* boot_addr_range_t is an iterator which iterates over address ranges from
  * the boot loader
@@ -45,9 +47,9 @@ size_t pcie_mem_lo_size;
 struct boot_addr_range;
 
 typedef void (*boot_addr_range_advance_func)(
-        struct boot_addr_range *range_struct);
+    struct boot_addr_range* range_struct);
 typedef void (*boot_addr_range_reset_func)(
-        struct boot_addr_range *range_struct);
+    struct boot_addr_range* range_struct);
 
 typedef struct boot_addr_range {
     /* the base of the current address range */
@@ -60,7 +62,7 @@ typedef struct boot_addr_range {
     int is_reset;
 
     /* private information for the advance function to keep its place */
-    void *seq;
+    void* seq;
     /* a function which advances this iterator to the next address range */
     boot_addr_range_advance_func advance;
     /* a function which resets this range and its sequencing information */
@@ -68,8 +70,7 @@ typedef struct boot_addr_range {
 } boot_addr_range_t;
 
 /* a utility function to reset the common parts of a boot_addr_range_t */
-static void boot_addr_range_reset(boot_addr_range_t *range)
-{
+static void boot_addr_range_reset(boot_addr_range_t* range) {
     range->base = 0;
     range->size = 0;
     range->is_mem = 0;
@@ -81,12 +82,10 @@ static void boot_addr_range_reset(boot_addr_range_t *range)
  * array with the ranges of memory it finds, compacted to the start of the
  * array. it returns the total count of arenas which have been populated.
  */
-extern int _end;
-static status_t mem_arena_init(boot_addr_range_t *range)
-{
+static zx_status_t mem_arena_init(boot_addr_range_t* range) {
     mem_limit_ctx ctx;
-    ctx.kernel_base = KERNEL_BASE + KERNEL_LOAD_OFFSET;
-    ctx.kernel_size = reinterpret_cast<uintptr_t>(&_end) - ctx.kernel_base;
+    ctx.kernel_base = reinterpret_cast<uintptr_t>(__code_start);
+    ctx.kernel_size = reinterpret_cast<uintptr_t>(_end) - ctx.kernel_base;
     ctx.ramdisk_base = reinterpret_cast<uintptr_t>(platform_get_ramdisk(&ctx.ramdisk_size));
 
     bool have_limit = (mem_limit_init(&ctx) == ZX_OK);
@@ -107,11 +106,11 @@ static status_t mem_arena_init(boot_addr_range_t *range)
         /* trim off parts of memory ranges that are smaller than a page */
         uint64_t base = ROUNDUP(range->base, PAGE_SIZE);
         uint64_t size = ROUNDDOWN(range->base + range->size, PAGE_SIZE) -
-                base;
+                        base;
 
         /* trim any memory below 1MB for safety and SMP booting purposes */
-        if (base < 1*MB) {
-            uint64_t adjust = 1*MB - base;
+        if (base < 1 * MB) {
+            uint64_t adjust = 1 * MB - base;
             if (adjust >= size)
                 continue;
 
@@ -119,7 +118,7 @@ static status_t mem_arena_init(boot_addr_range_t *range)
             size -= adjust;
         }
 
-        status_t status = ZX_OK;
+        zx_status_t status = ZX_OK;
         if (have_limit) {
             status = mem_limit_add_arenas_from_range(&ctx, base, size, base_arena);
         }
@@ -133,14 +132,12 @@ static status_t mem_arena_init(boot_addr_range_t *range)
 
             LTRACEF("Adding pmm range at %#" PRIxPTR " of %#zx bytes.\n", arena.base, arena.size);
             status = pmm_add_arena(&arena);
-            // This will result in subsequent arenas not being added, but this
-            // is a fairly fatal event so it's justifiable.
+
+            // print a warning and continue
             if (status != ZX_OK) {
-                TRACEF("Failed to add pmm range at %#" PRIxPTR "\n", arena.base);
-                return status;
+                printf("MEM: Failed to add pmm range at %#" PRIxPTR " size %#zx\n", arena.base, arena.size);
             }
         }
-
     }
 
     return ZX_OK;
@@ -152,17 +149,15 @@ typedef struct e820_range_seq {
     int count;
 } e820_range_seq_t;
 
-static void e820_range_reset(boot_addr_range_t *range)
-{
+static void e820_range_reset(boot_addr_range_t* range) {
     boot_addr_range_reset(range);
 
-    e820_range_seq_t *seq = (e820_range_seq_t *)(range->seq);
+    e820_range_seq_t* seq = (e820_range_seq_t*)(range->seq);
     seq->index = -1;
 }
 
-static void e820_range_advance(boot_addr_range_t *range)
-{
-    e820_range_seq_t *seq = (e820_range_seq_t *)(range->seq);
+static void e820_range_advance(boot_addr_range_t* range) {
+    e820_range_seq_t* seq = (e820_range_seq_t*)(range->seq);
 
     seq->index++;
 
@@ -179,8 +174,7 @@ static void e820_range_advance(boot_addr_range_t *range)
     range->is_reset = 0;
 }
 
-static int e820_range_init(boot_addr_range_t *range, e820_range_seq_t *seq)
-{
+static zx_status_t e820_range_init(boot_addr_range_t* range, e820_range_seq_t* seq) {
     range->seq = seq;
     range->advance = &e820_range_advance;
     range->reset = &e820_range_reset;
@@ -189,10 +183,10 @@ static int e820_range_init(boot_addr_range_t *range, e820_range_seq_t *seq)
         seq->count = static_cast<int>(bootloader.e820_count);
         seq->map = static_cast<e820entry_t*>(bootloader.e820_table);
         range->reset(range);
-        return 1;
+        return ZX_OK;
     }
 
-    return 0;
+    return ZX_ERR_NO_MEMORY;
 }
 
 typedef struct efi_range_seq {
@@ -202,11 +196,10 @@ typedef struct efi_range_seq {
     int count;
 } efi_range_seq_t;
 
-static void efi_range_reset(boot_addr_range_t *range)
-{
+static void efi_range_reset(boot_addr_range_t* range) {
     boot_addr_range_reset(range);
 
-    efi_range_seq_t *seq = (efi_range_seq_t *)(range->seq);
+    efi_range_seq_t* seq = (efi_range_seq_t*)(range->seq);
     seq->index = -1;
 }
 
@@ -231,9 +224,8 @@ static void efi_print(const char* tag, efi_memory_descriptor* e) {
             mb ? "MB" : "KB");
 }
 
-static void efi_range_advance(boot_addr_range_t *range)
-{
-    efi_range_seq_t *seq = (efi_range_seq_t *)(range->seq);
+static void efi_range_advance(boot_addr_range_t* range) {
+    efi_range_seq_t* seq = (efi_range_seq_t*)(range->seq);
 
     seq->index++;
 
@@ -244,7 +236,7 @@ static void efi_range_advance(boot_addr_range_t *range)
     }
 
     const uintptr_t addr = reinterpret_cast<uintptr_t>(seq->base) + (seq->index * seq->entrysz);
-    efi_memory_descriptor *entry = reinterpret_cast<efi_memory_descriptor *>(addr);
+    efi_memory_descriptor* entry = reinterpret_cast<efi_memory_descriptor*>(addr);
     efi_print("EFI: ", entry);
     range->base = entry->PhysicalStart;
     range->size = entry->NumberOfPages * PAGE_SIZE;
@@ -254,8 +246,8 @@ static void efi_range_advance(boot_addr_range_t *range)
     // coalesce adjacent memory ranges
     while ((seq->index + 1) < seq->count) {
         const uintptr_t addr = reinterpret_cast<uintptr_t>(seq->base) +
-                ((seq->index + 1) * seq->entrysz);
-        efi_memory_descriptor *next = reinterpret_cast<efi_memory_descriptor *>(addr);
+                               ((seq->index + 1) * seq->entrysz);
+        efi_memory_descriptor* next = reinterpret_cast<efi_memory_descriptor*>(addr);
         if ((range->base + range->size) != next->PhysicalStart) {
             break;
         }
@@ -268,26 +260,25 @@ static void efi_range_advance(boot_addr_range_t *range)
     }
 }
 
-static int efi_range_init(boot_addr_range_t *range, efi_range_seq_t *seq)
-{
+static zx_status_t efi_range_init(boot_addr_range_t* range, efi_range_seq_t* seq) {
     range->seq = seq;
     range->advance = &efi_range_advance;
     range->reset = &efi_range_reset;
 
     if (bootloader.efi_mmap &&
         (bootloader.efi_mmap_size > sizeof(uint64_t))) {
-        seq->entrysz = *((uint64_t*) bootloader.efi_mmap);
+        seq->entrysz = *((uint64_t*)bootloader.efi_mmap);
         if (seq->entrysz < sizeof(efi_memory_descriptor)) {
-            return 0;
+            return ZX_ERR_NO_MEMORY;
         }
 
         seq->count = static_cast<int>((bootloader.efi_mmap_size - sizeof(uint64_t)) / seq->entrysz);
-        seq->base = reinterpret_cast<void *>(
-                reinterpret_cast<uintptr_t>(bootloader.efi_mmap) + sizeof(uint64_t));
+        seq->base = reinterpret_cast<void*>(
+            reinterpret_cast<uintptr_t>(bootloader.efi_mmap) + sizeof(uint64_t));
         range->reset(range);
-        return 1;
+        return ZX_OK;
     } else {
-        return 0;
+        return ZX_ERR_NO_MEMORY;
     }
 }
 
@@ -298,17 +289,15 @@ typedef struct multiboot_range_seq {
     int count;
 } multiboot_range_seq_t;
 
-static void multiboot_range_reset(boot_addr_range_t *range)
-{
+static void multiboot_range_reset(boot_addr_range_t* range) {
     boot_addr_range_reset(range);
 
-    multiboot_range_seq_t *seq = (multiboot_range_seq_t *)(range->seq);
+    multiboot_range_seq_t* seq = (multiboot_range_seq_t*)(range->seq);
     seq->index = -1;
 }
 
-static void multiboot_range_advance(boot_addr_range_t *range)
-{
-    multiboot_range_seq_t *seq = (multiboot_range_seq_t *)(range->seq);
+static void multiboot_range_advance(boot_addr_range_t* range) {
+    multiboot_range_seq_t* seq = (multiboot_range_seq_t*)(range->seq);
 
     if (seq->mmap) {
         /* memory map based range information */
@@ -319,7 +308,7 @@ static void multiboot_range_advance(boot_addr_range_t *range)
             return;
         }
 
-        memory_map_t *entry = &seq->mmap[seq->index];
+        memory_map_t* entry = &seq->mmap[seq->index];
 
         range->base = entry->base_addr_high;
         range->base <<= 32;
@@ -342,16 +331,15 @@ static void multiboot_range_advance(boot_addr_range_t *range)
 
         // mem_lower is memory (KB) available at base=0
         // mem_upper is memory (KB) available at base=1MB
-        range->base = 1024*1024;
+        range->base = 1024 * 1024;
         range->size = seq->info->mem_upper * 1024U;
         range->is_mem = 1;
         range->is_reset = 0;
     }
 }
 
-static int multiboot_range_init(boot_addr_range_t *range,
-                                multiboot_range_seq_t *seq)
-{
+static zx_status_t multiboot_range_init(boot_addr_range_t* range,
+                                multiboot_range_seq_t* seq) {
     LTRACEF("_multiboot_info %p\n", _multiboot_info);
 
     range->seq = seq;
@@ -360,41 +348,39 @@ static int multiboot_range_init(boot_addr_range_t *range,
 
     if (_multiboot_info == NULL) {
         /* no multiboot info found. */
-        return 0;
+        return ZX_ERR_NO_MEMORY;
     }
 
-    seq->info = (multiboot_info_t *)X86_PHYS_TO_VIRT(_multiboot_info);
+    seq->info = (multiboot_info_t*)X86_PHYS_TO_VIRT(_multiboot_info);
     seq->mmap = NULL;
     seq->count = 0;
 
     // if the MMAP flag is set and the address/length seems sane, parse the multiboot
     // memory map table
-    if ((seq->info->flags & MB_INFO_MMAP)
-            && (seq->info->mmap_addr != 0) && (seq->info->mmap_length > 0)) {
+    if ((seq->info->flags & MB_INFO_MMAP) && (seq->info->mmap_addr != 0) && (seq->info->mmap_length > 0)) {
 
         void* mmap_addr = (void*)X86_PHYS_TO_VIRT(seq->info->mmap_addr);
 
         /* we've been told the memory map is valid, so set it up */
-        seq->mmap = (memory_map_t *)(uintptr_t)(mmap_addr);
+        seq->mmap = (memory_map_t*)(uintptr_t)(mmap_addr);
         seq->count = static_cast<int>(seq->info->mmap_length / sizeof(memory_map_t));
 
         multiboot_range_reset(range);
-        return 1;
+        return ZX_OK;
     }
 
     if (seq->info->flags & MB_INFO_MEM_SIZE) {
         /* no additional setup required for the scalar range */
-        return 1;
+        return ZX_OK;
     }
 
     /* no memory information in the multiboot info */
-    return 0;
+    return ZX_ERR_NO_MEMORY;
 }
 
-static int addr_range_cmp(const void* p1, const void* p2)
-{
-    const struct addr_range *a1 = static_cast<const struct addr_range *>(p1);
-    const struct addr_range *a2 = static_cast<const struct addr_range *>(p2);
+static int addr_range_cmp(const void* p1, const void* p2) {
+    const struct addr_range* a1 = static_cast<const struct addr_range*>(p1);
+    const struct addr_range* a2 = static_cast<const struct addr_range*>(p2);
 
     if (a1->base < a2->base)
         return -1;
@@ -403,32 +389,48 @@ static int addr_range_cmp(const void* p1, const void* p2)
     return 1;
 }
 
-static status_t platform_mem_range_init(void)
-{
+static zx_status_t platform_mem_range_init(void) {
+    zx_status_t status;
     boot_addr_range_t range;
 
     /* first try the efi memory table */
     efi_range_seq_t efi_seq;
-    if (efi_range_init(&range, &efi_seq) &&
-        (mem_arena_init(&range) == ZX_OK))
+    status = efi_range_init(&range, &efi_seq);
+    if (status == ZX_OK) {
+        status = mem_arena_init(&range);
+        if (status != ZX_OK) {
+            printf("MEM: failure while adding EFI memory ranges\n");
+        }
         return ZX_OK;
+    }
 
     /* then try getting range info from e820 */
     e820_range_seq_t e820_seq;
-    if (e820_range_init(&range, &e820_seq) &&
-        (mem_arena_init(&range) == ZX_OK))
+    status = e820_range_init(&range, &e820_seq);
+    if (status == ZX_OK) {
+        status = mem_arena_init(&range);
+        if (status != ZX_OK) {
+            printf("MEM: failure while adding e820 memory ranges\n");
+        }
         return ZX_OK;
+    }
 
     /* if no ranges were found, try multiboot */
     multiboot_range_seq_t multiboot_seq;
-    if (multiboot_range_init(&range, &multiboot_seq) &&
-        (mem_arena_init(&range) == ZX_OK))
+    status = multiboot_range_init(&range, &multiboot_seq);
+    if (status == ZX_OK) {
+        status = mem_arena_init(&range);
+        if (status != ZX_OK) {
+            printf("MEM: failure while adding multiboot memory ranges\n");
+        }
         return ZX_OK;
+    }
 
     /* if still no ranges were found, make a safe guess */
+    printf("MEM: no arena range source: falling back to fixed size\n");
     e820_range_init(&range, &e820_seq);
     e820entry_t entry = {
-        .addr = MEMBASE,
+        .addr = 0,
         .size = DEFAULT_MEMEND,
         .type = E820_RAM,
     };
@@ -440,11 +442,11 @@ static status_t platform_mem_range_init(void)
 static size_t cached_e820_entry_count;
 static struct addr_range cached_e820_entries[64];
 
-status_t enumerate_e820(enumerate_e820_callback callback, void* ctx) {
+zx_status_t enumerate_e820(enumerate_e820_callback callback, void* ctx) {
     if (callback == NULL)
         return ZX_ERR_INVALID_ARGS;
 
-    if(!cached_e820_entry_count)
+    if (!cached_e820_entry_count)
         return ZX_ERR_BAD_STATE;
 
     DEBUG_ASSERT(cached_e820_entry_count <= fbl::count_of(cached_e820_entries));
@@ -456,8 +458,7 @@ status_t enumerate_e820(enumerate_e820_callback callback, void* ctx) {
 }
 
 /* Discover the basic memory map */
-void platform_mem_init(void)
-{
+void pc_mem_init(void) {
     if (platform_mem_range_init() != ZX_OK) {
         TRACEF("Error adding arenas from provided memory tables.\n");
     }
@@ -472,11 +473,12 @@ void platform_mem_init(void)
     efi_range_seq_t efi_seq;
     e820_range_seq_t e820_seq;
     multiboot_range_seq_t multiboot_seq;
+    bool initialized_bootstrap16 = false;
 
     cached_e820_entry_count = 0;
-    if (efi_range_init(&range, &efi_seq) ||
-        e820_range_init(&range, &e820_seq) ||
-        multiboot_range_init(&range, &multiboot_seq)) {
+    if ((efi_range_init(&range, &efi_seq) == ZX_OK) ||
+        (e820_range_init(&range, &e820_seq) == ZX_OK) ||
+        (multiboot_range_init(&range, &multiboot_seq) == ZX_OK)) {
         for (range.reset(&range),
              range.advance(&range);
              !range.is_reset; range.advance(&range)) {
@@ -491,8 +493,30 @@ void platform_mem_init(void)
             entry->size = range.size;
             entry->is_mem = range.is_mem ? true : false;
 
+            const uint64_t alloc_size = 2 * PAGE_SIZE;
+            const uint64_t min_base = 2 * PAGE_SIZE;
+            if (!initialized_bootstrap16 && entry->is_mem &&
+                entry->base <= 1 * MB - alloc_size && entry->size >= alloc_size) {
+
+                uint64_t adj_base = entry->base;
+                if (entry->base < min_base) {
+                    uint64_t size_adj = min_base - entry->base;
+                    if (entry->size < size_adj + alloc_size) {
+                        continue;
+                    }
+                    adj_base = min_base;
+                }
+
+                LTRACEF("Selected %" PRIxPTR " as bootstrap16 region\n", adj_base);
+                x86_bootstrap16_init(adj_base);
+                initialized_bootstrap16 = true;
+            }
         }
     } else {
         TRACEF("ERROR - No e820 range entries found!  This is going to end badly for everyone.\n");
+    }
+
+    if (!initialized_bootstrap16) {
+        TRACEF("WARNING - Failed to assign bootstrap16 region, SMP won't work\n");
     }
 }

@@ -5,8 +5,8 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <launchpad/vmo.h>
-#include <launchpad/loader-service.h>
-#include <zircon/device/dmctl.h>
+#include <loader-service/loader-service.h>
+#include <ldmsg/ldmsg.h>
 #include <zircon/dlfcn.h>
 #include <zircon/processargs.h>
 #include <zircon/syscalls.h>
@@ -54,14 +54,8 @@ bool dlopen_vmo_test(void) {
 static atomic_bool my_loader_service_ok = false;
 static atomic_int my_loader_service_calls = 0;
 
-static zx_status_t my_loader_service(void* arg, uint32_t load_op,
-                                     zx_handle_t request_handle,
-                                     const char* name,
-                                     zx_handle_t* out) {
+static zx_status_t my_load_object(void* ctx, const char* name, zx_handle_t* out) {
     ++my_loader_service_calls;
-
-    EXPECT_EQ(request_handle, ZX_HANDLE_INVALID,
-              "called with a request handle");
 
     int cmp = strcmp(name, TEST_NAME);
     EXPECT_EQ(cmp, 0, "called with unexpected name");
@@ -69,16 +63,9 @@ static zx_status_t my_loader_service(void* arg, uint32_t load_op,
         unittest_printf("        saw \"%s\", expected \"%s\"", name, TEST_NAME);
         return ZX_HANDLE_INVALID;
     }
-    EXPECT_EQ(load_op, (uint32_t) LOADER_SVC_OP_LOAD_OBJECT,
-              "called with unexpected load op");
-    if (load_op != (uint32_t) LOADER_SVC_OP_LOAD_OBJECT) {
-        unittest_printf("        saw %" PRIu32 ", expected %" PRIu32, load_op,
-                        LOADER_SVC_OP_LOAD_OBJECT);
-        return ZX_HANDLE_INVALID;
-    }
 
     zx_handle_t vmo = ZX_HANDLE_INVALID;
-    zx_status_t status = launchpad_vmo_from_file(arg, &vmo);
+    zx_status_t status = launchpad_vmo_from_file((char*) ctx, &vmo);
     EXPECT_EQ(status, ZX_OK, "");
     EXPECT_NE(vmo, ZX_HANDLE_INVALID, "launchpad_vmo_from_file");
     if (status < 0) {
@@ -89,6 +76,21 @@ static zx_status_t my_loader_service(void* arg, uint32_t load_op,
     *out = vmo;
     return ZX_OK;
 }
+
+static zx_status_t my_load_abspath(void* ctx, const char* name, zx_handle_t* vmo) {
+    return ZX_ERR_NOT_SUPPORTED;
+}
+
+static zx_status_t my_publish_data_sink(void* ctx, const char* name, zx_handle_t vmo) {
+    zx_handle_close(vmo);
+    return ZX_ERR_NOT_SUPPORTED;
+}
+
+static loader_service_ops_t my_loader_ops = {
+    .load_object = my_load_object,
+    .load_abspath = my_load_abspath,
+    .publish_data_sink = my_publish_data_sink,
+};
 
 static void show_dlerror(void) {
     unittest_printf_critical("dlerror: %s\n", dlerror());
@@ -104,9 +106,13 @@ bool loader_service_test(void) {
         show_dlerror();
 
     // Spin up our test service.
-    zx_handle_t my_service;
-    zx_status_t status = loader_service_simple(&my_loader_service, (void*)TEST_ACTUAL_NAME, &my_service);
-    EXPECT_EQ(status, ZX_OK, "fdio_loader_service");
+    loader_service_t* svc = NULL;
+    zx_status_t status = loader_service_create(NULL, &my_loader_ops, (void*)TEST_ACTUAL_NAME, &svc);
+    EXPECT_EQ(status, ZX_OK, "loader_service_create");
+
+    zx_handle_t my_service = ZX_HANDLE_INVALID;
+    status = loader_service_connect(svc, &my_service);
+    EXPECT_EQ(status, ZX_OK, "loader_service_connect");
 
     // Install the service.
     zx_handle_t old = dl_set_loader_service(my_service);
@@ -148,23 +154,29 @@ bool loader_service_test(void) {
     END_TEST;
 }
 
-#define DMCTL_PATH "/dev/misc/dmctl"
-
-bool ioctl_test(void) {
+bool clone_test(void) {
     BEGIN_TEST;
 
-    int fd = open(DMCTL_PATH, O_RDONLY);
-    ASSERT_GE(fd, 0, "can't open " DMCTL_PATH);
-
     zx_handle_t h = ZX_HANDLE_INVALID;
-    ssize_t s = ioctl_dmctl_get_loader_service_channel(fd, &h);
-    close(fd);
-
-    EXPECT_EQ(s, (ssize_t)sizeof(zx_handle_t),
-              "unexpected return value from ioctl");
+    zx_status_t s = dl_clone_loader_service(&h);
+    EXPECT_EQ(s, ZX_OK, "unexpected return value from ioctl");
     EXPECT_NE(h, ZX_HANDLE_INVALID, "invalid handle from ioctl");
 
     zx_handle_close(h);
+
+    END_TEST;
+}
+
+int main(int argc, char** argv);
+static bool dladdr_main_test(void) {
+    BEGIN_TEST;
+
+    Dl_info info;
+    ASSERT_NE(dladdr(&main, &info), 0, "dladdr failed");
+
+    // The "main" symbol is not exported to .dynsym, so it won't be found.
+    EXPECT_EQ(info.dli_sname, NULL, "unexpected symbol name");
+    EXPECT_EQ(info.dli_saddr, NULL, "unexpected symbol address");
 
     END_TEST;
 }
@@ -174,7 +186,8 @@ bool ioctl_test(void) {
 BEGIN_TEST_CASE(dlfcn_tests)
 RUN_TEST(dlopen_vmo_test);
 RUN_TEST(loader_service_test);
-RUN_TEST(ioctl_test);
+RUN_TEST(clone_test);
+RUN_TEST(dladdr_main_test);
 END_TEST_CASE(dlfcn_tests)
 
 int main(int argc, char** argv) {

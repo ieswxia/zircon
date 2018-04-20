@@ -8,6 +8,7 @@
 
 #include <err.h>
 #include <zircon/compiler.h>
+#include <zircon/types.h>
 
 Semaphore::Semaphore(int64_t initial_count) : count_(initial_count) {
     wait_queue_init(&waitq_);
@@ -26,23 +27,31 @@ int Semaphore::Post() {
     return 0;
 }
 
-zx_status_t Semaphore::Wait(lk_time_t deadline) {
+zx_status_t Semaphore::Wait(zx_time_t deadline, bool* was_blocked) {
     thread_t *current_thread = get_current_thread();
 
      // If there are no resources available then we need to
      // sit in the wait queue until sem_post adds some.
     zx_status_t ret = ZX_OK;
-    AutoThreadLock lock;
-    current_thread->interruptable = true;
+    bool block;
 
-    if (unlikely(--count_ < 0)) {
-        ret = wait_queue_block(&waitq_, deadline);
-        if (ret < ZX_OK) {
-            if ((ret == ZX_ERR_TIMED_OUT) || (ret == ZX_ERR_INTERNAL_INTR_KILLED))
-                count_++;
+    {
+        AutoThreadLock lock;
+        current_thread->interruptable = true;
+        block = --count_ < 0;
+
+        if (unlikely(block)) {
+            ret = wait_queue_block(&waitq_, deadline);
+            if (ret < ZX_OK) {
+                if ((ret == ZX_ERR_TIMED_OUT) || (ret == ZX_ERR_INTERNAL_INTR_KILLED))
+                    count_++;
+            }
         }
+
+        current_thread->interruptable = false;
     }
 
-    current_thread->interruptable = false;
+    if (was_blocked != nullptr)
+        *was_blocked = block;
     return ret;
 }

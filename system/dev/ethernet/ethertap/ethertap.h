@@ -12,7 +12,7 @@
 #include <zircon/compiler.h>
 #include <zircon/types.h>
 #include <zircon/device/ethertap.h>
-#include <zx/socket.h>
+#include <lib/zx/socket.h>
 #include <fbl/mutex.h>
 #include <fbl/unique_ptr.h>
 #include <threads.h>
@@ -39,8 +39,10 @@ class TapDevice : public ddk::Device<TapDevice, ddk::Unbindable>,
     zx_status_t EthmacQuery(uint32_t options, ethmac_info_t* info);
     void EthmacStop();
     zx_status_t EthmacStart(fbl::unique_ptr<ddk::EthmacIfcProxy> proxy);
-    void EthmacSend(uint32_t options, void* data, size_t length);
-
+    zx_status_t EthmacQueueTx(uint32_t options, ethmac_netbuf_t* netbuf);
+    zx_status_t EthmacSetParam(uint32_t param, int32_t value, void* data);
+    // No DMA capability, so return invalid handle for get_bti
+    zx_handle_t EthmacGetBti();
     int Thread();
 
   private:
@@ -56,6 +58,7 @@ class TapDevice : public ddk::Device<TapDevice, ddk::Unbindable>,
     uint8_t mac_[6] = {};
 
     fbl::Mutex lock_;
+    bool dead_ = false;
     fbl::unique_ptr<ddk::EthmacIfcProxy> ethmac_proxy_ __TA_GUARDED(lock_);
 
     // Only accessed from Thread, so not locked.

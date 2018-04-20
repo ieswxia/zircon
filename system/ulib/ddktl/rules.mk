@@ -8,6 +8,8 @@ MODULE := $(LOCAL_DIR)
 
 MODULE_TYPE := userlib
 
+MODULE_PACKAGE := static
+
 include make/module.mk
 
 #
@@ -27,7 +29,6 @@ MODULE_SRCS := \
     $(TEST_DIR)/ddktl-test-binding.c \
     $(TEST_DIR)/device-tests.cpp \
     $(TEST_DIR)/ethernet-tests.cpp \
-    $(TEST_DIR)/wlan-tests.cpp \
 
 MODULE_STATIC_LIBS := \
     system/ulib/ddk \

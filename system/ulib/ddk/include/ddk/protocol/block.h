@@ -1,55 +1,117 @@
-// Copyright 2016 The Fuchsia Authors. All rights reserved.
+// Copyright 2017 The Fuchsia Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
 #pragma once
 
-#include <zircon/compiler.h>
-#include <zircon/types.h>
+#include <assert.h>
+#include <stdint.h>
 #include <zircon/device/block.h>
 
-__BEGIN_CDECLS;
+// block_op_t's are submitted for processing via the queue() method
+// of the block_protocol.  Once submitted, the contents of the block_op_t
+// may be modified while it's being processed and/or as it is passed down
+// the stack to lower layered drivers.
+//
+// The contents may be mutated along the way -- for example, a partition
+// driver would, after validation, adjust offset_dev to reflect the position
+// of the partition.
+//
+// The completion_cb() must eventually be called upon success or failure and
+// at that point the cookie field must contain whatever value was in it when
+// the block_op_t was originally queued.
+//
+// The rw.pages field may be modified but the *contents* of the array it points
+// to may not be modified.
 
-typedef struct block_callbacks {
-    void (*complete)(void* cookie, zx_status_t status);
-} block_callbacks_t;
+typedef struct block_op block_op_t;
+
+struct block_op {
+    union {
+        // All Commands
+        uint32_t command;                // command and flags
+
+        // BLOCK_OP_READ, BLOCK_OP_WRITE
+        struct {
+            uint32_t command;            // command and flags
+            uint32_t extra;              // available for temporary use
+            zx_handle_t vmo;             // vmo of data to read or write
+            uint32_t length;             // transfer length in blocks (0 is invalid)
+            uint64_t offset_dev;         // device offset in blocks
+            uint64_t offset_vmo;         // vmo offset in blocks
+            uint64_t* pages;             // optional physical page list
+        } rw;
+
+        // BLOCK_OP_TRIM
+        struct {
+            uint32_t command;            // command and flags
+            // ???
+        } trim;
+    };
+
+    // The completion_cb() will be called when the block operation
+    // succeeds or fails, and cookie will be whatever was set when
+    // the block_op was initially queue()'d.
+    void (*completion_cb)(block_op_t* block, zx_status_t status);
+    void* cookie;
+};
+
+static_assert(sizeof(block_op_t) == 56, "");
 
 typedef struct block_protocol_ops {
-    void (*set_callbacks)(void* ctx, block_callbacks_t* cb);
-    void (*get_info)(void* ctx, block_info_t* info);
-    void (*read)(void* ctx, zx_handle_t vmo, uint64_t length, uint64_t vmo_offset,
-                 uint64_t dev_offset, void* cookie);
-    void (*write)(void* ctx, zx_handle_t vmo, uint64_t length, uint64_t vmo_offset,
-                  uint64_t dev_offset, void* cookie);
+    // Obtain the parameters of the block device (block_info_t) and
+    // the required size of block_txn_t.  The block_txn_t's submitted
+    // via queue() must have block_op_size_out - sizeof(block_op_t) bytes
+    // available at the end of the structure for the use of the driver.
+    void (*query)(void* ctx, block_info_t* info_out, size_t* block_op_size_out);
+
+    // Submit an IO request for processing.  Success or failure will
+    // be reported via the completion_cb() in the block_op_t.  This
+    // callback may be called before the queue() method returns.
+    void (*queue)(void* ctx, block_op_t* txn);
 } block_protocol_ops_t;
 
-typedef struct {
+typedef struct block_protocol {
     block_protocol_ops_t* ops;
     void* ctx;
 } block_protocol_t;
 
-// Identify how the block device can propagate certain information, such as
-// "operation completed".
-static inline void block_set_callbacks(block_protocol_t* block, block_callbacks_t* cb) {
-    block->ops->set_callbacks(block->ctx, cb);
-}
+// Read and Write ops use u.rw for parameters.
+//
+// If u.rw.pages is not NULL, the VMO is already appropriately pinned
+// for IO and pages is an array of the physical addresses covering
+// offset_vmo * block_size through (offset_vmo + length + 1U) * block_size.
+//
+// The number of entries in this array is always
+// ((u.rw.length + 1U * block_size + PAGE_SIZE - 1) / PAGE_SIZE)
+#define BLOCK_OP_READ                0x00000001
+#define BLOCK_OP_WRITE               0x00000002
 
-// Get information about the underlying block device
-static inline void block_get_info(block_protocol_t* block, block_info_t* info) {
-    block->ops->get_info(block->ctx, info);
-}
+// Write any controller or device cached data to nonvolatile storage.
+// This operation always implies BARRIER_BEFORE and BARRIER_AFTER,
+// meaning that previous operations will complete before it starts
+// and later operations will not start until it is done.
+#define BLOCK_OP_FLUSH               0x00000003
 
-// Read to the VMO from the block device
-static inline void block_read(block_protocol_t* block, zx_handle_t vmo, uint64_t length,
-                              uint64_t vmo_offset, uint64_t dev_offset, void* cookie) {
-    block->ops->read(block->ctx, vmo, length, vmo_offset, dev_offset, cookie);
-}
+// TBD
+#define BLOCK_OP_TRIM                0x00000004
+
+#define BLOCK_OP_MASK                0x000000FF
 
 
-// Write from the VMO to the block device
-static inline void block_write(block_protocol_t* block, zx_handle_t vmo, uint64_t length,
-                               uint64_t vmo_offset, uint64_t dev_offset, void* cookie) {
-    block->ops->write(block->ctx, vmo, length, vmo_offset, dev_offset, cookie);
-}
+// Mark this operation as "Force Unit Access" (FUA), indicating that
+// it should not complete until the data is written to the non-volatile
+// medium (write), and that reads should bypass any on-device caches.
+#define BLOCK_FL_FORCE_ACCESS        0x00001000
 
-__END_CDECLS;
+// Require that this operation will not begin until all previous
+// operations have completed.
+//
+// Prevents earlier operations from being reordered after this one.
+#define BLOCK_FL_BARRIER_BEFORE      0x00000100
+
+// Require that this operation complete before any subsequent
+// operations are started.
+//
+// Prevents later operations from being reordered before this one.
+#define BLOCK_FL_BARRIER_AFTER       0x00000200

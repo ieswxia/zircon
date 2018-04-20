@@ -14,10 +14,10 @@
 #include <fbl/ref_counted.h>
 #include <fbl/ref_ptr.h>
 #include <kernel/mutex.h>
-#include <kernel/vm.h>
 #include <lib/user_copy/user_ptr.h>
 #include <list.h>
 #include <stdint.h>
+#include <vm/vm.h>
 #include <vm/vm_object.h>
 #include <zircon/thread_annotations.h>
 #include <zircon/types.h>
@@ -27,13 +27,17 @@ class VmObjectPhysical final : public VmObject {
 public:
     static zx_status_t Create(paddr_t base, uint64_t size, fbl::RefPtr<VmObject>* vmo);
 
+    bool is_contiguous() const override { return true; }
+
     uint64_t size() const override
         // TODO: Figure out whether it's safe to lock here without causing
         // any deadlocks.
         TA_NO_THREAD_SAFETY_ANALYSIS { return size_; }
 
-    zx_status_t LookupUser(uint64_t offset, uint64_t len, user_ptr<paddr_t> buffer,
+    zx_status_t LookupUser(uint64_t offset, uint64_t len, user_inout_ptr<paddr_t> buffer,
                            size_t buffer_size) override;
+    zx_status_t Lookup(uint64_t offset, uint64_t len, uint pf_flags,
+                       vmo_lookup_fn_t lookup_fn, void* context) override;
 
     void Dump(uint depth, bool verbose) override;
 

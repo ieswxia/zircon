@@ -4,18 +4,22 @@
 
 #include <stdbool.h>
 #include <string.h>
+#include <threads.h>
 #include <unistd.h>
 
+#include <ddk/protocol/block.h>
+#include <fbl/auto_call.h>
+#include <fbl/auto_lock.h>
+#include <fbl/array.h>
+#include <fbl/limits.h>
+#include <fbl/new.h>
 #include <fs/mapped-vmo.h>
+#include <sync/completion.h>
 #include <zircon/compiler.h>
 #include <zircon/device/block.h>
 #include <zircon/syscalls.h>
 #include <zircon/thread_annotations.h>
-#include <fbl/auto_call.h>
-#include <fbl/auto_lock.h>
-#include <fbl/limits.h>
-#include <fbl/new.h>
-#include <threads.h>
+#include <lib/zx/vmo.h>
 
 #include "fvm-private.h"
 
@@ -42,7 +46,6 @@ fbl::unique_ptr<SliceExtent> SliceExtent::Split(size_t vslice) {
     return fbl::move(new_extent);
 }
 
-
 bool SliceExtent::Merge(const SliceExtent& other) {
     ZX_DEBUG_ASSERT(end() == other.start());
     fbl::AllocChecker ac;
@@ -57,27 +60,29 @@ bool SliceExtent::Merge(const SliceExtent& other) {
     return true;
 }
 
-VPartitionManager::VPartitionManager(zx_device_t* parent, const block_info_t& info)
+VPartitionManager::VPartitionManager(zx_device_t* parent, const block_info_t& info,
+                                     size_t block_op_size, const block_protocol_t* bp)
     : ManagerDeviceType(parent), info_(info), metadata_(nullptr), metadata_size_(0),
-      slice_size_(0) {}
+      slice_size_(0), block_op_size_(block_op_size) {
+    memcpy(&bp_, bp, sizeof(*bp));
+}
 
 VPartitionManager::~VPartitionManager() = default;
 
 zx_status_t VPartitionManager::Create(zx_device_t* dev, fbl::unique_ptr<VPartitionManager>* out) {
     block_info_t block_info;
-    size_t actual = 0;
-    ssize_t rc = device_ioctl(dev, IOCTL_BLOCK_GET_INFO, nullptr, 0, &block_info,
-                              sizeof(block_info), &actual);
-    if (rc < 0) {
-        return static_cast<zx_status_t>(rc);
-    } else if (actual != sizeof(block_info)) {
-        return ZX_ERR_BAD_STATE;
-    } else if (block_info.block_size == 0) {
-        return ZX_ERR_BAD_STATE;
+    block_protocol_t bp;
+    size_t block_op_size = 0;
+    if (device_get_protocol(dev, ZX_PROTOCOL_BLOCK, &bp) != ZX_OK) {
+        printf("fvm: ERROR: block device '%s': does not support block protocol\n",
+               device_get_name(dev));
+        return ZX_ERR_NOT_SUPPORTED;
     }
+    bp.ops->query(bp.ctx, &block_info, &block_op_size);
 
     fbl::AllocChecker ac;
-    auto vpm = fbl::make_unique_checked<VPartitionManager>(&ac, dev, block_info);
+    auto vpm = fbl::make_unique_checked<VPartitionManager>(&ac, dev, block_info,
+                                                           block_op_size, &bp);
     if (!ac.check()) {
         return ZX_ERR_NO_MEMORY;
     }
@@ -94,14 +99,81 @@ zx_status_t VPartitionManager::AddPartition(fbl::unique_ptr<VPartition> vp) cons
     if ((status = vp->DdkAdd(name)) != ZX_OK) {
         return status;
     }
-    vp.release();
+    // TODO(johngro): ask smklein why it is OK to release this managed pointer.
+    __UNUSED auto ptr = vp.release();
     return ZX_OK;
+}
+
+struct VpmIoCookie {
+    fbl::atomic<size_t> num_txns;
+    fbl::atomic<zx_status_t> status;
+    completion_t signal;
+};
+
+static void IoCallback(block_op_t* op, zx_status_t status) {
+    VpmIoCookie* c = reinterpret_cast<VpmIoCookie*>(op->cookie);
+    if (status != ZX_OK) {
+        c->status.store(status);
+    }
+    if (c->num_txns.fetch_sub(1) - 1 == 0) {
+        completion_signal(&c->signal);
+    }
+}
+
+zx_status_t VPartitionManager::DoIoLocked(zx_handle_t vmo, size_t off,
+                                          size_t len, uint32_t command) {
+    size_t block_size = info_.block_size;
+    const size_t max_transfer = info_.max_transfer_size / block_size;
+    size_t len_remaining = len / block_size;
+    size_t vmo_offset = 0;
+    size_t dev_offset = off / block_size;
+    size_t num_txns = fbl::round_up(len_remaining, max_transfer) / max_transfer;
+
+    fbl::AllocChecker ac;
+    fbl::Array<uint8_t> buffer(new (&ac) uint8_t[block_op_size_ * num_txns],
+                               block_op_size_ * num_txns);
+
+    if (!ac.check()) {
+        return ZX_ERR_NO_MEMORY;
+    }
+
+    VpmIoCookie cookie;
+    cookie.num_txns.store(num_txns);
+    cookie.status.store(ZX_OK);
+    completion_reset(&cookie.signal);
+
+    for (size_t i = 0; i < num_txns; i++) {
+        size_t length = fbl::min(len_remaining, max_transfer);
+        len_remaining -= length;
+
+        block_op_t* bop = reinterpret_cast<block_op_t*>(buffer.get() + (block_op_size_ * i));
+        bop->command = command;
+        bop->rw.vmo = vmo;
+        bop->rw.length = static_cast<uint32_t>(length);
+        bop->rw.offset_dev = dev_offset;
+        bop->rw.offset_vmo = vmo_offset;
+        bop->rw.pages = NULL;
+        bop->completion_cb = IoCallback;
+        bop->cookie = &cookie;
+        memset(buffer.get() + (block_op_size_ * i) + sizeof(block_op_t), 0,
+               block_op_size_ - sizeof(block_op_t));
+        bp_.ops->queue(bp_.ctx, bop);
+
+        vmo_offset += length;
+        dev_offset += length;
+    }
+
+    ZX_DEBUG_ASSERT(len_remaining == 0);
+    completion_wait(&cookie.signal, ZX_TIME_INFINITE);
+    return static_cast<zx_status_t>(cookie.status.load());
 }
 
 zx_status_t VPartitionManager::Load() {
     fbl::AutoLock lock(&lock_);
 
     auto auto_detach = fbl::MakeAutoCall([&]() TA_NO_THREAD_SAFETY_ANALYSIS {
+        fprintf(stderr, "fvm: Aborting Driver Load\n");
+        DdkRemove();
         // "Load" is running in a background thread called by bind.
         // This thread will be joined when the fvm_device is released,
         // but it must be added to be released.
@@ -116,83 +188,89 @@ zx_status_t VPartitionManager::Load() {
         delete this;
     });
 
-    // Read the superblock first, to determine the slice sice
-    iotxn_t* txn = nullptr;
-    zx_status_t status = iotxn_alloc(&txn, IOTXN_ALLOC_POOL, FVM_BLOCK_SIZE);
-    if (status != ZX_OK) {
-        return status;
+    zx::vmo vmo;
+    if (zx::vmo::create(FVM_BLOCK_SIZE, 0, &vmo) != ZX_OK) {
+        return ZX_ERR_INTERNAL;
     }
-    txn->opcode = IOTXN_OP_READ;
-    txn->offset = 0;
-    txn->length = FVM_BLOCK_SIZE;
-    iotxn_synchronous_op(parent(), txn);
-    if (txn->status != ZX_OK) {
-        status = txn->status;
-        iotxn_release(txn);
-        return status;
+
+    // Read the superblock first, to determine the slice sice
+    if (DoIoLocked(vmo.get(), 0, FVM_BLOCK_SIZE, BLOCK_OP_READ)) {
+        fprintf(stderr, "fvm: Failed to read first block from underlying device\n");
+        return ZX_ERR_INTERNAL;
     }
 
     fvm_t sb;
-    iotxn_copyfrom(txn, &sb, sizeof(sb), 0);
-    iotxn_release(txn);
+    zx_status_t status = vmo.read(&sb, 0, sizeof(sb));
+    if (status != ZX_OK) {
+        return ZX_ERR_INTERNAL;
+    }
 
     // Validate the superblock, confirm the slice size
     slice_size_ = sb.slice_size;
-    if (info_.block_size == 0 || SliceSize() % info_.block_size) {
+    if ((slice_size_ * VSliceMax()) / VSliceMax() != slice_size_) {
+        fprintf(stderr, "fvm: Slice Size, VSliceMax overflow block address space\n");
+        return ZX_ERR_BAD_STATE;
+    } else if (info_.block_size == 0 || SliceSize() % info_.block_size) {
+        fprintf(stderr, "fvm: Bad block (%u) or slice size (%zu)\n",
+                info_.block_size, SliceSize());
         return ZX_ERR_BAD_STATE;
     } else if (sb.vpartition_table_size != kVPartTableLength) {
+        fprintf(stderr, "fvm: Bad vpartition table size %zu (expected %zu)\n",
+                sb.vpartition_table_size, kVPartTableLength);
         return ZX_ERR_BAD_STATE;
     } else if (sb.allocation_table_size != AllocTableLength(DiskSize(), SliceSize())) {
+        fprintf(stderr, "fvm: Bad allocation table size %zu (expected %zu)\n",
+                sb.allocation_table_size, AllocTableLength(DiskSize(), SliceSize()));
         return ZX_ERR_BAD_STATE;
     }
 
     metadata_size_ = fvm::MetadataSize(DiskSize(), SliceSize());
     // Now that the slice size is known, read the rest of the metadata
-    size_t dual_metadata_size = 2 * MetadataSize();
+    auto make_metadata_vmo = [&](size_t offset, fbl::unique_ptr<MappedVmo>* out) {
+        fbl::unique_ptr<MappedVmo> mvmo;
+        zx_status_t status = MappedVmo::Create(MetadataSize(), "fvm-meta", &mvmo);
+        if (status != ZX_OK) {
+            return status;
+        }
+
+        // Read both copies of metadata, ensure at least one is valid
+        if ((status = DoIoLocked(mvmo->GetVmo(), offset,
+                                 MetadataSize(), BLOCK_OP_READ)) != ZX_OK) {
+            return status;
+        }
+
+        *out = fbl::move(mvmo);
+        return ZX_OK;
+    };
+
     fbl::unique_ptr<MappedVmo> mvmo;
-    status = MappedVmo::Create(dual_metadata_size, "fvm-meta", &mvmo);
-    if (status != ZX_OK) {
+    if ((status = make_metadata_vmo(0, &mvmo)) != ZX_OK) {
+        fprintf(stderr, "fvm: Failed to load metadata vmo: %d\n", status);
         return status;
     }
-
-    // Read both copies of metadata, ensure at least one is valid
-    status = iotxn_alloc_vmo(&txn, IOTXN_ALLOC_POOL, mvmo->GetVmo(), 0, dual_metadata_size);
-    if (status != ZX_OK) {
+    fbl::unique_ptr<MappedVmo> mvmo_backup;
+    if ((status = make_metadata_vmo(MetadataSize(), &mvmo_backup)) != ZX_OK) {
+        fprintf(stderr, "fvm: Failed to load backup metadata vmo: %d\n", status);
         return status;
     }
-    txn->opcode = IOTXN_OP_READ;
-    txn->offset = 0;
-    txn->length = dual_metadata_size;
-    iotxn_synchronous_op(parent(), txn);
-    if (txn->status != ZX_OK) {
-        status = txn->status;
-        iotxn_release(txn);
-        return status;
-    }
-    iotxn_release(txn);
-
-    const void* backup = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(mvmo->GetData()) +
-                                                 MetadataSize());
 
     const void* metadata;
-    if ((status = fvm_validate_header(mvmo->GetData(), backup, MetadataSize(),
-                                      &metadata)) != ZX_OK) {
+    if ((status = fvm_validate_header(mvmo->GetData(), mvmo_backup->GetData(),
+                                      MetadataSize(), &metadata)) != ZX_OK) {
+        fprintf(stderr, "fvm: Header validation failure: %d\n", status);
         return status;
     }
-    // TODO(smklein): Compare the performance of the current reading behavior
-    // (read into VMO, map into VMAR, cut VMAR in half) with an alternative
-    // which waits to map the VMO by using zx_vmo_read twice beforehand instead.
-    first_metadata_is_primary_ = (metadata == mvmo->GetData());
-    if ((status = mvmo->Shrink(PrimaryOffsetLocked(), MetadataSize())) != ZX_OK) {
-        return status;
+
+    if (metadata == mvmo->GetData()) {
+        first_metadata_is_primary_ = true;
+        metadata_ = fbl::move(mvmo);
+    } else {
+        first_metadata_is_primary_ = false;
+        metadata_ = fbl::move(mvmo_backup);
     }
 
     // Begin initializing the underlying partitions
-    metadata_ = fbl::move(mvmo);
-
-    if ((status = DdkAdd("fvm")) != ZX_OK) {
-        return status;
-    }
+    DdkMakeVisible();
     auto_detach.cancel();
 
     // 0th vpartition is invalid
@@ -204,19 +282,20 @@ zx_status_t VPartitionManager::Load() {
         if (GetVPartEntryLocked(i)->slices == 0) {
             continue;
         } else if ((status = VPartition::Create(this, i, &vpartitions[i])) != ZX_OK) {
+            fprintf(stderr, "FVM: Failed to Create vpartition %zu\n", i);
             return status;
         }
     }
 
     // Iterate through the Slice Allocation table, filling the slice maps
     // of VPartitions.
-    for (uint32_t i = 1; i < GetFvmLocked()->pslice_count; i++) {
+    for (uint32_t i = 1; i <= GetFvmLocked()->pslice_count; i++) {
         const slice_entry_t* entry = GetSliceEntryLocked(i);
         if (entry->vpart == FVM_SLICE_FREE) {
             continue;
         }
         if (vpartitions[entry->vpart] == nullptr) {
-            return ZX_ERR_BAD_STATE;
+            continue;
         }
 
         // It's fine to load the slices while not holding the vpartition
@@ -231,8 +310,11 @@ zx_status_t VPartitionManager::Load() {
     for (size_t i = 0; i < FVM_MAX_ENTRIES; i++) {
         if (vpartitions[i] == nullptr) {
             continue;
-        }
-        if (AddPartition(fbl::move(vpartitions[i]))) {
+        } else if (GetAllocatedVPartEntry(i)->flags & kVPartFlagInactive) {
+            fprintf(stderr, "FVM: Freeing inactive partition\n");
+            FreeSlices(vpartitions[i].get(), 0, VSliceMax());
+            continue;
+        } else if (AddPartition(fbl::move(vpartitions[i]))) {
             continue;
         }
         device_count++;
@@ -242,25 +324,14 @@ zx_status_t VPartitionManager::Load() {
 }
 
 zx_status_t VPartitionManager::WriteFvmLocked() {
-    iotxn_t* txn = nullptr;
-
-    zx_status_t status = iotxn_alloc_vmo(&txn, IOTXN_ALLOC_POOL,
-                                         metadata_->GetVmo(), 0,
-                                         MetadataSize());
-    if (status != ZX_OK) {
-        return status;
-    }
-    txn->opcode = IOTXN_OP_WRITE;
-    // If we were reading from the primary, write to the backup.
-    txn->offset = BackupOffsetLocked();
-    txn->length = MetadataSize();
+    zx_status_t status;
 
     GetFvmLocked()->generation++;
     fvm_update_hash(GetFvmLocked(), MetadataSize());
 
-    iotxn_synchronous_op(parent_, txn);
-    status = txn->status;
-    iotxn_release(txn);
+    // If we were reading from the primary, write to the backup.
+    status = DoIoLocked(metadata_->GetVmo(), BackupOffsetLocked(),
+                        MetadataSize(), BLOCK_OP_WRITE);
     if (status != ZX_OK) {
         return status;
     }
@@ -317,8 +388,9 @@ zx_status_t VPartitionManager::AllocateSlicesLocked(VPartition* vp, size_t vslic
 
     {
         fbl::AutoLock lock(&vp->lock_);
-        if (vp->IsKilledLocked())
+        if (vp->IsKilledLocked()) {
             return ZX_ERR_BAD_STATE;
+        }
         for (size_t i = 0; i < count; i++) {
             size_t pslice;
             auto vslice = vslice_start + i;
@@ -356,7 +428,42 @@ zx_status_t VPartitionManager::AllocateSlicesLocked(VPartition* vp, size_t vslic
             vp->SliceFreeLocked(vslice);
         }
     }
+
     return status;
+}
+
+zx_status_t VPartitionManager::Upgrade(const uint8_t* old_guid, const uint8_t* new_guid) {
+    fbl::AutoLock lock(&lock_);
+    size_t old_index = 0;
+    size_t new_index = 0;
+
+    if (!memcmp(old_guid, new_guid, GUID_LEN)) {
+        old_guid = nullptr;
+    }
+
+    for (size_t i = 1; i < FVM_MAX_ENTRIES; i++) {
+        auto entry = GetVPartEntryLocked(i);
+        if (entry->slices != 0) {
+            if (old_guid && !(entry->flags & kVPartFlagInactive) &&
+                !memcmp(entry->guid, old_guid, GUID_LEN)) {
+                old_index = i;
+            } else if ((entry->flags & kVPartFlagInactive) &&
+                       !memcmp(entry->guid, new_guid, GUID_LEN)) {
+                new_index = i;
+            }
+        }
+    }
+
+    if (!new_index) {
+        return ZX_ERR_NOT_FOUND;
+    }
+
+    if (old_index) {
+        GetVPartEntryLocked(old_index)->flags |= kVPartFlagInactive;
+    }
+    GetVPartEntryLocked(new_index)->flags &= ~kVPartFlagInactive;
+
+    return WriteFvmLocked();
 }
 
 zx_status_t VPartitionManager::FreeSlices(VPartition* vp, size_t vslice_start,
@@ -377,6 +484,7 @@ zx_status_t VPartitionManager::FreeSlicesLocked(VPartition* vp, size_t vslice_st
         if (vp->IsKilledLocked())
             return ZX_ERR_BAD_STATE;
 
+        //TODO: use block protocol
         // Sync first, before removing slices, so iotxns in-flight cannot
         // operate on 'unowned' slices.
         zx_status_t status;
@@ -388,15 +496,14 @@ zx_status_t VPartitionManager::FreeSlicesLocked(VPartition* vp, size_t vslice_st
         if (vslice_start == 0) {
             // Special case: Freeing entire VPartition
             for (auto extent = vp->ExtentBegin(); extent.IsValid(); extent = vp->ExtentBegin()) {
-                while (!extent->is_empty()) {
-                    auto vslice = extent->end() - 1;
-                    GetSliceEntryLocked(vp->SliceGetLocked(vslice))->vpart = PSLICE_UNALLOCATED;
-                    ZX_ASSERT(vp->SliceFreeLocked(vslice));
+                for (size_t i = extent->start(); i < extent->end(); i++) {
+                    GetSliceEntryLocked(vp->SliceGetLocked(i))->vpart = PSLICE_UNALLOCATED;
                 }
+                vp->ExtentDestroyLocked(extent->start());
             }
 
             // Remove device, VPartition if this was a request to free all slices.
-            device_remove(zxdev());
+            vp->DdkRemove();
             auto entry = GetVPartEntryLocked(vp->GetEntryIndex());
             entry->clear();
             vp->KillLocked();
@@ -462,7 +569,7 @@ zx_status_t VPartitionManager::DdkIoctl(uint32_t op, const void* cmd,
             auto entry = GetVPartEntryLocked(vpart_entry);
             entry->init(request->type, request->guid,
                         static_cast<uint32_t>(request->slice_count),
-                        request->name);
+                        request->name, request->flags & kVPartAllocateMask);
 
             if ((status = AllocateSlicesLocked(vpart.get(), 0,
                                                request->slice_count)) != ZX_OK) {
@@ -484,6 +591,13 @@ zx_status_t VPartitionManager::DdkIoctl(uint32_t op, const void* cmd,
         *out_actual = sizeof(fvm_info_t);
         return ZX_OK;
     }
+    case IOCTL_BLOCK_FVM_UPGRADE: {
+        if (cmdlen < sizeof(upgrade_req_t)) {
+            return ZX_ERR_BUFFER_TOO_SMALL;
+        }
+        const upgrade_req_t* req = static_cast<const upgrade_req_t*>(cmd);
+        return Upgrade(req->old_guid, req->new_guid);
+    }
     default:
         return ZX_ERR_NOT_SUPPORTED;
     }
@@ -492,7 +606,7 @@ zx_status_t VPartitionManager::DdkIoctl(uint32_t op, const void* cmd,
 }
 
 void VPartitionManager::DdkUnbind() {
-    device_remove(zxdev());
+    DdkRemove();
 }
 
 void VPartitionManager::DdkRelease() {
@@ -500,7 +614,7 @@ void VPartitionManager::DdkRelease() {
     delete this;
 }
 
-VPartition::VPartition(VPartitionManager* vpm, size_t entry_index)
+VPartition::VPartition(VPartitionManager* vpm, size_t entry_index, size_t block_op_size)
     : PartitionDeviceType(vpm->zxdev()), mgr_(vpm), entry_index_(entry_index) {
 
     memcpy(&info_, &mgr_->info_, sizeof(block_info_t));
@@ -514,20 +628,13 @@ zx_status_t VPartition::Create(VPartitionManager* vpm, size_t entry_index,
     ZX_DEBUG_ASSERT(entry_index != 0);
 
     fbl::AllocChecker ac;
-    auto vp = fbl::make_unique_checked<VPartition>(&ac, vpm, entry_index);
+    auto vp = fbl::make_unique_checked<VPartition>(&ac, vpm, entry_index, vpm->BlockOpSize());
     if (!ac.check()) {
         return ZX_ERR_NO_MEMORY;
     }
 
     *out = fbl::move(vp);
     return ZX_OK;
-}
-
-static void vpart_block_complete(iotxn_t* txn, void* cookie) {
-    block_callbacks_t* cb;
-    memcpy(&cb, txn->extra, sizeof(void*));
-    cb->complete(cookie, txn->status);
-    iotxn_release(txn);
 }
 
 uint32_t VPartition::SliceGetLocked(size_t vslice) const {
@@ -543,8 +650,8 @@ uint32_t VPartition::SliceGetLocked(size_t vslice) const {
 zx_status_t VPartition::CheckSlices(size_t vslice_start, size_t* count, bool* allocated) {
     fbl::AutoLock lock(&lock_);
 
-    if (vslice_start > mgr_->VSliceMax()) {
-        return ZX_ERR_INVALID_ARGS;
+    if (vslice_start >= mgr_->VSliceMax()) {
+        return ZX_ERR_OUT_OF_RANGE;
     }
 
     if (IsKilledLocked()) {
@@ -638,21 +745,13 @@ bool VPartition::SliceFreeLocked(size_t vslice) {
     return true;
 }
 
-void VPartition::Txn(uint32_t opcode, zx_handle_t vmo, uint64_t length,
-                     uint64_t vmo_offset, uint64_t dev_offset, void* cookie) {
-    zx_status_t status;
-    iotxn_t* txn;
-    if ((status = iotxn_alloc_vmo(&txn, IOTXN_ALLOC_POOL, vmo, vmo_offset,
-                                  length)) != ZX_OK) {
-        callbacks_->complete(cookie, status);
-        return;
-    }
-    txn->opcode = opcode;
-    txn->offset = dev_offset;
-    txn->complete_cb = vpart_block_complete;
-    txn->cookie = cookie;
-    memcpy(txn->extra, &callbacks_, sizeof(void*));
-    iotxn_queue(zxdev(), txn);
+void VPartition::ExtentDestroyLocked(size_t vslice) TA_REQ(lock_) {
+    ZX_DEBUG_ASSERT(vslice < mgr_->VSliceMax());
+    ZX_DEBUG_ASSERT(SliceCanFree(vslice));
+    auto extent = --slice_map_.upper_bound(vslice);
+    size_t length = extent->size();
+    slice_map_.erase(*extent);
+    AddBlocksLocked(-((length * mgr_->SliceSize()) / info_.block_size));
 }
 
 static zx_status_t RequestBoundCheck(const extend_request_t* request,
@@ -792,77 +891,93 @@ zx_status_t VPartition::DdkIoctl(uint32_t op, const void* cmd, size_t cmdlen,
     }
 }
 
-typedef struct multi_iotxn_state {
-    multi_iotxn_state(size_t total, iotxn_t* txn)
+typedef struct multi_txn_state {
+    multi_txn_state(size_t total, block_op_t* txn)
         : txns_completed(0), txns_total(total), status(ZX_OK), original(txn) {}
 
     fbl::Mutex lock;
     size_t txns_completed TA_GUARDED(lock);
     size_t txns_total TA_GUARDED(lock);
     zx_status_t status TA_GUARDED(lock);
-    iotxn_t* original TA_GUARDED(lock);
-} multi_iotxn_state_t;
+    block_op_t* original TA_GUARDED(lock);
+} multi_txn_state_t;
 
-static void multi_iotxn_completion(iotxn_t* txn, void* cookie) {
-    multi_iotxn_state_t* state = static_cast<multi_iotxn_state_t*>(cookie);
-    bool last_iotxn = false;
+static void multi_txn_completion(block_op_t* txn, zx_status_t status) {
+    multi_txn_state_t* state = static_cast<multi_txn_state_t*>(txn->cookie);
+    bool last_txn = false;
     {
         fbl::AutoLock lock(&state->lock);
         state->txns_completed++;
-        if (state->status == ZX_OK && txn->status != ZX_OK) {
-            state->status = txn->status;
+        if (state->status == ZX_OK && status != ZX_OK) {
+            state->status = status;
         }
         if (state->txns_completed == state->txns_total) {
-            last_iotxn = true;
-            iotxn_complete(state->original, state->status, state->original->length);
+            last_txn = true;
+            state->original->completion_cb(state->original, state->status);
         }
     }
 
-    if (last_iotxn) {
+    if (last_txn) {
         delete state;
     }
-    iotxn_release(txn);
+    free(txn);
 }
 
-void VPartition::DdkIotxnQueue(iotxn_t* txn) {
-    if (txn->offset % BlockSize()) {
-        iotxn_complete(txn, ZX_ERR_INVALID_ARGS, 0);
+void VPartition::BlockQueue(block_op_t* txn) {
+    ZX_DEBUG_ASSERT(mgr_->BlockOpSize() > 0);
+    switch (txn->command & BLOCK_OP_MASK) {
+    case BLOCK_OP_READ:
+    case BLOCK_OP_WRITE:
+        break;
+    // Pass-through operations
+    case BLOCK_OP_FLUSH:
+        mgr_->Queue(txn);
+        return;
+    default:
+        fprintf(stderr, "[FVM BlockQueue] Unsupported Command: %x\n", txn->command);
+        txn->completion_cb(txn, ZX_ERR_NOT_SUPPORTED);
         return;
     }
-    // transactions from read()/write() may be truncated
-    txn->length = ROUNDDOWN(txn->length, BlockSize());
-    if (txn->length == 0) {
-        iotxn_complete(txn, ZX_OK, 0);
+
+    const uint64_t device_capacity = DdkGetSize() / BlockSize();
+    if (txn->rw.length == 0) {
+        txn->completion_cb(txn, ZX_ERR_INVALID_ARGS);
+        return;
+    } else if ((txn->rw.offset_dev >= device_capacity) ||
+               (device_capacity - txn->rw.offset_dev < txn->rw.length)) {
+        txn->completion_cb(txn, ZX_ERR_OUT_OF_RANGE);
         return;
     }
 
     const size_t disk_size = mgr_->DiskSize();
     const size_t slice_size = mgr_->SliceSize();
-    size_t vslice_start = txn->offset / slice_size;
-    size_t vslice_end = (txn->offset + txn->length - 1) / slice_size;
+    const uint64_t blocks_per_slice = slice_size / BlockSize();
+    // Start, end both inclusive
+    size_t vslice_start = txn->rw.offset_dev / blocks_per_slice;
+    size_t vslice_end = (txn->rw.offset_dev + txn->rw.length - 1) / blocks_per_slice;
 
     fbl::AutoLock lock(&lock_);
     if (vslice_start == vslice_end) {
-        // Common case: iotxn occurs within one slice
+        // Common case: txn occurs within one slice
         uint32_t pslice = SliceGetLocked(vslice_start);
         if (pslice == FVM_SLICE_FREE) {
-            iotxn_complete(txn, ZX_ERR_OUT_OF_RANGE, 0);
+            txn->completion_cb(txn, ZX_ERR_OUT_OF_RANGE);
             return;
         }
-        txn->offset = SliceStart(disk_size, slice_size, pslice) +
-                      (txn->offset % slice_size);
-        iotxn_queue(GetParent(), txn);
+        txn->rw.offset_dev = SliceStart(disk_size, slice_size, pslice) /
+                BlockSize() + (txn->rw.offset_dev % blocks_per_slice);
+        mgr_->Queue(txn);
         return;
     }
 
-    // Less common case: iotxn spans multiple slices
+    // Less common case: txn spans multiple slices
 
     // First, check that all slices are allocated.
     // If any are missing, then this txn will fail.
     bool contiguous = true;
     for (size_t vslice = vslice_start; vslice <= vslice_end; vslice++) {
         if (SliceGetLocked(vslice) == FVM_SLICE_FREE) {
-            iotxn_complete(txn, ZX_ERR_OUT_OF_RANGE, 0);
+            txn->completion_cb(txn, ZX_ERR_OUT_OF_RANGE);
             return;
         }
         if (vslice != vslice_start && SliceGetLocked(vslice - 1) + 1 != SliceGetLocked(vslice)) {
@@ -873,107 +988,94 @@ void VPartition::DdkIotxnQueue(iotxn_t* txn) {
     // Ideal case: slices are contiguous
     if (contiguous) {
         uint32_t pslice = SliceGetLocked(vslice_start);
-        txn->offset = SliceStart(disk_size, slice_size, pslice) +
-                      (txn->offset % slice_size);
-        iotxn_queue(GetParent(), txn);
+        txn->rw.offset_dev = SliceStart(disk_size, slice_size, pslice) /
+                BlockSize() + (txn->rw.offset_dev % blocks_per_slice);
+        mgr_->Queue(txn);
         return;
     }
 
     // Harder case: Noncontiguous slices
     constexpr size_t kMaxSlices = 32;
-    iotxn_t* txns[kMaxSlices];
+    block_op_t* txns[kMaxSlices];
     const size_t txn_count = vslice_end - vslice_start + 1;
-    if (kMaxSlices < (txn_count)) {
-        iotxn_complete(txn, ZX_ERR_OUT_OF_RANGE, 0);
+    if (kMaxSlices < txn_count) {
+        txn->completion_cb(txn, ZX_ERR_OUT_OF_RANGE);
         return;
     }
 
     fbl::AllocChecker ac;
-    fbl::unique_ptr<multi_iotxn_state_t> state(new (&ac) multi_iotxn_state_t(txn_count, txn));
+    fbl::unique_ptr<multi_txn_state_t> state(new (&ac) multi_txn_state_t(txn_count, txn));
     if (!ac.check()) {
-        iotxn_complete(txn, ZX_ERR_NO_MEMORY, 0);
+        txn->completion_cb(txn, ZX_ERR_NO_MEMORY);
         return;
     }
 
-    size_t length_remaining = txn->length;
+    uint32_t length_remaining = txn->rw.length;
     for (size_t i = 0; i < txn_count; i++) {
         size_t vslice = vslice_start + i;
         uint32_t pslice = SliceGetLocked(vslice);
 
-        uint64_t vmo_offset;
-        zx_off_t length;
+        uint64_t offset_vmo = txn->rw.offset_vmo;
+        uint64_t length;
         if (vslice == vslice_start) {
-            length = fbl::roundup(txn->offset + 1, slice_size) - txn->offset;
-            vmo_offset = 0;
+            length = fbl::round_up(txn->rw.offset_dev + 1, blocks_per_slice) - txn->rw.offset_dev;
         } else if (vslice == vslice_end) {
             length = length_remaining;
-            vmo_offset = txn->length - length_remaining;
+            offset_vmo += txn->rw.length - length_remaining;
         } else {
-            length = slice_size;
-            vmo_offset = txns[0]->length + slice_size * (i - 1);
+            length = blocks_per_slice;
+            offset_vmo += txns[0]->rw.length + blocks_per_slice * (i - 1);
         }
-        ZX_DEBUG_ASSERT(length <= slice_size);
+        ZX_DEBUG_ASSERT(length <= blocks_per_slice);
+        ZX_DEBUG_ASSERT(length <= length_remaining);
 
-        zx_status_t status;
-        txns[i] = nullptr;
-        if ((status = iotxn_clone_partial(txn, vmo_offset, length, &txns[i])) != ZX_OK) {
+        txns[i] = static_cast<block_op_t*>(calloc(1, mgr_->BlockOpSize()));
+        if (txns[i] == nullptr) {
             while (i-- > 0) {
-                iotxn_release(txns[i]);
+                free(txns[i]);
             }
-            iotxn_complete(txn, status, 0);
+            txn->completion_cb(txn, ZX_ERR_NO_MEMORY);
             return;
         }
-        txns[i]->offset = SliceStart(disk_size, slice_size, pslice);
+        memcpy(txns[i], txn, sizeof(*txn));
+        txns[i]->rw.offset_vmo = offset_vmo;
+        txns[i]->rw.length = static_cast<uint32_t>(length);
+        txns[i]->rw.offset_dev = SliceStart(disk_size, slice_size, pslice) / BlockSize();
         if (vslice == vslice_start) {
-            txns[i]->offset += (txn->offset % slice_size);
+            txns[i]->rw.offset_dev += (txn->rw.offset_dev % blocks_per_slice);
         }
-        length_remaining -= txns[i]->length;
-        txns[i]->complete_cb = multi_iotxn_completion;
+        length_remaining -= txns[i]->rw.length;
+        txns[i]->completion_cb = multi_txn_completion;
         txns[i]->cookie = state.get();
     }
     ZX_DEBUG_ASSERT(length_remaining == 0);
 
     for (size_t i = 0; i < txn_count; i++) {
-        iotxn_queue(GetParent(), txns[i]);
+        mgr_->Queue(txns[i]);
     }
-    state.release();
+    // TODO(johngro): ask smklein why it is OK to release this managed pointer.
+    __UNUSED auto ptr = state.release();
 }
 
 zx_off_t VPartition::DdkGetSize() {
-    const zx_off_t size = mgr_->DiskSize() * mgr_->SliceSize();
-    if (size / mgr_->SliceSize() != size) {
-        return fbl::numeric_limits<zx_off_t>::max();
-    }
-    return size;
+    const zx_off_t sz = mgr_->VSliceMax() * mgr_->SliceSize();
+    // Check for overflow; enforced when loading driver
+    ZX_DEBUG_ASSERT(sz / mgr_->VSliceMax() == mgr_->SliceSize());
+    return sz;
 }
 
 void VPartition::DdkUnbind() {
-    device_remove(zxdev());
+    DdkRemove();
 }
 
 void VPartition::DdkRelease() {
     delete this;
 }
 
-// Block Protocol (VPartition)
-
-void VPartition::BlockSetCallbacks(block_callbacks_t* cb) {
-    callbacks_ = cb;
-}
-
-void VPartition::BlockGetInfo(block_info_t* info) {
-    fbl::AutoLock lock(&lock_);
-    *info = info_;
-}
-
-void VPartition::BlockRead(zx_handle_t vmo, uint64_t length,
-                           uint64_t vmo_offset, uint64_t dev_offset, void* cookie) {
-    Txn(IOTXN_OP_READ, vmo, length, vmo_offset, dev_offset, cookie);
-}
-
-void VPartition::BlockWrite(zx_handle_t vmo, uint64_t length, uint64_t vmo_offset,
-                            uint64_t dev_offset, void* cookie) {
-    Txn(IOTXN_OP_WRITE, vmo, length, vmo_offset, dev_offset, cookie);
+void VPartition::BlockQuery(block_info_t* info_out, size_t* block_op_size_out) {
+    static_assert(fbl::is_same<decltype(info_out), decltype(&info_)>::value, "Info type mismatch");
+    memcpy(info_out, &info_, sizeof(info_));
+    *block_op_size_out = mgr_->BlockOpSize();
 }
 
 } // namespace fvm
@@ -990,12 +1092,17 @@ zx_status_t fvm_bind(zx_device_t* parent) {
     if (status != ZX_OK) {
         return status;
     }
+    if ((status = vpm->DdkAdd("fvm", DEVICE_ADD_INVISIBLE)) != ZX_OK) {
+        return status;
+    }
 
     // Read vpartition table asynchronously
     status = thrd_create_with_name(&vpm->init_, fvm_load_thread, vpm.get(), "fvm-init");
     if (status < 0) {
+        vpm->DdkRemove();
         return status;
     }
-    vpm.release();
+    // TODO(johngro): ask smklein why it is OK to release this managed pointer.
+    __UNUSED auto ptr = vpm.release();
     return ZX_OK;
 }

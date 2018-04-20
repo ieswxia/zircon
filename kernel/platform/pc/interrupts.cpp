@@ -6,25 +6,27 @@
 // license that can be found in the LICENSE file or at
 // https://opensource.org/licenses/MIT
 
-#include <sys/types.h>
-#include <debug.h>
-#include <err.h>
-#include <reg.h>
-#include <assert.h>
-#include <kernel/thread.h>
-#include <dev/interrupt.h>
-#include <arch/x86.h>
-#include <arch/x86/interrupts.h>
-#include <arch/x86/apic.h>
-#include <lk/init.h>
-#include <kernel/spinlock.h>
 #include "platform_p.h"
+#include <arch/x86.h>
+#include <arch/x86/apic.h>
+#include <arch/x86/interrupts.h>
+#include <assert.h>
+#include <debug.h>
+#include <dev/interrupt.h>
+#include <err.h>
+#include <fbl/algorithm.h>
+#include <kernel/auto_lock.h>
+#include <kernel/spinlock.h>
+#include <kernel/thread.h>
+#include <lib/pow2_range_allocator.h>
+#include <lk/init.h>
 #include <platform/pc.h>
 #include <platform/pc/acpi.h>
 #include <platform/pic.h>
-#include <lib/pow2_range_allocator.h>
-#include <fbl/algorithm.h>
 #include <pow2.h>
+#include <reg.h>
+#include <sys/types.h>
+#include <zircon/types.h>
 
 #include "platform_p.h"
 
@@ -38,31 +40,27 @@
 #include <trace.h>
 
 struct int_handler_struct {
-    spin_lock_t lock;
+    SpinLock lock;
     int_handler handler;
-    void *arg;
+    void* arg;
 };
 
-static spin_lock_t lock = SPIN_LOCK_INITIAL_VALUE;
-static struct int_handler_struct int_handler_table[X86_MAX_INT];
+static SpinLock lock;
+static struct int_handler_struct int_handler_table[X86_INT_COUNT];
 static p2ra_state_t x86_irq_vector_allocator;
 
-static void platform_init_apic(uint level)
-{
+static void platform_init_apic(uint level) {
     pic_map(PIC1_BASE, PIC2_BASE);
     pic_disable();
 
-    for (size_t i = 0; i < fbl::count_of(int_handler_table); ++i)
-        spin_lock_init(&int_handler_table[i].lock);
-
     // Enumerate the IO APICs
     uint32_t num_io_apics;
-    status_t status = platform_enumerate_io_apics(NULL, 0, &num_io_apics);
+    zx_status_t status = platform_enumerate_io_apics(NULL, 0, &num_io_apics);
     // TODO: If we want to support x86 without IO APICs, we should do something
     // better here.
     ASSERT(status == ZX_OK);
-    io_apic_descriptor *io_apics =
-            static_cast<io_apic_descriptor *>(calloc(num_io_apics, sizeof(*io_apics)));
+    io_apic_descriptor* io_apics =
+        static_cast<io_apic_descriptor*>(calloc(num_io_apics, sizeof(*io_apics)));
     ASSERT(io_apics != NULL);
     uint32_t num_found = 0;
     status = platform_enumerate_io_apics(io_apics, num_io_apics, &num_found);
@@ -73,14 +71,14 @@ static void platform_init_apic(uint level)
     uint32_t num_isos;
     status = platform_enumerate_interrupt_source_overrides(NULL, 0, &num_isos);
     ASSERT(status == ZX_OK);
-    io_apic_isa_override *isos = NULL;
+    io_apic_isa_override* isos = NULL;
     if (num_isos > 0) {
-        isos = static_cast<io_apic_isa_override *>(calloc(num_isos, sizeof(*isos)));
+        isos = static_cast<io_apic_isa_override*>(calloc(num_isos, sizeof(*isos)));
         ASSERT(isos != NULL);
         status = platform_enumerate_interrupt_source_overrides(
-                isos,
-                num_isos,
-                &num_found);
+            isos,
+            num_isos,
+            &num_found);
         ASSERT(status == ZX_OK);
         ASSERT(num_isos == num_found);
     }
@@ -95,7 +93,7 @@ static void platform_init_apic(uint level)
     ASSERT(arch_ints_disabled());
 
     // Initialize the delivery modes/targets for the ISA interrupts
-    uint8_t local_apic_id = apic_local_id();
+    uint8_t bsp_apic_id = apic_bsp_id();
     for (uint8_t irq = 0; irq < 8; ++irq) {
         // Explicitly skip mapping the PIC2 interrupt, since it is actually
         // just used internally on the PICs for daisy chaining.  QEMU remaps
@@ -104,20 +102,20 @@ static void platform_init_apic(uint level)
         // with the PIT IRQ.
         if (irq != ISA_IRQ_PIC2) {
             apic_io_configure_isa_irq(
-                    irq,
-                    DELIVERY_MODE_FIXED,
-                    IO_APIC_IRQ_MASK,
-                    DST_MODE_PHYSICAL,
-                    local_apic_id,
-                    0);
-        }
-        apic_io_configure_isa_irq(
-                static_cast<uint8_t>(irq + 8),
+                irq,
                 DELIVERY_MODE_FIXED,
                 IO_APIC_IRQ_MASK,
                 DST_MODE_PHYSICAL,
-                local_apic_id,
+                bsp_apic_id,
                 0);
+        }
+        apic_io_configure_isa_irq(
+            static_cast<uint8_t>(irq + 8),
+            DELIVERY_MODE_FIXED,
+            IO_APIC_IRQ_MASK,
+            DST_MODE_PHYSICAL,
+            bsp_apic_id,
+            0);
     }
 
     // Initialize the x86 IRQ vector allocator and add the range of vectors to manage.
@@ -131,94 +129,66 @@ static void platform_init_apic(uint level)
 }
 LK_INIT_HOOK(apic, &platform_init_apic, LK_INIT_LEVEL_VM + 2);
 
-status_t mask_interrupt(unsigned int vector)
-{
-    spin_lock_saved_state_t state;
-    spin_lock_irqsave(&lock, state);
-
+zx_status_t mask_interrupt(unsigned int vector) {
+    AutoSpinLock guard(&lock);
     apic_io_mask_irq(vector, IO_APIC_IRQ_MASK);
-
-    spin_unlock_irqrestore(&lock, state);
-
     return ZX_OK;
 }
 
-status_t unmask_interrupt(unsigned int vector)
-{
-    spin_lock_saved_state_t state;
-    spin_lock_irqsave(&lock, state);
-
+zx_status_t unmask_interrupt(unsigned int vector) {
+    AutoSpinLock guard(&lock);
     apic_io_mask_irq(vector, IO_APIC_IRQ_UNMASK);
-
-    spin_unlock_irqrestore(&lock, state);
-
     return ZX_OK;
 }
 
-status_t configure_interrupt(unsigned int vector,
-                             enum interrupt_trigger_mode tm,
-                             enum interrupt_polarity pol)
-{
-    spin_lock_saved_state_t state;
-    spin_lock_irqsave(&lock, state);
-
+zx_status_t configure_interrupt(unsigned int vector,
+                                enum interrupt_trigger_mode tm,
+                                enum interrupt_polarity pol) {
+    AutoSpinLock guard(&lock);
     apic_io_configure_irq(
-            vector,
-            tm,
-            pol,
-            DELIVERY_MODE_FIXED,
-            IO_APIC_IRQ_MASK,
-            DST_MODE_PHYSICAL,
-            0,
-            0);
-
-    spin_unlock_irqrestore(&lock, state);
-
+        vector,
+        tm,
+        pol,
+        DELIVERY_MODE_FIXED,
+        IO_APIC_IRQ_MASK,
+        DST_MODE_PHYSICAL,
+        apic_bsp_id(),
+        0);
     return ZX_OK;
 }
 
-status_t get_interrupt_config(unsigned int vector,
-                              enum interrupt_trigger_mode* tm,
-                              enum interrupt_polarity* pol)
-{
-    status_t ret;
-    spin_lock_saved_state_t state;
-    spin_lock_irqsave(&lock, state);
-
-    ret = apic_io_fetch_irq_config(vector, tm, pol);
-
-    spin_unlock_irqrestore(&lock, state);
-
-    return ret;
+zx_status_t get_interrupt_config(unsigned int vector,
+                                 enum interrupt_trigger_mode* tm,
+                                 enum interrupt_polarity* pol) {
+    AutoSpinLock guard(&lock);
+    return apic_io_fetch_irq_config(vector, tm, pol);
 }
 
-enum handler_return platform_irq(x86_iframe_t *frame)
-{
+void platform_irq(x86_iframe_t* frame) {
     // get the current vector
     uint64_t x86_vector = frame->vector;
     DEBUG_ASSERT(x86_vector >= X86_INT_PLATFORM_BASE &&
                  x86_vector <= X86_INT_PLATFORM_MAX);
 
     // deliver the interrupt
-    enum handler_return ret = INT_NO_RESCHEDULE;
+    struct int_handler_struct* handler = &int_handler_table[x86_vector];
 
-    struct int_handler_struct *handler = &int_handler_table[x86_vector];
-
-    spin_lock(&handler->lock);
-    if (handler->handler)
-        ret = handler->handler(handler->arg);
-    spin_unlock(&handler->lock);
+    {
+        AutoSpinLockNoIrqSave guard(&handler->lock);
+        if (handler->handler)
+            handler->handler(handler->arg);
+    }
 
     apic_issue_eoi();
-    return ret;
 }
 
-void register_int_handler(unsigned int vector, int_handler handler, void *arg)
-{
-    DEBUG_ASSERT(is_valid_interrupt(vector, 0));
+zx_status_t register_int_handler(unsigned int vector, int_handler handler, void* arg) {
+    if (!is_valid_interrupt(vector, 0)) {
+        return ZX_ERR_INVALID_ARGS;
+    }
 
-    spin_lock_saved_state_t state;
-    spin_lock_irqsave(&lock, state);
+    AutoSpinLock guard(&lock);
+    zx_status_t result = ZX_OK;
 
     /* Fetch the x86 vector currently configured for this global irq.  Force
      * it's value to zero if it is currently invalid */
@@ -235,8 +205,7 @@ void register_int_handler(unsigned int vector, int_handler handler, void *arg)
     } else if (!x86_vector && handler) {
         /* If the x86 vector is invalid, and we are registering a handler,
          * attempt to get a new x86 vector from the pool. */
-        uint     range_start;
-        status_t result;
+        uint range_start;
 
         /* Right now, there is not much we can do if the allocation fails.  In
          * debug builds, we ASSERT that everything went well.  In release
@@ -249,7 +218,7 @@ void register_int_handler(unsigned int vector, int_handler handler, void *arg)
             TRACEF("Failed to allocate x86 IRQ vector for global IRQ (%u) when "
                    "registering new handler (%p, %p)\n",
                    vector, handler, arg);
-            goto finished;
+            return result;
         }
 
         DEBUG_ASSERT((range_start >= X86_INT_PLATFORM_BASE) &&
@@ -260,20 +229,25 @@ void register_int_handler(unsigned int vector, int_handler handler, void *arg)
     // Update the handler table and register the x86 vector with the io_apic.
     DEBUG_ASSERT(!!x86_vector == !!handler);
 
-    // No need to irq_save; we already did that when we grabbed the outer lock.
-    spin_lock(&int_handler_table[x86_vector].lock);
-    int_handler_table[x86_vector].handler = handler;
-    int_handler_table[x86_vector].arg = handler ? arg : NULL;
-    spin_unlock(&int_handler_table[x86_vector].lock);
+    {
+        // No need to irq_save; we already did that when we grabbed the outer lock.
+        AutoSpinLockNoIrqSave handler_guard(&int_handler_table[x86_vector].lock);
+
+        if (handler && int_handler_table[x86_vector].handler) {
+            p2ra_free_range(&x86_irq_vector_allocator, x86_vector, 1);
+            return ZX_ERR_ALREADY_BOUND;
+        }
+
+        int_handler_table[x86_vector].handler = handler;
+        int_handler_table[x86_vector].arg = handler ? arg : NULL;
+    }
 
     apic_io_configure_irq_vector(vector, x86_vector);
 
-finished:
-    spin_unlock_irqrestore(&lock, state);
+    return ZX_OK;
 }
 
-bool is_valid_interrupt(unsigned int vector, uint32_t flags)
-{
+bool is_valid_interrupt(unsigned int vector, uint32_t flags) {
     return apic_io_is_valid_irq(vector);
 }
 
@@ -289,10 +263,10 @@ void shutdown_interrupts(void) {
 }
 
 #ifdef WITH_DEV_PCIE
-status_t x86_alloc_msi_block(uint requested_irqs,
-                             bool can_target_64bit,
-                             bool is_msix,
-                             pcie_msi_block_t* out_block) {
+zx_status_t x86_alloc_msi_block(uint requested_irqs,
+                                bool can_target_64bit,
+                                bool is_msix,
+                                pcie_msi_block_t* out_block) {
     if (!out_block)
         return ZX_ERR_INVALID_ARGS;
 
@@ -302,7 +276,7 @@ status_t x86_alloc_msi_block(uint requested_irqs,
     if (!requested_irqs || (requested_irqs > PCIE_MAX_MSI_IRQS))
         return ZX_ERR_INVALID_ARGS;
 
-    status_t res;
+    zx_status_t res;
     uint alloc_start;
     uint alloc_size = 1u << log2_uint_ceil(requested_irqs);
 
@@ -317,10 +291,10 @@ status_t x86_alloc_msi_block(uint requested_irqs,
         // there should either be a system policy (like, always send to any
         // processor, or just processor 0, or something), or the decision of
         // which CPUs to bind to should be left to the caller.
-        uint32_t tgt_addr = 0xFEE00000;                 // base addr
-        tgt_addr |= ((uint32_t)apic_local_id()) << 12;  // Dest ID == our local APIC ID
-        tgt_addr |= 0x08;                               // Redir hint == 1
-        tgt_addr &= ~0x04;                              // Dest Mode == Physical
+        uint32_t tgt_addr = 0xFEE00000;              // base addr
+        tgt_addr |= ((uint32_t)apic_bsp_id()) << 12; // Dest ID == the BSP APIC ID
+        tgt_addr |= 0x08;                            // Redir hint == 1
+        tgt_addr &= ~0x04;                           // Dest Mode == Physical
 
         // Compute the target data.
         // See section 10.11.2 of the Intel 64 and IA-32 Architectures Software
@@ -335,11 +309,11 @@ status_t x86_alloc_msi_block(uint requested_irqs,
 
         /* Success!  Fill out the bookkeeping and we are done */
         out_block->platform_ctx = NULL;
-        out_block->base_irq_id  = alloc_start;
-        out_block->num_irq      = alloc_size;
-        out_block->tgt_addr     = tgt_addr;
-        out_block->tgt_data     = tgt_data;
-        out_block->allocated    = true;
+        out_block->base_irq_id = alloc_start;
+        out_block->num_irq = alloc_size;
+        out_block->tgt_addr = tgt_addr;
+        out_block->tgt_data = tgt_data;
+        out_block->allocated = true;
     }
 
     return res;
@@ -353,9 +327,9 @@ void x86_free_msi_block(pcie_msi_block_t* block) {
 }
 
 void x86_register_msi_handler(const pcie_msi_block_t* block,
-                              uint                    msi_id,
-                              int_handler             handler,
-                              void*                   ctx) {
+                              uint msi_id,
+                              int_handler handler,
+                              void* ctx) {
     DEBUG_ASSERT(block && block->allocated);
     DEBUG_ASSERT(msi_id < block->num_irq);
 
@@ -363,9 +337,8 @@ void x86_register_msi_handler(const pcie_msi_block_t* block,
     DEBUG_ASSERT((x86_vector >= X86_INT_PLATFORM_BASE) &&
                  (x86_vector <= X86_INT_PLATFORM_MAX));
 
-    spin_lock(&int_handler_table[x86_vector].lock);
+    AutoSpinLock guard(&int_handler_table[x86_vector].lock);
     int_handler_table[x86_vector].handler = handler;
-    int_handler_table[x86_vector].arg     = handler ? ctx : NULL;
-    spin_unlock(&int_handler_table[x86_vector].lock);
+    int_handler_table[x86_vector].arg = handler ? ctx : NULL;
 }
-#endif  // WITH_DEV_PCIE
+#endif // WITH_DEV_PCIE

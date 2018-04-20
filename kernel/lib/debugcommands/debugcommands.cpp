@@ -19,6 +19,7 @@
 #include <kernel/thread.h>
 #include <vm/pmm.h>
 #include <arch.h>
+#include <zircon/types.h>
 
 #include <lib/console.h>
 
@@ -29,7 +30,6 @@ static int cmd_fill_mem(int argc, const cmd_args *argv, uint32_t flags);
 static int cmd_reset(int argc, const cmd_args *argv, uint32_t flags);
 static int cmd_memtest(int argc, const cmd_args *argv, uint32_t flags);
 static int cmd_copy_mem(int argc, const cmd_args *argv, uint32_t flags);
-static int cmd_chain(int argc, const cmd_args *argv, uint32_t flags);
 static int cmd_sleep(int argc, const cmd_args *argv, uint32_t flags);
 static int cmd_crash(int argc, const cmd_args *argv, uint32_t flags);
 static int cmd_stackstomp(int argc, const cmd_args *argv, uint32_t flags);
@@ -54,7 +54,6 @@ STATIC_COMMAND("stackstomp", "intentionally overrun the stack", &cmd_stackstomp)
 STATIC_COMMAND("mtest", "simple memory test", &cmd_memtest)
 #endif
 STATIC_COMMAND("cmdline", "display kernel commandline", &cmd_cmdline)
-STATIC_COMMAND("chain", "chain load another binary", &cmd_chain)
 STATIC_COMMAND("sleep", "sleep number of seconds", &cmd_sleep)
 STATIC_COMMAND("sleepm", "sleep number of milliseconds", &cmd_sleep)
 STATIC_COMMAND_END(mem);
@@ -283,25 +282,12 @@ static int cmd_memtest(int argc, const cmd_args *argv, uint32_t flags)
     return 0;
 }
 
-static int cmd_chain(int argc, const cmd_args *argv, uint32_t flags)
-{
-    if (argc < 2) {
-        printf("not enough arguments\n");
-        printf("%s <address>\n", argv[0].str);
-        return -1;
-    }
-
-    arch_chain_load(argv[1].p, 0, 0, 0, 0);
-
-    return 0;
-}
-
 static int cmd_sleep(int argc, const cmd_args *argv, uint32_t flags)
 {
-    lk_time_t t = LK_SEC(1); /* default to 1 second */
+    zx_duration_t t = ZX_SEC(1); /* default to 1 second */
 
     if (argc >= 2) {
-        t = LK_MSEC(argv[1].u);
+        t = ZX_MSEC(argv[1].u);
         if (!strcmp(argv[0].str, "sleep"))
             t *= 1000;
     }
@@ -327,7 +313,7 @@ static int cmd_crash(int argc, const cmd_args *argv, uint32_t flags)
             thread_t *t = thread_create("crasher", &crash_thread, NULL, DEFAULT_PRIORITY, DEFAULT_STACK_SIZE);
             thread_resume(t);
 
-            thread_join(t, NULL, INFINITE_TIME);
+            thread_join(t, NULL, ZX_TIME_INFINITE);
             return 0;
         }
     }
@@ -340,14 +326,18 @@ static int cmd_crash(int argc, const cmd_args *argv, uint32_t flags)
     return 0;
 }
 
+__attribute__((noinline)) static void stomp_stack(size_t size) {
+    // -Wvla prevents VLAs but not explicit alloca.
+    // Neither is allowed anywhere in the kernel outside this test code.
+    void* death = __builtin_alloca(size); // OK in test-only code.
+    memset(death, 0xaa, size);
+    thread_sleep_relative(ZX_USEC(1));
+}
+
 static int cmd_stackstomp(int argc, const cmd_args *argv, uint32_t flags)
 {
-    for (size_t i = 0; i < DEFAULT_STACK_SIZE * 2; i++) {
-        uint8_t death[i];
-
-        memset(death, 0xaa, i);
-        thread_sleep_relative(LK_USEC(1));
-    }
+    for (size_t i = 0; i < DEFAULT_STACK_SIZE * 2; i++)
+        stomp_stack(i);
 
     printf("survived.\n");
 
@@ -384,4 +374,3 @@ static int cmd_cmdline(int argc, const cmd_args *argv, uint32_t flags)
 
     return 0;
 }
-

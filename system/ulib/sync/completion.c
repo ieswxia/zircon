@@ -14,17 +14,21 @@ enum {
 };
 
 zx_status_t completion_wait(completion_t* completion, zx_time_t timeout) {
+    zx_time_t deadline = (timeout == ZX_TIME_INFINITE) ? timeout : zx_deadline_after(timeout);
+    return completion_wait_deadline(completion, deadline);
+}
+
+zx_status_t completion_wait_deadline(completion_t* completion, zx_time_t deadline) {
     // TODO(kulakowski): With a little more state (a waiters count),
     // this could optimistically spin before entering the kernel.
 
-    atomic_int* futex = &completion->futex;
+    atomic_int* futex = &completion->futex.futex;
 
     for (;;) {
         int current_value = atomic_load(futex);
         if (current_value == SIGNALED) {
             return ZX_OK;
         }
-        zx_time_t deadline = (timeout == ZX_TIME_INFINITE) ? timeout : zx_deadline_after(timeout);
         switch (zx_futex_wait(futex, current_value, deadline)) {
         case ZX_OK:
             continue;
@@ -43,11 +47,11 @@ zx_status_t completion_wait(completion_t* completion, zx_time_t timeout) {
 }
 
 void completion_signal(completion_t* completion) {
-    atomic_int* futex = &completion->futex;
+    atomic_int* futex = &completion->futex.futex;
     atomic_store(futex, SIGNALED);
     zx_futex_wake(futex, UINT32_MAX);
 }
 
 void completion_reset(completion_t* completion) {
-    atomic_store(&completion->futex, UNSIGNALED);
+    atomic_store(&completion->futex.futex, UNSIGNALED);
 }

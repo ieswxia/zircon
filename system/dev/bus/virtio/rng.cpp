@@ -5,13 +5,14 @@
 #include "rng.h"
 
 #include <ddk/debug.h>
-#include <inttypes.h>
 #include <fbl/auto_lock.h>
+#include <inttypes.h>
+#include <limits.h>
 
 namespace virtio {
 
-RngDevice::RngDevice(zx_device_t* bus_device)
-    : Device(bus_device) {
+RngDevice::RngDevice(zx_device_t* bus_device, zx::bti bti, fbl::unique_ptr<Backend> backend)
+    : Device(bus_device, fbl::move(bti), fbl::move(backend)) {
 }
 
 RngDevice::~RngDevice() {
@@ -20,33 +21,35 @@ RngDevice::~RngDevice() {
 
 zx_status_t RngDevice::Init() {
     // reset the device
-    Reset();
+    DeviceReset();
 
     // ack and set the driver status bit
-    StatusAcknowledgeDriver();
+    DriverStatusAck();
 
     // allocate the main vring
     auto err = vring_.Init(kRingIndex, kRingSize);
     if (err < 0) {
-        dprintf(ERROR, "virtio-rng: failed to allocate vring\n");
+        zxlogf(ERROR, "%s: failed to allocate vring\n", tag());
         return err;
     }
 
     // allocate the entropy buffer
-    zx_status_t rc = io_buffer_init(&buf_, kBufferSize, IO_BUFFER_RO | IO_BUFFER_CONTIG);
+    static_assert(kBufferSize <= PAGE_SIZE, "");
+    zx_status_t rc = io_buffer_init(&buf_, bti_.get(), kBufferSize,
+                                    IO_BUFFER_RO | IO_BUFFER_CONTIG);
     if (rc != ZX_OK) {
-        dprintf(ERROR, "virtio-rng: cannot allocate entropy buffer: %d\n", rc);
+        zxlogf(ERROR, "%s: cannot allocate entropy buffer: %d\n", tag(), rc);
         return rc;
     }
 
-    dprintf(SPEW, "virtio-rng: allocated entropy buffer at %p, physical address %#" PRIxPTR "\n",
-            io_buffer_virt(&buf_), io_buffer_phys(&buf_));
+    zxlogf(SPEW, "%s: allocated entropy buffer at %p, physical address %#" PRIxPTR "\n",
+           tag(), io_buffer_virt(&buf_), io_buffer_phys(&buf_));
 
     // start the interrupt thread
     StartIrqThread();
 
     // set DRIVER_OK
-    StatusDriverOK();
+    DriverStatusOk();
 
     device_add_args_t args = {};
     args.version = DEVICE_ADD_ARGS_VERSION;
@@ -55,8 +58,8 @@ zx_status_t RngDevice::Init() {
     args.ops = &device_ops_;
 
     auto status = device_add(bus_device_, &args, &device_);
-    if (status < 0) {
-        dprintf(ERROR, "virtio-rng: device_add failed %d\n", status);
+    if (status != ZX_OK) {
+        zxlogf(ERROR, "%s: device_add failed %d\n", tag(), status);
         device_ = nullptr;
         return status;
     }
@@ -68,13 +71,13 @@ zx_status_t RngDevice::Init() {
                           "virtio-rng-seed-thread");
     thrd_detach(seed_thread_);
 
-    dprintf(INFO, "virtio-rng: initialization succeeded\n");
+    zxlogf(INFO, "%s: initialization succeeded\n", tag());
 
     return ZX_OK;
 }
 
 void RngDevice::IrqRingUpdate() {
-    dprintf(TRACE, "virtio-rng: Got irq ring update\n");
+    zxlogf(TRACE, "%s: Got irq ring update\n", tag());
 
     // parse our descriptor chain, add back to the free queue
     auto free_chain = [this](vring_used_elem* used_elem) {
@@ -82,12 +85,12 @@ void RngDevice::IrqRingUpdate() {
         struct vring_desc* desc = vring_.DescFromIndex((uint16_t)i);
 
         if (desc->addr != io_buffer_phys(&buf_) || desc->len != kBufferSize) {
-            dprintf(ERROR, "virtio-rng: entropy response with unexpected buffer\n");
+            zxlogf(ERROR, "%s: entropy response with unexpected buffer\n", tag());
         } else {
-            dprintf(SPEW, "virtio-rng: received entropy; adding to kernel pool\n");
+            zxlogf(SPEW, "%s: received entropy; adding to kernel pool\n", tag());
             zx_status_t rc = zx_cprng_add_entropy(io_buffer_virt(&buf_), kBufferSize);
             if (rc != ZX_OK) {
-                dprintf(ERROR, "virtio-rng: add_entropy failed (%d)\n", rc);
+                zxlogf(ERROR, "%s: add_entropy failed (%d)\n", tag(), rc);
             }
         }
 
@@ -99,32 +102,32 @@ void RngDevice::IrqRingUpdate() {
 }
 
 void RngDevice::IrqConfigChange() {
-    dprintf(TRACE, "virtio-rng: Got irq config change (ignoring)\n");
+    zxlogf(TRACE, "%s: Got irq config change (ignoring)\n", tag());
 }
 
 int RngDevice::SeedThreadEntry(void* arg) {
     RngDevice* d = static_cast<RngDevice*>(arg);
-    for(;;) {
+    for (;;) {
         zx_status_t rc = d->Request();
-        dprintf(SPEW, "virtio-rng-seed-thread: RngDevice::Request() returned %d\n", rc);
+        zxlogf(SPEW, "virtio-rng-seed-thread: RngDevice::Request() returned %d\n", rc);
         zx_nanosleep(zx_deadline_after(ZX_SEC(300)));
     }
 }
 
 zx_status_t RngDevice::Request() {
-    dprintf(TRACE, "virtio-rng: sending entropy request\n");
+    zxlogf(TRACE, "%s: sending entropy request\n", tag());
     fbl::AutoLock lock(&lock_);
     uint16_t i;
     vring_desc* desc = vring_.AllocDescChain(1, &i);
     if (!desc) {
-        dprintf(ERROR, "virtio-rng: failed to allocate descriptor chain of length 1\n");
+        zxlogf(ERROR, "%s: failed to allocate descriptor chain of length 1\n", tag());
         return ZX_ERR_NO_RESOURCES;
     }
 
     desc->addr = io_buffer_phys(&buf_);
     desc->len = kBufferSize;
     desc->flags = VRING_DESC_F_WRITE;
-    dprintf(SPEW, "virtio-rng: allocated descriptor chain desc %p, i %u\n", desc, i);
+    zxlogf(SPEW, "%s: allocated descriptor chain desc %p, i %u\n", tag(), desc, i);
     if (driver_get_log_flags() & DDK_LOG_SPEW) {
         virtio_dump_desc(desc);
     }
@@ -132,7 +135,7 @@ zx_status_t RngDevice::Request() {
     vring_.SubmitChain(i);
     vring_.Kick();
 
-    dprintf(SPEW, "virtio-rng: kicked off entropy request\n");
+    zxlogf(SPEW, "%s: kicked off entropy request\n", tag());
 
     return ZX_OK;
 }

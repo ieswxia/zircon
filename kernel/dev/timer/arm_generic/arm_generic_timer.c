@@ -15,12 +15,10 @@
 #include <dev/timer/arm_generic.h>
 #include <platform/timer.h>
 #include <trace.h>
+#include <zircon/types.h>
 
-#if WITH_DEV_PDEV
 #include <pdev/driver.h>
-#include <mdi/mdi.h>
-#include <mdi/mdi-defs.h>
-#endif
+#include <zircon/boot/driver-config.h>
 
 #define LOCAL_TRACE 0
 
@@ -51,12 +49,12 @@ static int timer_irq;
 struct fp_32_64 cntpct_per_ns;
 struct fp_32_64 ns_per_cntpct;
 
-static uint64_t lk_time_to_cntpct(lk_time_t lk_time)
+static uint64_t zx_time_to_cntpct(zx_time_t zx_time)
 {
-    return u64_mul_u64_fp32_64(lk_time, cntpct_per_ns);
+    return u64_mul_u64_fp32_64(zx_time, cntpct_per_ns);
 }
 
-static lk_time_t cntpct_to_lk_bigtime(uint64_t cntpct)
+zx_time_t cntpct_to_zx_time(uint64_t cntpct)
 {
     return u64_mul_u64_fp32_64(cntpct, ns_per_cntpct);
 }
@@ -206,19 +204,19 @@ static uint64_t read_ct(void)
     return cntpct;
 }
 
-static enum handler_return platform_tick(void *arg)
+static void platform_tick(void *arg)
 {
     write_ctl(0);
-    return timer_tick(current_time());
+    timer_tick(current_time());
 }
 
-status_t platform_set_oneshot_timer(lk_time_t deadline)
+zx_status_t platform_set_oneshot_timer(zx_time_t deadline)
 {
     DEBUG_ASSERT(arch_ints_disabled());
 
     // Add one to the deadline, since with very high probability the deadline
     // straddles a counter tick.
-    const uint64_t cntpct_deadline = lk_time_to_cntpct(deadline) + 1;
+    const uint64_t cntpct_deadline = zx_time_to_cntpct(deadline) + 1;
 
     // Even if the deadline has already passed, the ARMv8-A timer will fire the
     // interrupt.
@@ -233,12 +231,17 @@ void platform_stop_timer(void)
     write_ctl(0);
 }
 
-lk_time_t current_time(void)
+zx_time_t current_time(void)
 {
-    return cntpct_to_lk_bigtime(read_ct());
+    return cntpct_to_zx_time(read_ct());
 }
 
-uint64_t ticks_per_second(void)
+zx_ticks_t current_ticks(void)
+{
+    return read_ct();
+}
+
+zx_ticks_t ticks_per_second(void)
 {
     return u64_mul_u32_fp32_64(1000 * 1000 * 1000, cntpct_per_ns);
 }
@@ -265,56 +268,56 @@ static void test_time_conversion_check_result(uint64_t a, uint64_t b, uint64_t l
     }
 }
 
-static void test_lk_time_to_cntpct(uint32_t cntfrq, lk_time_t lk_time)
+static void test_zx_time_to_cntpct(uint32_t cntfrq, zx_time_t zx_time)
 {
-    uint64_t cntpct = lk_time_to_cntpct(lk_time);
-    const uint64_t nanos_per_sec = LK_SEC(1);
-    uint64_t expected_cntpct = ((uint64_t)cntfrq * lk_time + nanos_per_sec / 2) / nanos_per_sec;
+    uint64_t cntpct = zx_time_to_cntpct(zx_time);
+    const uint64_t nanos_per_sec = ZX_SEC(1);
+    uint64_t expected_cntpct = ((uint64_t)cntfrq * zx_time + nanos_per_sec / 2) / nanos_per_sec;
 
     test_time_conversion_check_result(cntpct, expected_cntpct, 1, false);
-    LTRACEF_LEVEL(2, "lk_time_to_cntpct(%" PRIu64 "): got %" PRIu64
+    LTRACEF_LEVEL(2, "zx_time_to_cntpct(%" PRIu64 "): got %" PRIu64
                   ", expect %" PRIu64 "\n",
-                  lk_time, cntpct, expected_cntpct);
+                  zx_time, cntpct, expected_cntpct);
 }
 
-static void test_cntpct_to_lk_bigtime(uint32_t cntfrq, uint64_t expected_s)
+static void test_cntpct_to_zx_time(uint32_t cntfrq, uint64_t expected_s)
 {
-    lk_time_t expected_lk_bigtime = LK_SEC(expected_s);
+    zx_time_t expected_zx_time = ZX_SEC(expected_s);
     uint64_t cntpct = (uint64_t)cntfrq * expected_s;
-    lk_time_t lk_bigtime = cntpct_to_lk_bigtime(cntpct);
+    zx_time_t zx_time = cntpct_to_zx_time(cntpct);
 
-    test_time_conversion_check_result(lk_bigtime, expected_lk_bigtime, (1000 * 1000 + cntfrq - 1) / cntfrq, false);
-    LTRACEF_LEVEL(2, "cntpct_to_lk_bigtime(%" PRIu64
+    test_time_conversion_check_result(zx_time, expected_zx_time, (1000 * 1000 + cntfrq - 1) / cntfrq, false);
+    LTRACEF_LEVEL(2, "cntpct_to_zx_time(%" PRIu64
                   "): got %" PRIu64 ", expect %" PRIu64 "\n",
-                  cntpct, lk_bigtime, expected_lk_bigtime);
+                  cntpct, zx_time, expected_zx_time);
 }
 
 static void test_time_conversions(uint32_t cntfrq)
 {
-    test_lk_time_to_cntpct(cntfrq, 0);
-    test_lk_time_to_cntpct(cntfrq, 1);
-    test_lk_time_to_cntpct(cntfrq, 60 * 60 * 24);
-    test_lk_time_to_cntpct(cntfrq, 60 * 60 * 24 * 365);
-    test_lk_time_to_cntpct(cntfrq, 60 * 60 * 24 * (365 * 10 + 2));
-    test_lk_time_to_cntpct(cntfrq, 60ULL * 60 * 24 * (365 * 100 + 2));
-    test_lk_time_to_cntpct(cntfrq, 1ULL<<60);
-    test_cntpct_to_lk_bigtime(cntfrq, 0);
-    test_cntpct_to_lk_bigtime(cntfrq, 1);
-    test_cntpct_to_lk_bigtime(cntfrq, 60 * 60 * 24);
-    test_cntpct_to_lk_bigtime(cntfrq, 60 * 60 * 24 * 365);
-    test_cntpct_to_lk_bigtime(cntfrq, 60 * 60 * 24 * (365 * 10 + 2));
-    test_cntpct_to_lk_bigtime(cntfrq, 60ULL * 60 * 24 * (365 * 100 + 2));
+    test_zx_time_to_cntpct(cntfrq, 0);
+    test_zx_time_to_cntpct(cntfrq, 1);
+    test_zx_time_to_cntpct(cntfrq, 60 * 60 * 24);
+    test_zx_time_to_cntpct(cntfrq, 60 * 60 * 24 * 365);
+    test_zx_time_to_cntpct(cntfrq, 60 * 60 * 24 * (365 * 10 + 2));
+    test_zx_time_to_cntpct(cntfrq, 60ULL * 60 * 24 * (365 * 100 + 2));
+    test_zx_time_to_cntpct(cntfrq, 1ULL<<60);
+    test_cntpct_to_zx_time(cntfrq, 0);
+    test_cntpct_to_zx_time(cntfrq, 1);
+    test_cntpct_to_zx_time(cntfrq, 60 * 60 * 24);
+    test_cntpct_to_zx_time(cntfrq, 60 * 60 * 24 * 365);
+    test_cntpct_to_zx_time(cntfrq, 60 * 60 * 24 * (365 * 10 + 2));
+    test_cntpct_to_zx_time(cntfrq, 60ULL * 60 * 24 * (365 * 100 + 2));
 }
 
 static void arm_generic_timer_init_conversion_factors(uint32_t cntfrq)
 {
-    fp_32_64_div_32_32(&cntpct_per_ns, cntfrq, LK_SEC(1));
-    fp_32_64_div_32_32(&ns_per_cntpct, LK_SEC(1), cntfrq);
+    fp_32_64_div_32_32(&cntpct_per_ns, cntfrq, ZX_SEC(1));
+    fp_32_64_div_32_32(&ns_per_cntpct, ZX_SEC(1), cntfrq);
     dprintf(SPEW, "cntpct_per_ns: %08x.%08x%08x\n", cntpct_per_ns.l0, cntpct_per_ns.l32, cntpct_per_ns.l64);
     dprintf(SPEW, "ns_per_cntpct: %08x.%08x%08x\n", ns_per_cntpct.l0, ns_per_cntpct.l32, ns_per_cntpct.l64);
 }
 
-void arm_generic_timer_init(int irq, uint32_t freq_override)
+static void arm_generic_timer_init(uint32_t freq_override)
 {
     uint32_t cntfrq;
 
@@ -343,11 +346,10 @@ void arm_generic_timer_init(int irq, uint32_t freq_override)
     arm_generic_timer_init_conversion_factors(cntfrq);
     test_time_conversions(cntfrq);
 
-    LTRACEF("register irq %d on cpu %u\n", irq, arch_curr_cpu_num());
-    register_int_handler(irq, &platform_tick, NULL);
-    unmask_interrupt(irq);
-
-    timer_irq = irq;
+    LTRACEF("register irq %d on cpu %u\n", timer_irq, arch_curr_cpu_num());
+    zx_status_t status = register_int_handler(timer_irq, &platform_tick, NULL);
+    DEBUG_ASSERT(status == ZX_OK);
+    unmask_interrupt(timer_irq);
 }
 
 static void arm_generic_timer_init_secondary_cpu(uint level)
@@ -371,49 +373,32 @@ static void arm_generic_timer_resume_cpu(uint level)
 LK_INIT_HOOK_FLAGS(arm_generic_timer_resume_cpu, arm_generic_timer_resume_cpu,
                    LK_INIT_LEVEL_PLATFORM, LK_INIT_FLAG_CPU_RESUME);
 
-#if WITH_DEV_PDEV
-static void arm_generic_timer_pdev_init(mdi_node_ref_t* node, uint level) {
-    uint32_t irq;
-    bool got_irq_phys = false;
-    bool got_irq_virt = false;
-    bool got_irq_sphys = false;
-    uint32_t freq_override = 0;
+static void arm_generic_timer_pdev_init(const void* driver_data, uint32_t length) {
+    ASSERT(length >= sizeof(dcfg_arm_generic_timer_driver_t));
+    const dcfg_arm_generic_timer_driver_t* driver = driver_data;
+    uint32_t irq_phys = driver->irq_phys;
+    uint32_t irq_virt = driver->irq_virt;
+    uint32_t irq_sphys = driver->irq_sphys;
 
-    mdi_node_ref_t child;
-    mdi_each_child(node, &child) {
-        switch (mdi_id(&child)) {
-        case MDI_ARM_TIMER_IRQ_PHYS:
-            got_irq_phys = !mdi_node_uint32(&child, &irq);
-            break;
-        case MDI_ARM_TIMER_IRQ_VIRT:
-            got_irq_virt = !mdi_node_uint32(&child, &irq);
-            break;
-        case MDI_ARM_TIMER_IRQ_SPHYS:
-            got_irq_sphys = !mdi_node_uint32(&child, &irq);
-            break;
-        case MDI_ARM_TIMER_FREQ_OVERRIDE:
-            // freq_override is optional
-            mdi_node_uint32(&child, &freq_override);
-            break;
-        }
+    if (irq_phys && irq_virt && arm64_get_boot_el() < 2) {
+        // If we did not boot at EL2 or above, prefer the virtual timer.
+        irq_phys = 0;
     }
-
-    if (got_irq_phys && got_irq_virt) {
-        panic("both irq-phys and irq-virt set in arm_generic_timer_pdev_init\n");
-    }
-    if (got_irq_phys) {
+    if (irq_phys) {
+        timer_irq = irq_phys;
         reg_procs = &cntp_procs;
-    } else if (got_irq_virt) {
+    } else if (irq_virt) {
+        timer_irq = irq_virt;
         reg_procs = &cntv_procs;
-    } else if (got_irq_sphys) {
+    } else if (irq_sphys) {
+        timer_irq = irq_sphys;
         reg_procs = &cntps_procs;
     } else {
-        panic("neither irq-phys nor irq-virt set in arm_generic_timer_pdev_init\n");
+        panic("no irqs set in arm_generic_timer_pdev_init\n");
     }
     smp_mb();
 
-    arm_generic_timer_init(irq, freq_override);
+    arm_generic_timer_init(driver->freq_override);
 }
 
-LK_PDEV_INIT(arm_generic_timer_pdev_init, MDI_ARM_TIMER, arm_generic_timer_pdev_init, LK_INIT_LEVEL_PLATFORM_EARLY);
-#endif // WITH_DEV_PDEV
+LK_PDEV_INIT(arm_generic_timer_pdev_init, KDRV_ARM_GENERIC_TIMER, arm_generic_timer_pdev_init, LK_INIT_LEVEL_PLATFORM_EARLY);

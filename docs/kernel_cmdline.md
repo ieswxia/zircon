@@ -32,12 +32,12 @@ option off unless you suspect the crashlogger is causing problems.
 
 If this option is set, the crashlogger will attempt to generate a
 "processor trace" dump along with the crash report. The dump files
-are written as /tmp/crash-pt.*. This option requires processor tracing
+are written as /tmp/crash-pt.\*. This option requires processor tracing
 to be enabled in the kernel. This can be done by running "ipt" program after
-the system has booted. E.g., add this to /system/autorun
+the system has booted. E.g., set zircon.autorun.system like this
 
 ```
-ipt --circular --control init start
+zircon.autorun.system=ipt+--circular+--control+init+start
 ```
 
 After the files are written, copy them to the host and print them
@@ -45,27 +45,44 @@ with the "ipt-dump" program. See its docs for more info.
 
 This option is only supported on Intel x86 platforms.
 
+## devmgr\.epoch=\<seconds\>
+
+Sets the initial offset (from the Unix epoch, in seconds) for the UTC clock.
+This is useful for platforms lacking an RTC, where the UTC offset would
+otherwise remain at 0.
+
+## devmgr\.require-system=\<bool\>
+
+Instructs the devmgr that a /system volume is required.  Without this,
+devmgr assumes this is a standalone Zircon build and not a full Fuchsia
+system.
+
 ## driver.\<name>.disable
 
 Disables the driver with the given name. The driver name comes from the
-zircon\_driver\_info, and can be found as the second argument to the
+zircon\_driver\_info, and can be found as the first argument to the
 ZIRCON\_DRIVER\_BEGIN macro.
 
-Example: `driver.usb-audio.disable`
+Example: `driver.usb_audio.disable`
 
 ## driver.\<name>.log=\<flags>
 
 Set the log flags for a driver.  Flags are one or more comma-separated
-values which must be preceeded by a "+" (in which case that flag is enabled)
+values which must be preceded by a "+" (in which case that flag is enabled)
 or a "-" (in which case that flag is disabled).  The textual constants
-"error", "info", "trace", "spew", "debug1", "debug2", "debug3", and "debug4"
+"error", "warn", "info", "trace", "spew", "debug1", "debug2", "debug3", and "debug4"
 may be used, and they map to the corresponding bits in DDK_LOG_... in `ddk/debug.h`
-The default log flags for a driver is "error" and "info".
+The default log flags for a driver is "error", "warn", and "info".
 
 Individual drivers may define their own log flags beyond the eight mentioned
 above.
 
-Example: `driver.usb-audio.log=-error,+info,+0x1000`
+Example: `driver.usb_audio.log=-error,+info,+0x1000`
+
+Note again that the name of the driver is the "Driver" argument to the
+ZIRCON\_DRIVER\_BEGIN macro. It is not, for example, the name of the device,
+which for some drivers is almost identical, except that the device may be
+named "foo-bar" whereas the driver name must use underscores, e.g., "foo_bar".
 
 ## gfxconsole.early=\<bool>
 
@@ -92,12 +109,13 @@ When running an entropy collector quality test, collect the provided number of
 bytes. Defaults to the maximum value `ENTROPY_COLLECTOR_TEST_MAXLEN`.
 
 The default value for the compile-time constant `ENTROPY_COLLECTOR_TEST_MAXLEN`
-is 128 KiB.
+is 1MiB.
 
 ## kernel.entropy-test.src=\<source>
 
 When running an entropy collector quality test, use the provided entropy source.
-Currently recognized sources: `hw_rng`, `jitterentropy`.
+Currently recognized sources: `hw_rng`, `jitterentropy`. This option is ignored
+unless the kernel was built with `ENABLE_ENTROPY_COLLECTOR_TEST=1`.
 
 ## kernel.halt-on-panic=\<bool>
 If this option is set (disabled by default), the system will halt on
@@ -121,16 +139,18 @@ accessed.
 Sets the "memory loops" parameter for jitterentropy (the default is 32). When
 jitterentropy is performing memory operations (to increase variation in CPU
 timing), this controls how many times the memory access routine is repeated.
-This parameter is only used when `kernel.jitterentropy.raw` is true (otherwise,
-jitterentropy chooses the number of loops is a random-ish way).
+This parameter is only used when `kernel.jitterentropy.raw` is true. If the
+value of this parameter is `0` or if `kernel.jitterentropy.raw` is `false`,
+then jitterentropy chooses the number of loops is a random-ish way.
 
 ## kernel.jitterentropy.ll=\<num>
 
 Sets the "LFSR loops" parameter for jitterentropy (the default is 1). When
 jitterentropy is performing CPU-intensive LFSR operations (to increase variation
 in CPU timing), this controls how many times the LFSR routine is repeated.  This
-parameter is only used when `kernel.jitterentropy.raw` is true (otherwise,
-jitterentropy chooses the number of loops is a random-ish way).
+parameter is only used when `kernel.jitterentropy.raw` is true. If the value of
+this parameter is `0` or if `kernel.jitterentropy.raw` is `false`, then
+jitterentropy chooses the number of loops is a random-ish way.
 
 ## kernel.jitterentropy.raw=\<bool>
 
@@ -174,6 +194,36 @@ kernel thread should sleep between checks.
 The `k oom info` command will show the current value of this and other
 parameters.
 
+## kernel.mexec-pci-shutdown=\<bool>
+
+If false, this option leaves PCI devices running when calling mexec. Defaults
+to true.
+
+## kernel.serial=\<string\>
+
+This controls what serial port is used.  If provided, it overrides the serial
+port described by the system's bootdata.
+
+If set to "none", the kernel debug serial port will be disabled.
+
+### x64 specific values
+
+On x64, some additional values are supported for configuring 8250-like UARTs:
+- If set to "legacy", the legacy COM1 interface is used.
+- A port-io UART can be specified using "ioport,\<portno>,\<irq>".
+- An MMIO UART can be specified using "mmio,\<physaddr>,\<irq>".
+
+For example, "ioport,0x3f8,4" would describe the legacy COM1 interface.
+
+All numbers may be in any base accepted by *strtoul*().
+
+All other values are currently undefined.
+
+## kernel.shell=\<bool>
+
+This option tells the kernel to start its own shell on the kernel console
+instead of a userspace sh.
+
 ## kernel.smp.maxcpus=\<num>
 
 This option caps the number of CPUs to initialize.  It cannot be greater than
@@ -206,21 +256,85 @@ This option (disabled by default) turns on dynamic linker trace output.
 The output is in a form that is consumable by clients like Intel
 Processor Trace support.
 
-## zircon.autorun.boot=\<path>\
+## thread.set.priority.disable=\<bool>
 
-This option requests that the executable at *path* be launched at boot,
-after devmgr starts up.
+This option (false by default) prevents the syscall that increases
+a thread priority (`zx_thread_set_priority`) from taking effect.
 
-## zircon.autorun.system=\<path>\
+## zircon.autorun.boot=\<command>
 
-This option requests that the executable at *path* be launched once the
-system partition is mounted and *init* is launched.  If there is no system
-bootfs or system partition, it will never be launched.
+This option requests that *command* be run at boot, after devmgr starts up.
+
+Any `+` characters in *command* are treated as argument separators, allowing
+you to pass arguments to an executable.
+
+### Sidebar: Injecting a personal autorun script <a name="autorun"></a>
+
+It's often useful to inject a personal autorun script into the boot filesystem,
+especially for running tests or setup tasks. You can do this with the zircon
+build system's `EXTRA_USER_MANIFEST_LINES` make variable.
+
+1.  Create a local shell script with the commands you want to run; for this
+    example, call it `${HOME}/my_local_script.sh`. \
+    **NOTE**: The first line must be a `#!` line, typically `#!/boot/bin/sh`.
+2.  Add your script to the boot filesystem by invoking `make` (or one of the
+    `//zircon/scripts/build-*` scripts) with \
+    `EXTRA_USER_MANIFEST_LINES="my_installed_script=${HOME}/my_local_script.sh"`
+    \
+    This will copy your local script into the boot filesystem at the path
+    `/boot/my_installed_script`. (You can change the `my_installed_script` part
+    to change the basename of the installed script, though it will always appear
+    under `/boot`.)
+3.  Tell `devmgr` to invoke your script by passing a commandline like
+    `zircon.autorun.boot=/boot/my_installed_script`
+
+## zircon.autorun.system=\<command>
+
+This option requests that *command* be run once the system partition is mounted
+and *init* is launched.  If there is no system bootfs or system partition, it
+will never be launched.
+
+Any `+` characters in *command* are treated as argument separators, allowing
+you to pass arguments to an executable.
+
+## zircon.system.blob-init=\<command>
+
+This option requests that *command* be run once the blob partition is
+mounted. The given command is expected to mount /system, and then signal its
+process handle with `ZX_SIGNAL_USER0`.
+
+*command* may not assume that any other filesystem has been mounted. If
+`zircon.system.blob-init-arg` is set, it will be provided as the first
+argument.
+
+A ramdisk containing `/system` takes precedence over
+`zircon.system.blob-init` and *command* will not be run if a system
+ramdisk is present. blob init will take precedence over a minfs
+partition with the system GUID, and the minfs partition will not be mounted
+if `zircon.system.blob-init` is set.
+
+## zircon.system.disable-automount=<\bool>
+
+This option prevents the fshost from auto-mounting any disk filesystems
+(/system, /data, etc), which can be useful for certain low level test setups.
+It is false by default.  It is implied by **netsvc.netboot=true**
 
 ## zircon.system.writable=\<bool>
 
 This option requests that if a minfs partition with the system type GUID is
 found, it is to be mounted read-write rather than read-only.
+
+## zircon.system.volume=\<arg>
+
+This option specifies where to find the "/system" volume.
+
+It may be set to:
+"any", in which case the first volume of the appropriate type will be used.
+"local" in which the first volume that's non-removable of the appropriate type
+  will be used.
+"none" (default) which avoids mounting anything.
+
+A "/system" ramdisk provided by bootdata always supersedes this option.
 
 ## netsvc.netboot=\<bool>
 
@@ -230,6 +344,23 @@ booting.
 More specifically, zircon will fetch a new zircon system from a bootserver on
 the local link and attempt to kexec into the new image, thereby replacing the
 currently running instance of zircon.
+
+This setting implies **zircon.system.disable-automount=true**
+
+## netsvc.advertise=\<bool>
+
+If true, netsvc will seek a bootserver by sending netboot advertisements.
+Defaults to true.
+
+## netsvc.interface=\<path>
+
+This option instructs netsvc to use only the ethernet device at the given
+topological path. All other ethernet devices are ignored by netsvc. The
+topological path for a device can be determined from the shell by running the
+`lsdev` command on the ethernet class device (e.g., `/dev/class/ethernet/000`).
+
+This is useful for configuring network booting for a device with multiple
+ethernet ports which may be enumerated in a non-deterministic order.
 
 ## userboot=\<path>
 
@@ -256,7 +387,7 @@ when the process it launches exits.
 ## vdso.soft_ticks=\<bool>
 
 If this option is set, the `zx_ticks_get` and `zx_ticks_per_second` system
-calls will use `zx_time_get(ZX_CLOCK_MONOTONIC)` in nanoseconds rather than
+calls will use `zx_clock_get(ZX_CLOCK_MONOTONIC)` in nanoseconds rather than
 hardware cycle counters in a hardware-based time unit.  Defaults to false.
 
 ## virtcon.disable
@@ -283,6 +414,11 @@ Set the system nodename, as used by `bootserver`, `loglistener`, and the
 human-readable nodename from its MAC address.  This cmdline is honored by
 GigaBoot and Zircon.
 
+## console.path=\<path>
+
+Specify console device path. If not specified device manager will open
+`/dev/misc/console`. Only has effect if kernel.shell=false.
+
 # Additional Gigaboot Commandline Options
 
 ## bootloader.timeout=\<num>
@@ -304,7 +440,7 @@ This option sets the default boot device to netboot, use a local zircon.bin or t
 
 Pass each option using -c, for example:
 ```
-./scripts/run-zircon-x86-64 -c gfxconsole.font=18x32 -c gfxconsole.early=false
+./scripts/run-zircon-x64 -c gfxconsole.font=18x32 -c gfxconsole.early=false
 ```
 
 ## in GigaBoot20x6, when netbooting

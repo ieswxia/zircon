@@ -56,6 +56,8 @@ zx_status_t vc_init_gfx(gfx_surface* test) {
         return ZX_ERR_NO_MEMORY;
     }
 
+    g_status_width = vc_gfx->width / font->width;
+
     return ZX_OK;
 }
 
@@ -88,7 +90,7 @@ void vc_gfx_invalidate_region(vc_t* vc, unsigned x, unsigned y, unsigned w, unsi
 }
 #else
 static int vc_gfx_fd = -1;
-static zx_handle_t vc_gfx_vmo = 0;
+static zx_handle_t vc_gfx_vmo = ZX_HANDLE_INVALID;
 static uintptr_t vc_gfx_mem = 0;
 static size_t vc_gfx_size = 0;
 
@@ -148,6 +150,8 @@ zx_status_t vc_init_gfx(int fd) {
                                      fb.info.stride, fb.info.format, 0)) == NULL) {
         goto fail;
     }
+
+    g_status_width = vc_gfx->width / font->width;
 
     return ZX_OK;
 

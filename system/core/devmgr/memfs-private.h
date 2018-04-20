@@ -4,154 +4,16 @@
 
 #pragma once
 
-#include <threads.h>
-
-#include <ddk/device.h>
-#include <fs/vfs.h>
 #include <zircon/compiler.h>
 #include <zircon/thread_annotations.h>
 #include <zircon/types.h>
+#include <fdio/io.h>
 #include <fdio/remoteio.h>
 #include <fdio/vfs.h>
 
 #ifdef __cplusplus
 
-#include <fbl/atomic.h>
-#include <fbl/intrusive_double_list.h>
-#include <fbl/ref_ptr.h>
-#include <fbl/unique_ptr.h>
-#include <fs/remote.h>
-#include <fs/watcher.h>
-
-#include "dnode.h"
-
-namespace memfs {
-
-class Dnode;
-
-class VnodeMemfs : public fs::Vnode {
-public:
-    virtual zx_status_t Setattr(vnattr_t* a) final;
-    virtual zx_status_t Sync() final;
-    ssize_t Ioctl(uint32_t op, const void* in_buf,
-                  size_t in_len, void* out_buf, size_t out_len) override;
-    zx_status_t AttachRemote(fs::MountChannel h) final;
-
-    // To be more specific: Is this vnode connected into the directory hierarchy?
-    // VnodeDirs can be unlinked, and this method will subsequently return false.
-    bool IsDirectory() const { return dnode_ != nullptr; }
-    void UpdateModified() { modify_time_ = zx_time_get(ZX_CLOCK_UTC); }
-
-    virtual ~VnodeMemfs();
-
-    fbl::RefPtr<Dnode> dnode_;
-    uint32_t link_count_;
-
-protected:
-    VnodeMemfs();
-
-    uint64_t ino_;
-    uint64_t create_time_;
-    uint64_t modify_time_;
-
-private:
-    static fbl::atomic<uint64_t> ino_ctr_;
-};
-
-class VnodeFile final : public VnodeMemfs {
-public:
-    VnodeFile();
-    VnodeFile(zx_handle_t vmo, zx_off_t length);
-    ~VnodeFile();
-
-    virtual zx_status_t Open(uint32_t flags) final;
-
-private:
-    ssize_t Read(void* data, size_t len, size_t off) final;
-    ssize_t Write(const void* data, size_t len, size_t off) final;
-    zx_status_t Truncate(size_t len) final;
-    zx_status_t Getattr(vnattr_t* a) final;
-    zx_status_t Mmap(int flags, size_t len, size_t* off, zx_handle_t* out) final;
-
-    zx_handle_t vmo_;
-    zx_off_t length_;
-};
-
-class VnodeDir : public VnodeMemfs {
-public:
-    VnodeDir();
-    virtual ~VnodeDir();
-
-    virtual zx_status_t Open(uint32_t flags) final;
-    zx_status_t Lookup(fbl::RefPtr<fs::Vnode>* out, const char* name, size_t len) final;
-    zx_status_t Create(fbl::RefPtr<fs::Vnode>* out, const char* name, size_t len, uint32_t mode) final;
-
-    // Create a vnode from a VMO.
-    // Fails if the vnode already exists.
-    // Passes the vmo to the Vnode; does not duplicate it.
-    zx_status_t CreateFromVmo(bool vmofile, const char* name, size_t namelen, zx_handle_t vmo,
-                              zx_off_t off, zx_off_t len);
-
-    // Use the watcher container to implement a directory watcher
-    void Notify(const char* name, size_t len, unsigned event) final;
-    zx_status_t WatchDir(zx::channel* out) final;
-    zx_status_t WatchDirV2(fs::Vfs* vfs, const vfs_watch_dir_t* cmd) final;
-
-    // The vnode is acting as a mount point for a remote filesystem or device.
-    virtual bool IsRemote() const final;
-    virtual zx::channel DetachRemote() final;
-    virtual zx_handle_t WaitForRemote() final;
-    virtual zx_handle_t GetRemote() const final;
-    virtual void SetRemote(zx::channel remote) final;
-
-private:
-    zx_status_t Readdir(void* cookie, void* dirents, size_t len) final;
-
-    // Resolves the question, "Can this directory create a child node with the name?"
-    // Returns "ZX_OK" on success; otherwise explains failure with error message.
-    zx_status_t CanCreate(const char* name, size_t namelen) const;
-
-    // Creates a dnode for the Vnode, attaches vnode to dnode, (if directory) attaches
-    // dnode to vnode, and adds dnode to parent directory.
-    zx_status_t AttachVnode(fbl::RefPtr<memfs::VnodeMemfs> vn, const char* name, size_t namelen,
-                            bool isdir);
-
-    zx_status_t Unlink(const char* name, size_t len, bool must_be_dir) final;
-    zx_status_t Rename(fbl::RefPtr<fs::Vnode> newdir,
-                       const char* oldname, size_t oldlen,
-                       const char* newname, size_t newlen,
-                       bool src_must_be_dir, bool dst_must_be_dir) final;
-    zx_status_t Link(const char* name, size_t len, fbl::RefPtr<fs::Vnode> target) final;
-    zx_status_t Getattr(vnattr_t* a) final;
-    zx_status_t Mmap(int flags, size_t len, size_t* off, zx_handle_t* out) final;
-    ssize_t Ioctl(uint32_t op, const void* in_buf,
-                  size_t in_len, void* out_buf, size_t out_len) final;
-
-    fs::RemoteContainer remoter_;
-    fs::WatcherContainer watcher_;
-};
-
-class VnodeVmo final : public VnodeMemfs {
-public:
-    VnodeVmo(zx_handle_t vmo, zx_off_t offset, zx_off_t length);
-    ~VnodeVmo();
-
-    virtual zx_status_t Open(uint32_t flags) override;
-
-private:
-    zx_status_t Serve(fs::Vfs* vfs, zx::channel channel, uint32_t flags) final;
-    ssize_t Read(void* data, size_t len, size_t off) final;
-    zx_status_t Getattr(vnattr_t* a) final;
-    zx_status_t GetHandles(uint32_t flags, zx_handle_t* hnds,
-                           uint32_t* type, void* extra, uint32_t* esize) final;
-
-    zx_handle_t vmo_;
-    zx_off_t offset_;
-    zx_off_t length_;
-    bool have_local_clone_;
-};
-
-} // namespace memfs
+#include <memfs/vnode.h>
 
 using VnodeMemfs = memfs::VnodeMemfs;
 using VnodeDir = memfs::VnodeDir;
@@ -171,12 +33,15 @@ typedef struct VnodeDir VnodeDir;
 __BEGIN_CDECLS
 
 void vfs_global_init(VnodeDir* root);
+void vfs_watch_exit(zx_handle_t event);
 
 // generate mxremoteio handles
-zx_handle_t vfs_create_global_root_handle(void);
+zx_status_t vfs_create_global_root_handle(zx_handle_t* out);
 zx_status_t vfs_connect_global_root_handle(zx_handle_t h);
-zx_handle_t vfs_create_root_handle(VnodeMemfs* vn);
+zx_status_t vfs_create_root_handle(VnodeMemfs* vn, zx_handle_t* out);
 zx_status_t vfs_connect_root_handle(VnodeMemfs* vn, zx_handle_t h);
+
+zx_status_t vfs_install_fs(const char* path, zx_handle_t h);
 
 // device fs
 zx_status_t devfs_mount(zx_handle_t h);
@@ -187,14 +52,12 @@ zx_status_t bootfs_add_file(const char* path, zx_handle_t vmo, zx_off_t off, siz
 // system fs
 VnodeDir* systemfs_get_root(void);
 zx_status_t systemfs_add_file(const char* path, zx_handle_t vmo, zx_off_t off, size_t len);
+void systemfs_set_readonly(bool value);
 
 // Create the global root to memfs
 VnodeDir* vfs_create_global_root(void) TA_NO_THREAD_SAFETY_ANALYSIS;
 
-// Create a generic root to memfs
-VnodeDir* vfs_create_root(void);
-
-void memfs_mount(VnodeDir* parent, VnodeDir* subtree);
+zx_status_t memfs_mount(VnodeDir* parent, const char* name, VnodeDir* subtree);
 
 void devmgr_vfs_exit(void);
 

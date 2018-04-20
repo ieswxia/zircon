@@ -2,29 +2,11 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#include <ddk/iotxn.h>
 #include <ddk/protocol/usb.h>
 #include <driver/usb.h>
 #include <zircon/compiler.h>
 #include <stdlib.h>
 #include <string.h>
-
-// helper function for allocating iotxns for USB transfers
-__EXPORT iotxn_t* usb_alloc_iotxn(uint8_t ep_address, size_t data_size) {
-    iotxn_t* txn;
-
-    zx_status_t status = iotxn_alloc(&txn, 0, data_size);
-    if (status != ZX_OK) {
-        return NULL;
-    }
-    txn->protocol = ZX_PROTOCOL_USB;
-
-    usb_protocol_data_t* data = iotxn_pdata(txn, usb_protocol_data_t);
-    memset(data, 0, sizeof(*data));
-    data->ep_address = ep_address;
-
-    return txn;
-}
 
 // initializes a usb_desc_iter_t for iterating on descriptors past the
 // interface's existing descriptors.

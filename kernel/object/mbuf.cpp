@@ -37,7 +37,11 @@ bool MBufChain::is_empty() const {
     return size_ == 0;
 }
 
-size_t MBufChain::Read(user_ptr<void> dst, size_t len, bool datagram) {
+size_t MBufChain::Read(user_out_ptr<void> dst, size_t len, bool datagram) {
+    if (size_ == 0) {
+        return 0;
+    }
+
     if (datagram && len > tail_.front().pkt_len_)
         len = tail_.front().pkt_len_;
 
@@ -72,8 +76,11 @@ size_t MBufChain::Read(user_ptr<void> dst, size_t len, bool datagram) {
     return pos;
 }
 
-zx_status_t MBufChain::WriteDatagram(user_ptr<const void> src,
-                                     size_t len, size_t* written) {
+zx_status_t MBufChain::WriteDatagram(user_in_ptr<const void> src, size_t len,
+                                     size_t* written) {
+    if (len == 0) {
+        return ZX_ERR_INVALID_ARGS;
+    }
     if (len + size_ > kSizeMax)
         return ZX_ERR_SHOULD_WAIT;
 
@@ -118,8 +125,7 @@ zx_status_t MBufChain::WriteDatagram(user_ptr<const void> src,
     return ZX_OK;
 }
 
-zx_status_t MBufChain::WriteStream(user_ptr<const void> src,
-                                   size_t len, size_t* written) {
+zx_status_t MBufChain::WriteStream(user_in_ptr<const void> src, size_t len, size_t* written) {
     if (head_ == nullptr) {
         head_ = AllocMBuf();
         if (head_ == nullptr)

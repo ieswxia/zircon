@@ -8,6 +8,8 @@
 #include <ddk/io-buffer.h>
 #include <ddk/protocol/platform-device.h>
 #include <ddk/protocol/usb-dci.h>
+#include <ddk/protocol/usb-mode-switch.h>
+#include <zircon/device/usb-device.h>
 #include <zircon/listnode.h>
 #include <zircon/types.h>
 #include <zircon/hw/usb.h>
@@ -51,9 +53,9 @@ typedef struct {
 
 typedef struct {
     dwc3_fifo_t fifo;
-    list_node_t queued_txns;    // iotxns waiting to be processed
-    iotxn_t* current_txn;       // iotxn currently being processed
-    unsigned rsrc_id;           // resource ID for current_txn
+    list_node_t queued_reqs;    // requests waiting to be processed
+    usb_request_t* current_req; // request currently being processed
+    unsigned rsrc_id;           // resource ID for current_req
 
     // Used for synchronizing endpoint state
     // and ep specific hardware registers
@@ -74,8 +76,15 @@ typedef struct {
 
 typedef struct {
     zx_device_t* zxdev;
+    zx_device_t* xhci_dev;
+    zx_device_t* parent;
+    platform_device_protocol_t pdev;
+    usb_mode_switch_protocol_t ums;
     usb_dci_interface_t dci_intf;
-    pdev_mmio_buffer_t mmio;
+    io_buffer_t mmio;
+    zx_handle_t bti_handle;
+
+    usb_mode_t usb_mode;
 
     // event stuff
     io_buffer_t event_buffer;
@@ -101,7 +110,7 @@ typedef struct {
 } dwc3_t;
 
 static inline volatile void* dwc3_mmio(dwc3_t* dwc) {
-    return dwc->mmio.vaddr;
+    return io_buffer_virt(&dwc->mmio);
 }
 
 void dwc3_usb_reset(dwc3_t* dwc);
@@ -128,9 +137,9 @@ zx_status_t dwc3_ep_config(dwc3_t* dwc, usb_endpoint_descriptor_t* ep_desc,
 void dwc3_ep_set_config(dwc3_t* dwc, unsigned ep_num, bool enable);
 zx_status_t dwc3_ep_disable(dwc3_t* dwc, uint8_t ep_addr);
 void dwc3_start_eps(dwc3_t* dwc);
-void dwc3_ep_queue(dwc3_t* dwc, unsigned ep_num, iotxn_t* txn);
+void dwc3_ep_queue(dwc3_t* dwc, unsigned ep_num, usb_request_t* req);
 void dwc3_ep_start_transfer(dwc3_t* dwc, unsigned ep_num, unsigned type, zx_paddr_t buffer,
-                            size_t length);
+                            size_t length, bool send_zlp);
 void dwc3_ep_xfer_started(dwc3_t* dwc, unsigned ep_num, unsigned rsrc_id);
 void dwc3_ep_xfer_complete(dwc3_t* dwc, unsigned ep_num);
 void dwc3_ep_xfer_not_ready(dwc3_t* dwc, unsigned ep_num, unsigned stage);
@@ -147,6 +156,7 @@ void dwc3_ep0_xfer_complete(dwc3_t* dwc, unsigned ep_num);
 
 // Events
 void dwc3_events_start(dwc3_t* dwc);
+void dwc3_events_stop(dwc3_t* dwc);
 
 // Utils
 void dwc3_wait_bits(volatile uint32_t* ptr, uint32_t bits, uint32_t expected);

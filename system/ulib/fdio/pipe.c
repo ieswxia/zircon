@@ -91,12 +91,12 @@ ssize_t zx_pipe_write_internal(zx_handle_t h, const void* data, size_t len, int 
 
 ssize_t zx_pipe_write(fdio_t* io, const void* data, size_t len) {
     zx_pipe_t* p = (zx_pipe_t*)io;
-    return zx_pipe_write_internal(p->h, data, len, io->flags & FDIO_FLAG_NONBLOCK);
+    return zx_pipe_write_internal(p->h, data, len, io->ioflag & IOFLAG_NONBLOCK);
 }
 
 ssize_t zx_pipe_read(fdio_t* io, void* data, size_t len) {
     zx_pipe_t* p = (zx_pipe_t*)io;
-    return zx_pipe_read_internal(p->h, data, len, io->flags & FDIO_FLAG_NONBLOCK);
+    return zx_pipe_read_internal(p->h, data, len, io->ioflag & IOFLAG_NONBLOCK);
 }
 zx_status_t zx_pipe_misc(fdio_t* io, uint32_t op, int64_t off, uint32_t maxreply, void* data, size_t len) {
     switch (op) {
@@ -129,12 +129,6 @@ zx_status_t zx_pipe_close(fdio_t* io) {
     p->h = 0;
     zx_handle_close(h);
     return 0;
-}
-
-static void zx_pipe_release(fdio_t* io) {
-    zx_pipe_t* p = (zx_pipe_t*)io;
-    zx_handle_close(p->h);
-    free(io);
 }
 
 void zx_pipe_wait_begin(fdio_t* io, uint32_t events, zx_handle_t* handle, zx_signals_t* _signals) {
@@ -181,7 +175,6 @@ zx_status_t zx_pipe_unwrap(fdio_t* io, zx_handle_t* handles, uint32_t* types) {
     zx_pipe_t* p = (void*)io;
     handles[0] = p->h;
     types[0] = PA_FDIO_PIPE;
-    free(p);
     return 1;
 }
 
@@ -230,7 +223,7 @@ static fdio_ops_t zx_pipe_ops = {
 };
 
 fdio_t* fdio_pipe_create(zx_handle_t h) {
-    zx_pipe_t* p = calloc(1, sizeof(*p));
+    zx_pipe_t* p = fdio_alloc(sizeof(*p));
     if (p == NULL) {
         zx_handle_close(h);
         return NULL;

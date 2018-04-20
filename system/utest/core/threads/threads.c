@@ -47,29 +47,65 @@ static bool check_reported_pid_and_tid(zx_handle_t thread,
     return true;
 }
 
-// Suspend the given thread.  This waits for the thread suspension to take
-// effect, using the given exception port.
-static bool suspend_thread_synchronous(zx_handle_t thread, zx_handle_t eport) {
-    ASSERT_EQ(zx_task_suspend(thread), ZX_OK, "");
+static bool get_thread_info(zx_handle_t thread, zx_info_thread_t* info) {
+    return zx_object_get_info(thread, ZX_INFO_THREAD, info, sizeof(*info), NULL, NULL) == ZX_OK;
+}
 
-    // Wait for the thread to suspend.
-    for (;;) {
-        zx_port_packet_t packet;
-        ASSERT_EQ(zx_port_wait(eport, ZX_TIME_INFINITE, &packet, 0), ZX_OK, "");
-        if (packet.type == ZX_EXCP_THREAD_EXITING) {
-            // Ignore this "thread exiting" event and retry.  This event
-            // was probably caused by a thread from an earlier test case.
-            // We can get these events even if the previous test case
-            // joined the thread or used zx_object_wait_one() to wait for
-            // the thread to terminate.
-            continue;
-        }
-        EXPECT_TRUE(check_reported_pid_and_tid(thread, &packet), "");
+// Suspend the given thread and block until it reaches the suspended state. The suspend token
+// is written to the output parameter.
+static bool suspend_thread_synchronous(zx_handle_t thread, zx_handle_t* suspend_token) {
+    ASSERT_EQ(zx_task_suspend_token(thread, suspend_token), ZX_OK, "");
+
+    zx_signals_t observed = 0u;
+    ASSERT_EQ(zx_object_wait_one(thread, ZX_THREAD_SUSPENDED, ZX_TIME_INFINITE, &observed), ZX_OK, "");
+
+    return true;
+}
+
+// Resume the given thread and block until it reaches the running state.
+static bool resume_thread_synchronous(zx_handle_t thread, zx_handle_t suspend_token) {
+    ASSERT_EQ(zx_handle_close(suspend_token), ZX_OK, "");
+
+    zx_signals_t observed = 0u;
+    ASSERT_EQ(zx_object_wait_one(thread, ZX_THREAD_RUNNING, ZX_TIME_INFINITE, &observed), ZX_OK, "");
+
+    return true;
+}
+
+// Updates the thread state to advance over a software breakpoint instruction, assuming the
+// breakpoint was just hit. This does not resume the thread, only updates its state.
+static bool advance_over_breakpoint(zx_handle_t thread) {
+#if defined(__aarch64__)
+    // Advance 4 bytes to the next instruction after the debug break.
+    struct zx_thread_state_general_regs regs;
+    ASSERT_EQ(zx_thread_read_state(thread, ZX_THREAD_STATE_GENERAL_REGS, &regs, sizeof(regs)),
+              ZX_OK, "");
+    regs.pc += 4;
+    ASSERT_EQ(zx_thread_write_state(thread, ZX_THREAD_STATE_GENERAL_REGS, &regs, sizeof(regs)),
+              ZX_OK, "");
+#elif defined(__x86_64__)
+    // x86 sets the instruction pointer to the following instruction so needs no update.
+#else
+#error Not supported on this platform.
+#endif
+    return true;
+}
+
+// Waits for the exception type excp_type, ignoring exceptions of type ignore_type (these will
+// just resume the thread), and issues errors for anything else.
+static bool wait_thread_excp_type(zx_handle_t thread, zx_handle_t eport, uint32_t excp_type,
+                                  uint32_t ignore_type) {
+    zx_port_packet_t packet;
+    while (true) {
+        ASSERT_EQ(zx_port_wait(eport, ZX_TIME_INFINITE, &packet, 1), ZX_OK, "");
         ASSERT_EQ(packet.key, kExceptionPortKey, "");
-        ASSERT_EQ(packet.type, (uint32_t)ZX_EXCP_THREAD_SUSPENDED, "");
-        break;
+        if (packet.type != ignore_type) {
+            ASSERT_EQ(packet.type, excp_type, "");
+            break;
+        } else {
+            ASSERT_EQ(zx_task_resume_from_exception(thread, eport, 0), ZX_OK, "");
+        }
     }
-
     return true;
 }
 
@@ -120,6 +156,12 @@ static bool set_debugger_exception_port(zx_handle_t* eport_out) {
                                           ZX_EXCEPTION_PORT_DEBUGGER),
               ZX_OK, "");
     return true;
+}
+
+static void clear_debugger_exception_port(void) {
+    zx_handle_t self = zx_process_self();
+    zx_task_bind_exception_port(self, ZX_HANDLE_INVALID, kExceptionPortKey,
+                                ZX_EXCEPTION_PORT_DEBUGGER);
 }
 
 static bool test_basics(void) {
@@ -260,7 +302,7 @@ static bool test_kill_wait_thread(void) {
 static bool test_bad_state_nonstarted_thread(void) {
     BEGIN_TEST;
 
-    // perform a bunch of apis against non started threads (in the INITIAL STATE)
+    // Perform a bunch of apis against non started threads (in the INITIAL STATE).
     zx_handle_t thread;
 
     ASSERT_EQ(zx_thread_create(zx_process_self(), "thread", 5, 0, &thread), ZX_OK, "");
@@ -359,47 +401,60 @@ static bool test_resume_suspended(void) {
 
     ASSERT_EQ(zx_event_create(0, &event), ZX_OK, "");
     ASSERT_TRUE(start_thread(threads_test_wait_fn, &event, &thread, &thread_h), "");
-    ASSERT_EQ(zx_task_suspend(thread_h), ZX_OK, "");
-    ASSERT_EQ(zx_task_resume(thread_h, 0), ZX_OK, "");
+
+    zx_handle_t suspend_token = ZX_HANDLE_INVALID;
+    ASSERT_EQ(zx_task_suspend_token(thread_h, &suspend_token), ZX_OK, "");
+    ASSERT_EQ(zx_handle_close(suspend_token), ZX_OK, "");
 
     // The thread should still be blocked on the event when it wakes up
     ASSERT_EQ(zx_object_wait_one(thread_h, ZX_THREAD_TERMINATED, zx_deadline_after(ZX_MSEC(100)),
                                  NULL), ZX_ERR_TIMED_OUT, "");
 
-    // Verify thread is blocked
+    // Verify thread is blocked (though may still be running if on a very busy system)
     zx_info_thread_t info;
-    ASSERT_EQ(zx_object_get_info(thread_h, ZX_INFO_THREAD,
-                                 &info, sizeof(info), NULL, NULL),
-              ZX_OK, "");
+    ASSERT_TRUE(get_thread_info(thread_h, &info), "");
     ASSERT_EQ(info.wait_exception_port_type, ZX_EXCEPTION_PORT_TYPE_NONE, "");
-    ASSERT_EQ(info.state, ZX_THREAD_STATE_BLOCKED, "");
+    ASSERT_TRUE(info.state == ZX_THREAD_STATE_RUNNING || info.state == ZX_THREAD_STATE_BLOCKED, "");
 
-    // Attach to debugger port so we can see ZX_EXCP_THREAD_SUSPENDED
-    zx_handle_t eport;
-    ASSERT_TRUE(set_debugger_exception_port(&eport),"");
+    // Check that signaling the event while suspended results in the expected behavior.
+    suspend_token = ZX_HANDLE_INVALID;
+    ASSERT_TRUE(suspend_thread_synchronous(thread_h, &suspend_token), "");
 
-    // Check that signaling the event while suspended results in the expected
-    // behavior
-    ASSERT_TRUE(suspend_thread_synchronous(thread_h, eport), "");
-
-    // Verify thread is suspended
-    ASSERT_EQ(zx_object_get_info(thread_h, ZX_INFO_THREAD,
-                                 &info, sizeof(info), NULL, NULL),
-              ZX_OK, "");
+    // Verify thread is suspended.
+    ASSERT_TRUE(get_thread_info(thread_h, &info), "");
     ASSERT_EQ(info.state, ZX_THREAD_STATE_SUSPENDED, "");
     ASSERT_EQ(info.wait_exception_port_type, ZX_EXCEPTION_PORT_TYPE_NONE, "");
 
-    // Since the thread is suspended the signaling should not take effect.
+    // Resuming the thread should mark the thread as blocked again.
+    ASSERT_TRUE(resume_thread_synchronous(thread_h, suspend_token), "");
+
+    // When a thread has a blocking syscall interrupted for a suspend, it may
+    // momentarily resume running.  If we catch it in the intermediate state,
+    // give it a chance to quiesce.
+    const size_t kNumTries = 20;
+    for (size_t i = 0; i < kNumTries; ++i) {
+        ASSERT_TRUE(get_thread_info(thread_h, &info), "");
+        if (info.state == ZX_THREAD_STATE_BLOCKED) {
+            break;
+        }
+        ASSERT_EQ(info.state, ZX_THREAD_STATE_RUNNING, "");
+        zx_nanosleep(zx_deadline_after(ZX_MSEC(5)));
+    }
+    ASSERT_EQ(info.state, ZX_THREAD_STATE_BLOCKED, "");
+
+    // When the thread is suspended the signaling should not take effect.
+    suspend_token = ZX_HANDLE_INVALID;
+    ASSERT_TRUE(suspend_thread_synchronous(thread_h, &suspend_token), "");
     ASSERT_EQ(zx_object_signal(event, 0, ZX_USER_SIGNAL_0), ZX_OK, "");
     ASSERT_EQ(zx_object_wait_one(event, ZX_USER_SIGNAL_1, zx_deadline_after(ZX_MSEC(100)), NULL), ZX_ERR_TIMED_OUT, "");
 
-    ASSERT_EQ(zx_task_resume(thread_h, 0), ZX_OK, "");
+    ASSERT_EQ(zx_handle_close(suspend_token), ZX_OK, "");
 
     ASSERT_EQ(zx_object_wait_one(event, ZX_USER_SIGNAL_1, ZX_TIME_INFINITE, NULL), ZX_OK, "");
+
     ASSERT_EQ(zx_object_wait_one(
         thread_h, ZX_THREAD_TERMINATED, ZX_TIME_INFINITE, NULL), ZX_OK, "");
 
-    ASSERT_EQ(zx_handle_close(eport), ZX_OK, "");
     ASSERT_EQ(zx_handle_close(event), ZX_OK, "");
     ASSERT_EQ(zx_handle_close(thread_h), ZX_OK, "");
 
@@ -412,25 +467,38 @@ static bool test_suspend_sleeping(void) {
     const zx_time_t sleep_deadline = zx_deadline_after(ZX_MSEC(100));
     zxr_thread_t thread;
 
-    // TODO(teisenbe): This code could be made less racy with a deadline sleep
-    // mode when we get one.
     zx_handle_t thread_h;
     ASSERT_TRUE(start_thread(threads_test_sleep_fn, (void*)sleep_deadline, &thread, &thread_h), "");
 
     zx_nanosleep(sleep_deadline - ZX_MSEC(50));
 
-    // Suspend the thread.  Use the debugger port to wait for the suspension.
-    zx_handle_t eport;
-    ASSERT_TRUE(set_debugger_exception_port(&eport), "");
-    ASSERT_TRUE(suspend_thread_synchronous(thread_h, eport), "");
-    ASSERT_EQ(zx_handle_close(eport), ZX_OK, "");
-
-    ASSERT_EQ(zx_task_resume(thread_h, 0), ZX_OK, "");
+    // Suspend the thread.
+    zx_handle_t suspend_token = ZX_HANDLE_INVALID;
+    zx_status_t status = zx_task_suspend_token(thread_h, &suspend_token);
+    if (status != ZX_OK) {
+        ASSERT_EQ(status, ZX_ERR_BAD_STATE, "");
+        // This might happen if the thread exits before we tried suspending it
+        // (due to e.g. a long context-switch away).  The system is too loaded
+        // and so we might not have a chance at success here without a massive
+        // sleep duration.
+        zx_info_thread_t info;
+        ASSERT_EQ(zx_object_get_info(thread_h, ZX_INFO_THREAD,
+                                     &info, sizeof(info), NULL, NULL),
+                  ZX_OK, "");
+        ASSERT_EQ(info.state, ZX_THREAD_STATE_DEAD, "");
+        ASSERT_EQ(zx_handle_close(thread_h), ZX_OK, "");
+        // Early bail from the test, since we hit a possible race from an
+        // overloaded machine.
+        END_TEST;
+    }
+    ASSERT_EQ(zx_object_wait_one(thread_h, ZX_THREAD_SUSPENDED, ZX_TIME_INFINITE, NULL), ZX_OK, "");
+    ASSERT_EQ(zx_handle_close(suspend_token), ZX_OK, "");
 
     // Wait for the sleep to finish
-    ASSERT_EQ(zx_object_wait_one(thread_h, ZX_THREAD_TERMINATED, sleep_deadline + ZX_MSEC(50), NULL),
+    ASSERT_EQ(zx_object_wait_one(thread_h, ZX_THREAD_TERMINATED, ZX_TIME_INFINITE, NULL),
               ZX_OK, "");
-    const zx_time_t now = zx_time_get(ZX_CLOCK_MONOTONIC);
+
+    const zx_time_t now = zx_clock_get(ZX_CLOCK_MONOTONIC);
     ASSERT_GE(now, sleep_deadline, "thread did not sleep long enough");
 
     ASSERT_EQ(zx_handle_close(thread_h), ZX_OK, "");
@@ -454,11 +522,9 @@ static bool test_suspend_channel_call(void) {
     ASSERT_EQ(zx_object_wait_one(channel, ZX_CHANNEL_READABLE, ZX_TIME_INFINITE, NULL),
               ZX_OK, "");
 
-    // Suspend the thread.  Use the debugger port to wait for the suspension.
-    zx_handle_t eport;
-    ASSERT_TRUE(set_debugger_exception_port(&eport), "");
-    ASSERT_TRUE(suspend_thread_synchronous(thread_h, eport), "");
-    ASSERT_EQ(zx_handle_close(eport), ZX_OK, "");
+    // Suspend the thread.
+    zx_handle_t suspend_token = ZX_HANDLE_INVALID;
+    ASSERT_TRUE(suspend_thread_synchronous(thread_h, &suspend_token), "");
 
     // Read the message
     uint8_t buf[9];
@@ -483,7 +549,7 @@ static bool test_suspend_channel_call(void) {
               ZX_ERR_SHOULD_WAIT, "");
 
     // Wake the suspended thread
-    ASSERT_EQ(zx_task_resume(thread_h, 0), ZX_OK, "");
+    ASSERT_EQ(zx_handle_close(suspend_token), ZX_OK, "");
 
     // Wait for the thread to finish
     ASSERT_EQ(zx_object_wait_one(thread_h, ZX_THREAD_TERMINATED, ZX_TIME_INFINITE, NULL),
@@ -509,23 +575,24 @@ static bool test_suspend_port_call(void) {
     ASSERT_TRUE(start_thread(threads_test_port_fn, port, &thread, &thread_h), "");
 
     zx_nanosleep(zx_deadline_after(ZX_MSEC(100)));
-    ASSERT_EQ(zx_task_suspend(thread_h), ZX_OK, "");
+    zx_handle_t suspend_token = ZX_HANDLE_INVALID;
+    ASSERT_EQ(zx_task_suspend_token(thread_h, &suspend_token), ZX_OK, "");
 
     zx_port_packet_t packet1 = { 100ull, ZX_PKT_TYPE_USER, 0u, {} };
     zx_port_packet_t packet2 = { 300ull, ZX_PKT_TYPE_USER, 0u, {} };
 
-    ASSERT_EQ(zx_port_queue(port[0], &packet1, 0u), ZX_OK, "");
-    ASSERT_EQ(zx_port_queue(port[0], &packet2, 0u), ZX_OK, "");
+    ASSERT_EQ(zx_port_queue(port[0], &packet1, 1u), ZX_OK, "");
+    ASSERT_EQ(zx_port_queue(port[0], &packet2, 1u), ZX_OK, "");
 
     zx_port_packet_t packet;
-    ASSERT_EQ(zx_port_wait(port[1], zx_deadline_after(ZX_MSEC(100)), &packet, 0u), ZX_ERR_TIMED_OUT, "");
+    ASSERT_EQ(zx_port_wait(port[1], zx_deadline_after(ZX_MSEC(100)), &packet, 1u), ZX_ERR_TIMED_OUT, "");
 
-    ASSERT_EQ(zx_task_resume(thread_h, 0), ZX_OK, "");
+    ASSERT_EQ(zx_handle_close(suspend_token), ZX_OK, "");
 
-    ASSERT_EQ(zx_port_wait(port[1], ZX_TIME_INFINITE, &packet, 0u), ZX_OK, "");
+    ASSERT_EQ(zx_port_wait(port[1], ZX_TIME_INFINITE, &packet, 1u), ZX_OK, "");
     EXPECT_EQ(packet.key, 105ull, "");
 
-    ASSERT_EQ(zx_port_wait(port[0], ZX_TIME_INFINITE, &packet, 0u), ZX_OK, "");
+    ASSERT_EQ(zx_port_wait(port[0], ZX_TIME_INFINITE, &packet, 1u), ZX_OK, "");
     EXPECT_EQ(packet.key, 300ull, "");
 
     ASSERT_EQ(zx_object_wait_one(
@@ -562,13 +629,15 @@ static bool test_suspend_stops_thread(void) {
     while (arg.v != 1) {
         zx_nanosleep(0);
     }
-    ASSERT_EQ(zx_task_suspend(thread_h), ZX_OK, "");
+
+    zx_handle_t suspend_token = ZX_HANDLE_INVALID;
+    ASSERT_EQ(zx_task_suspend_token(thread_h, &suspend_token), ZX_OK, "");
     while (arg.v != 2) {
         arg.v = 2;
         // Give the thread a chance to clobber the value
         zx_nanosleep(zx_deadline_after(ZX_MSEC(50)));
     }
-    ASSERT_EQ(zx_task_resume(thread_h, 0), ZX_OK, "");
+    ASSERT_EQ(zx_handle_close(suspend_token), ZX_OK, "");
     while (arg.v != 1) {
         zx_nanosleep(0);
     }
@@ -580,6 +649,81 @@ static bool test_suspend_stops_thread(void) {
     // receive an ZX_EXCP_THREAD_EXITING event.
     ASSERT_EQ(zx_object_wait_one(thread_h, ZX_THREAD_TERMINATED,
                                  ZX_TIME_INFINITE, NULL), ZX_OK, "");
+    ASSERT_EQ(zx_handle_close(thread_h), ZX_OK, "");
+
+    END_TEST;
+}
+
+static bool test_suspend_multiple(void) {
+    BEGIN_TEST;
+
+    // TODO(brettw) ZX-1072 Fix this test and enable. Currently suspend tokens
+    // and exception resumption don't interact well and resuming from an
+    // exception will resume the thread, even if there is an open suspend
+    // token.
+
+    zx_handle_t event;
+    zxr_thread_t thread;
+    zx_handle_t thread_h;
+
+    ASSERT_EQ(zx_event_create(0, &event), ZX_OK, "");
+    ASSERT_TRUE(start_thread(threads_test_wait_break_infinite_sleep_fn, &event, &thread,
+                             &thread_h), "");
+
+    // The thread will now be blocked on the event. Wake it up and catch the trap (undefined
+    // exception).
+    zx_handle_t exception_port = ZX_HANDLE_INVALID;
+    ASSERT_TRUE(set_debugger_exception_port(&exception_port), "");
+    ASSERT_EQ(zx_object_signal(event, 0, ZX_USER_SIGNAL_0), ZX_OK, "");
+    ASSERT_TRUE(wait_thread_excp_type(thread_h, exception_port, ZX_EXCP_SW_BREAKPOINT,
+                                      ZX_EXCP_THREAD_STARTING), "");
+
+    // The thread should now be blocked on a debugger exception.
+    zx_info_thread_t info;
+    ASSERT_TRUE(get_thread_info(thread_h, &info), "");
+    ASSERT_EQ(info.wait_exception_port_type, ZX_EXCEPTION_PORT_TYPE_DEBUGGER, "");
+    ASSERT_EQ(info.state, ZX_THREAD_STATE_BLOCKED, "");
+
+    advance_over_breakpoint(thread_h);
+
+    // Suspend twice (on top of the existing exception). Don't use the synchronous suspend since
+    // it's blocked already.
+    zx_handle_t suspend_token1 = ZX_HANDLE_INVALID;
+    ASSERT_EQ(zx_task_suspend_token(thread_h, &suspend_token1), ZX_OK, "");
+    zx_handle_t suspend_token2 = ZX_HANDLE_INVALID;
+    ASSERT_EQ(zx_task_suspend_token(thread_h, &suspend_token2), ZX_OK, "");
+
+    // Resume one token, it should remain blocked.
+    ASSERT_EQ(zx_handle_close(suspend_token1), ZX_OK, "");
+    ASSERT_TRUE(get_thread_info(thread_h, &info), "");
+    // Note: If this check is flaky, it's failing. It should not transition out of the blocked
+    // state, but if it does so, it will do so asynchronously which might cause
+    // nondeterministic failures.
+    ASSERT_EQ(info.state, ZX_THREAD_STATE_BLOCKED, "");
+
+    // Resume from the exception with invalid options.
+    ASSERT_EQ(zx_task_resume_from_exception(thread_h, exception_port, 23), ZX_ERR_INVALID_ARGS,
+              "");
+
+    // Resume the exception. It should be SUSPENDED now that the exception is complete (one could
+    // argue that it could still be BLOCKED also, but it's not in the current implementation).
+    // The transition to SUSPENDED happens asynchronously unlike some of the exception states.
+    ASSERT_EQ(zx_task_resume_from_exception(thread_h, exception_port, 0), ZX_OK, "");
+    zx_signals_t observed = 0u;
+    ASSERT_EQ(zx_object_wait_one(thread_h, ZX_THREAD_SUSPENDED, ZX_TIME_INFINITE, &observed),
+              ZX_OK, "");
+
+    ASSERT_TRUE(get_thread_info(thread_h, &info), "");
+    ASSERT_EQ(info.state, ZX_THREAD_STATE_SUSPENDED, "");
+
+    // 2nd resume, should be running or sleeping after this.
+    ASSERT_TRUE(resume_thread_synchronous(thread_h, suspend_token2), "");
+    ASSERT_TRUE(get_thread_info(thread_h, &info), "");
+    ASSERT_TRUE(info.state == ZX_THREAD_STATE_RUNNING || info.state == ZX_THREAD_STATE_BLOCKED, "");
+
+    // Clean up.
+    clear_debugger_exception_port();
+    ASSERT_EQ(zx_task_kill(thread_h), ZX_OK, "");
     ASSERT_EQ(zx_handle_close(thread_h), ZX_OK, "");
 
     END_TEST;
@@ -600,11 +744,12 @@ static bool test_kill_suspended_thread(void) {
         zx_nanosleep(0);
     }
 
-    // Attach to debugger port so we can see ZX_EXCP_THREAD_SUSPENDED.
-    zx_handle_t eport;
-    ASSERT_TRUE(set_debugger_exception_port(&eport),"");
+    zx_handle_t suspend_token = ZX_HANDLE_INVALID;
+    ASSERT_TRUE(suspend_thread_synchronous(thread_h, &suspend_token), "");
 
-    ASSERT_TRUE(suspend_thread_synchronous(thread_h, eport), "");
+    // Attach to debugger port so we can see ZX_EXCP_THREAD_EXITING.
+    zx_handle_t eport;
+    ASSERT_TRUE(set_debugger_exception_port(&eport), "");
 
     // Reset the test memory location.
     arg.v = 100;
@@ -617,15 +762,172 @@ static bool test_kill_suspended_thread(void) {
     EXPECT_EQ(arg.v, 100, "");
 
     // Check that the thread is reported as exiting and not as resumed.
-    zx_port_packet_t packet;
-    ASSERT_EQ(zx_port_wait(eport, ZX_TIME_INFINITE, &packet, 0), ZX_OK, "");
-    ASSERT_EQ(packet.key, kExceptionPortKey, "");
-    ASSERT_EQ(packet.type, (uint32_t)ZX_EXCP_THREAD_EXITING, "");
+    ASSERT_TRUE(wait_thread_excp_type(thread_h, eport, ZX_EXCP_THREAD_EXITING, 0), "");
 
     // Clean up.
+    clear_debugger_exception_port();
+    ASSERT_EQ(zx_handle_close(suspend_token), ZX_OK, "");
     ASSERT_EQ(zx_handle_close(eport), ZX_OK, "");
     ASSERT_EQ(zx_handle_close(thread_h), ZX_OK, "");
 
+    END_TEST;
+}
+
+static bool port_wait_for_signal_once(zx_handle_t port, zx_handle_t thread,
+                                      zx_time_t deadline, zx_signals_t mask,
+                                      zx_port_packet_t* packet) {
+    ASSERT_EQ(zx_object_wait_async(thread, port, 0u, mask,
+                                   ZX_WAIT_ASYNC_ONCE),
+              ZX_OK, "");
+    ASSERT_EQ(zx_port_wait(port, deadline, packet, 1), ZX_OK, "");
+    ASSERT_EQ(packet->type, ZX_PKT_TYPE_SIGNAL_ONE, "");
+    return true;
+}
+
+static bool port_wait_for_signal_repeating(zx_handle_t port,
+                                           zx_time_t deadline,
+                                           zx_port_packet_t* packet) {
+    ASSERT_EQ(zx_port_wait(port, deadline, packet, 1), ZX_OK, "");
+    ASSERT_EQ(packet->type, ZX_PKT_TYPE_SIGNAL_REP, "");
+    return true;
+}
+
+// Test signal delivery of suspended threads via async wait.
+static bool test_suspend_wait_async_signal_delivery_worker(bool use_repeating) {
+    zx_handle_t event;
+    zx_handle_t port;
+    zxr_thread_t thread;
+    zx_handle_t thread_h;
+    const zx_signals_t run_susp_mask = ZX_THREAD_RUNNING | ZX_THREAD_SUSPENDED;
+
+    ASSERT_EQ(zx_event_create(0, &event), ZX_OK, "");
+    ASSERT_TRUE(start_thread(threads_test_wait_fn, &event, &thread, &thread_h), "");
+
+    ASSERT_EQ(zx_port_create(0, &port), ZX_OK, "");
+    if (use_repeating) {
+        ASSERT_EQ(zx_object_wait_async(thread_h, port, 0u, run_susp_mask,
+                                       ZX_WAIT_ASYNC_REPEATING),
+                  ZX_OK, "");
+    }
+
+    zx_port_packet_t packet;
+    // There should be a RUNNING signal packet present and not SUSPENDED.
+    // This is from when the thread first started to run.
+    if (use_repeating) {
+        ASSERT_TRUE(port_wait_for_signal_repeating(port, 0u, &packet), "");
+    } else {
+        ASSERT_TRUE(port_wait_for_signal_once(port, thread_h, 0u, run_susp_mask, &packet), "");
+    }
+    ASSERT_EQ(packet.signal.observed & run_susp_mask, ZX_THREAD_RUNNING, "");
+
+    // Make sure there are no more packets.
+    if (use_repeating) {
+        ASSERT_EQ(zx_port_wait(port, 0u, &packet, 1), ZX_ERR_TIMED_OUT, "");
+    } else {
+        // In the non-repeating case we have to do things differently as one of
+        // RUNNING or SUSPENDED is always asserted.
+        ASSERT_EQ(zx_object_wait_async(thread_h, port, 0u,
+                                       ZX_THREAD_SUSPENDED,
+                                       ZX_WAIT_ASYNC_ONCE),
+                  ZX_OK, "");
+        ASSERT_EQ(zx_port_wait(port, 0u, &packet, 1), ZX_ERR_TIMED_OUT, "");
+        ASSERT_EQ(zx_port_cancel(port, thread_h, 0u), ZX_OK, "");
+    }
+
+    zx_handle_t suspend_token = ZX_HANDLE_INVALID;
+    ASSERT_TRUE(suspend_thread_synchronous(thread_h, &suspend_token), "");
+
+    zx_info_thread_t info;
+    ASSERT_TRUE(get_thread_info(thread_h, &info), "");
+    ASSERT_EQ(info.state, ZX_THREAD_STATE_SUSPENDED, "");
+
+    ASSERT_TRUE(resume_thread_synchronous(thread_h, suspend_token), "");
+    ASSERT_TRUE(get_thread_info(thread_h, &info), "");
+    // At this point the thread may be running or blocked waiting for an
+    // event. Either one is fine.
+    ASSERT_TRUE(info.state == ZX_THREAD_STATE_RUNNING ||
+                info.state == ZX_THREAD_STATE_BLOCKED, "");
+
+    // For repeating async waits we should see both SUSPENDED and RUNNING on
+    // the port. And we should see them at the same time (and not one followed
+    // by the other).
+    if (use_repeating) {
+        ASSERT_TRUE(port_wait_for_signal_repeating(port,
+                                                   zx_deadline_after(ZX_MSEC(100)),
+                                                   &packet), "");
+        ASSERT_EQ(packet.signal.observed & run_susp_mask, run_susp_mask, "");
+    } else {
+        // For non-repeating async waits we should see just RUNNING,
+        // and it should be immediately present (no deadline).
+        ASSERT_TRUE(port_wait_for_signal_once(port, thread_h, 0u, run_susp_mask,
+                                              &packet), "");
+        ASSERT_EQ(packet.signal.observed & run_susp_mask, ZX_THREAD_RUNNING, "");
+    }
+
+    // The thread should still be blocked on the event when it wakes up.
+    ASSERT_EQ(zx_object_wait_one(thread_h, ZX_THREAD_TERMINATED, zx_deadline_after(ZX_MSEC(100)),
+                                 NULL), ZX_ERR_TIMED_OUT, "");
+    ASSERT_TRUE(get_thread_info(thread_h, &info), "");
+    ASSERT_TRUE(info.state == ZX_THREAD_STATE_RUNNING || info.state == ZX_THREAD_STATE_BLOCKED, "");
+
+    // Check that suspend/resume while blocked in a syscall results in
+    // the expected behavior and is visible via async wait.
+    suspend_token = ZX_HANDLE_INVALID;
+    ASSERT_EQ(zx_task_suspend_token(thread_h, &suspend_token), ZX_OK, "");
+    if (use_repeating) {
+        ASSERT_TRUE(port_wait_for_signal_repeating(port,
+                                                   zx_deadline_after(ZX_MSEC(100)),
+                                                   &packet), "");
+    } else {
+        ASSERT_TRUE(port_wait_for_signal_once(port, thread_h,
+                                              zx_deadline_after(ZX_MSEC(100)),
+                                              ZX_THREAD_SUSPENDED, &packet), "");
+    }
+    ASSERT_EQ(packet.signal.observed & run_susp_mask, ZX_THREAD_SUSPENDED, "");
+
+    ASSERT_TRUE(get_thread_info(thread_h, &info), "");
+    ASSERT_EQ(info.state, ZX_THREAD_STATE_SUSPENDED, "");
+    ASSERT_EQ(zx_handle_close(suspend_token), ZX_OK, "");
+    if (use_repeating) {
+        ASSERT_TRUE(port_wait_for_signal_repeating(port,
+                                                   zx_deadline_after(ZX_MSEC(100)),
+                                                   &packet), "");
+    } else {
+        ASSERT_TRUE(port_wait_for_signal_once(port, thread_h,
+                                              zx_deadline_after(ZX_MSEC(100)),
+                                              ZX_THREAD_RUNNING, &packet), "");
+    }
+    ASSERT_EQ(packet.signal.observed & run_susp_mask, ZX_THREAD_RUNNING, "");
+
+    // Resumption from being suspended back into a blocking syscall will be
+    // in the RUNNING state and then BLOCKED.
+    ASSERT_TRUE(get_thread_info(thread_h, &info), "");
+    ASSERT_TRUE(info.state == ZX_THREAD_STATE_RUNNING || info.state == ZX_THREAD_STATE_BLOCKED, "");
+
+    ASSERT_EQ(zx_object_signal(event, 0, ZX_USER_SIGNAL_0), ZX_OK, "");
+    ASSERT_EQ(zx_object_wait_one(event, ZX_USER_SIGNAL_1, ZX_TIME_INFINITE, NULL), ZX_OK, "");
+
+    ASSERT_EQ(zx_object_wait_one(
+        thread_h, ZX_THREAD_TERMINATED, ZX_TIME_INFINITE, NULL), ZX_OK, "");
+
+    ASSERT_EQ(zx_handle_close(port), ZX_OK, "");
+    ASSERT_EQ(zx_handle_close(event), ZX_OK, "");
+    ASSERT_EQ(zx_handle_close(thread_h), ZX_OK, "");
+
+    return true;
+}
+
+// Test signal delivery of suspended threads via single async wait.
+static bool test_suspend_single_wait_async_signal_delivery(void) {
+    BEGIN_TEST;
+    EXPECT_TRUE(test_suspend_wait_async_signal_delivery_worker(false), "");
+    END_TEST;
+}
+
+// Test signal delivery of suspended threads via repeating async wait.
+static bool test_suspend_repeating_wait_async_signal_delivery(void) {
+    BEGIN_TEST;
+    EXPECT_TRUE(test_suspend_wait_async_signal_delivery_worker(true), "");
     END_TEST;
 }
 
@@ -635,7 +937,7 @@ static bool test_kill_suspended_thread(void) {
 static bool test_reading_register_state(void) {
     BEGIN_TEST;
 
-    zx_general_regs_t regs_expected;
+    zx_thread_state_general_regs_t regs_expected;
     regs_fill_test_values(&regs_expected);
     regs_expected.REG_PC = (uintptr_t)spin_with_regs_spin_address;
 
@@ -646,23 +948,18 @@ static bool test_reading_register_state(void) {
 
     // Allow some time for the thread to begin execution and reach the
     // instruction that spins.
-    ASSERT_EQ(zx_nanosleep(zx_deadline_after(ZX_MSEC(10))), ZX_OK, "");
+    ASSERT_EQ(zx_nanosleep(zx_deadline_after(ZX_MSEC(100))), ZX_OK, "");
 
-    // Attach to debugger port so we can see ZX_EXCP_THREAD_SUSPENDED.
-    zx_handle_t eport;
-    ASSERT_TRUE(set_debugger_exception_port(&eport),"");
+    zx_handle_t suspend_token = ZX_HANDLE_INVALID;
+    ASSERT_TRUE(suspend_thread_synchronous(thread_handle, &suspend_token), "");
 
-    ASSERT_TRUE(suspend_thread_synchronous(thread_handle, eport), "");
-
-    zx_general_regs_t regs;
-    uint32_t size_read;
-    ASSERT_EQ(zx_thread_read_state(thread_handle, ZX_THREAD_STATE_REGSET0,
-                                   &regs, sizeof(regs), &size_read), ZX_OK, "");
-    ASSERT_EQ(size_read, sizeof(regs), "");
+    zx_thread_state_general_regs_t regs;
+    ASSERT_EQ(zx_thread_read_state(thread_handle, ZX_THREAD_STATE_GENERAL_REGS,
+                                   &regs, sizeof(regs)), ZX_OK, "");
     ASSERT_TRUE(regs_expect_eq(&regs, &regs_expected), "");
 
     // Clean up.
-    ASSERT_EQ(zx_handle_close(eport), ZX_OK, "");
+    ASSERT_EQ(zx_handle_close(suspend_token), ZX_OK, "");
     ASSERT_EQ(zx_task_kill(thread_handle), ZX_OK, "");
     // Wait for the thread termination to complete.
     ASSERT_EQ(zx_object_wait_one(thread_handle, ZX_THREAD_TERMINATED,
@@ -684,34 +981,30 @@ static bool test_writing_register_state(void) {
 
     // Allow some time for the thread to begin execution and reach the
     // instruction that spins.
-    ASSERT_EQ(zx_nanosleep(zx_deadline_after(ZX_MSEC(10))), ZX_OK, "");
+    ASSERT_EQ(zx_nanosleep(zx_deadline_after(ZX_MSEC(100))), ZX_OK, "");
 
-    // Attach to debugger port so we can see ZX_EXCP_THREAD_SUSPENDED.
-    zx_handle_t eport;
-    ASSERT_TRUE(set_debugger_exception_port(&eport),"");
-
-    ASSERT_TRUE(suspend_thread_synchronous(thread_handle, eport), "");
+    zx_handle_t suspend_token = ZX_HANDLE_INVALID;
+    ASSERT_TRUE(suspend_thread_synchronous(thread_handle, &suspend_token), "");
 
     struct {
         // A small stack that is used for calling zx_thread_exit().
-        char stack[1024];
-        zx_general_regs_t regs_got;
+        char stack[1024] __ALIGNED(16);
+        zx_thread_state_general_regs_t regs_got;
     } stack;
 
-    zx_general_regs_t regs_to_set;
+    zx_thread_state_general_regs_t regs_to_set;
     regs_fill_test_values(&regs_to_set);
     regs_to_set.REG_PC = (uintptr_t)save_regs_and_exit_thread;
-    regs_to_set.REG_STACK_PTR = (uintptr_t)&stack.regs_got;
+    regs_to_set.REG_STACK_PTR = (uintptr_t)(stack.stack + sizeof(stack.stack));
     ASSERT_EQ(zx_thread_write_state(
-                  thread_handle, ZX_THREAD_STATE_REGSET0,
+                  thread_handle, ZX_THREAD_STATE_GENERAL_REGS,
                   &regs_to_set, sizeof(regs_to_set)), ZX_OK, "");
-    ASSERT_EQ(zx_task_resume(thread_handle, 0), ZX_OK, "");
+    ASSERT_EQ(zx_handle_close(suspend_token), ZX_OK, "");
     ASSERT_EQ(zx_object_wait_one(thread_handle, ZX_THREAD_TERMINATED,
                                  ZX_TIME_INFINITE, NULL), ZX_OK, "");
     EXPECT_TRUE(regs_expect_eq(&regs_to_set, &stack.regs_got), "");
 
     // Clean up.
-    ASSERT_EQ(zx_handle_close(eport), ZX_OK, "");
     ASSERT_EQ(zx_handle_close(thread_handle), ZX_OK, "");
 
     END_TEST;
@@ -749,19 +1042,14 @@ static bool test_noncanonical_rip_address(void) {
 
     // Allow some time for the thread to begin execution and block inside
     // the syscall.
-    ASSERT_EQ(zx_nanosleep(zx_deadline_after(ZX_MSEC(10))), ZX_OK, "");
+    ASSERT_EQ(zx_nanosleep(zx_deadline_after(ZX_MSEC(100))), ZX_OK, "");
 
-    // Attach to debugger port so we can see ZX_EXCP_THREAD_SUSPENDED.
-    zx_handle_t eport;
-    ASSERT_TRUE(set_debugger_exception_port(&eport),"");
+    zx_handle_t suspend_token = ZX_HANDLE_INVALID;
+    ASSERT_TRUE(suspend_thread_synchronous(thread_handle, &suspend_token), "");
 
-    ASSERT_TRUE(suspend_thread_synchronous(thread_handle, eport), "");
-
-    struct zx_x86_64_general_regs regs;
-    uint32_t size_read;
-    ASSERT_EQ(zx_thread_read_state(thread_handle, ZX_THREAD_STATE_REGSET0,
-                                   &regs, sizeof(regs), &size_read), ZX_OK, "");
-    ASSERT_EQ(size_read, sizeof(regs), "");
+    zx_thread_state_general_regs_t regs;
+    ASSERT_EQ(zx_thread_read_state(thread_handle, ZX_THREAD_STATE_GENERAL_REGS,
+                                   &regs, sizeof(regs)), ZX_OK, "");
 
     // Example addresses to test.
     uintptr_t noncanonical_addr =
@@ -769,16 +1057,16 @@ static bool test_noncanonical_rip_address(void) {
     uintptr_t canonical_addr = noncanonical_addr - 1;
     uint64_t kKernelAddr = 0xffff800000000000;
 
-    struct zx_x86_64_general_regs regs_modified = regs;
+    zx_thread_state_general_regs_t regs_modified = regs;
 
     // This RIP address must be disallowed.
     regs_modified.rip = noncanonical_addr;
-    ASSERT_EQ(zx_thread_write_state(thread_handle, ZX_THREAD_STATE_REGSET0,
+    ASSERT_EQ(zx_thread_write_state(thread_handle, ZX_THREAD_STATE_GENERAL_REGS,
                                     &regs_modified, sizeof(regs_modified)),
               ZX_ERR_INVALID_ARGS, "");
 
     regs_modified.rip = canonical_addr;
-    ASSERT_EQ(zx_thread_write_state(thread_handle, ZX_THREAD_STATE_REGSET0,
+    ASSERT_EQ(zx_thread_write_state(thread_handle, ZX_THREAD_STATE_GENERAL_REGS,
                                     &regs_modified, sizeof(regs_modified)),
               ZX_OK, "");
 
@@ -786,15 +1074,15 @@ static bool test_noncanonical_rip_address(void) {
     // disallowed because this simplifies the check and it's not useful to
     // allow this address.
     regs_modified.rip = kKernelAddr;
-    ASSERT_EQ(zx_thread_write_state(thread_handle, ZX_THREAD_STATE_REGSET0,
+    ASSERT_EQ(zx_thread_write_state(thread_handle, ZX_THREAD_STATE_GENERAL_REGS,
                                     &regs_modified, sizeof(regs_modified)),
               ZX_ERR_INVALID_ARGS, "");
 
     // Clean up: Restore the original register state.
-    ASSERT_EQ(zx_thread_write_state(thread_handle, ZX_THREAD_STATE_REGSET0,
+    ASSERT_EQ(zx_thread_write_state(thread_handle, ZX_THREAD_STATE_GENERAL_REGS,
                                     &regs, sizeof(regs)), ZX_OK, "");
     // Allow the child thread to resume and exit.
-    ASSERT_EQ(zx_task_resume(thread_handle, 0), ZX_OK, "");
+    ASSERT_EQ(zx_handle_close(suspend_token), ZX_OK, "");
     ASSERT_EQ(zx_object_signal(event, 0, ZX_USER_SIGNAL_0), ZX_OK, "");
     // Wait for the child thread to signal that it has continued.
     ASSERT_EQ(zx_object_wait_one(event, ZX_USER_SIGNAL_1, ZX_TIME_INFINITE,
@@ -802,7 +1090,6 @@ static bool test_noncanonical_rip_address(void) {
     // Wait for the child thread to exit.
     ASSERT_EQ(zx_object_wait_one(thread_handle, ZX_THREAD_TERMINATED, ZX_TIME_INFINITE,
                                  NULL), ZX_OK, "");
-    ASSERT_EQ(zx_handle_close(eport), ZX_OK, "");
     ASSERT_EQ(zx_handle_close(event), ZX_OK, "");
     ASSERT_EQ(zx_handle_close(thread_handle), ZX_OK, "");
 #endif
@@ -828,16 +1115,12 @@ static bool test_writing_arm_flags_register(void) {
     while (arg.v != 1) {
         ASSERT_EQ(zx_nanosleep(zx_deadline_after(ZX_USEC(1))), ZX_OK, "");
     }
-    // Attach to debugger port so we can see ZX_EXCP_THREAD_SUSPENDED.
-    zx_handle_t eport;
-    ASSERT_TRUE(set_debugger_exception_port(&eport), "");
-    ASSERT_TRUE(suspend_thread_synchronous(thread_handle, eport), "");
+    zx_handle_t suspend_token = ZX_HANDLE_INVALID;
+    ASSERT_TRUE(suspend_thread_synchronous(thread_handle, &suspend_token), "");
 
-    zx_general_regs_t regs;
-    uint32_t size_read;
-    ASSERT_EQ(zx_thread_read_state(thread_handle, ZX_THREAD_STATE_REGSET0,
-                                   &regs, sizeof(regs), &size_read), ZX_OK, "");
-    ASSERT_EQ(size_read, sizeof(regs), "");
+    zx_thread_state_general_regs_t regs;
+    ASSERT_EQ(zx_thread_read_state(thread_handle, ZX_THREAD_STATE_GENERAL_REGS,
+                                   &regs, sizeof(regs)), ZX_OK, "");
 
     // Check that zx_thread_read_state() does not report any more flag bits
     // than are readable via userland instructions.
@@ -847,14 +1130,13 @@ static bool test_writing_arm_flags_register(void) {
     // Try setting more flag bits.
     uint64_t original_cpsr = regs.cpsr;
     regs.cpsr |= ~kUserVisibleFlags;
-    ASSERT_EQ(zx_thread_write_state(thread_handle, ZX_THREAD_STATE_REGSET0,
+    ASSERT_EQ(zx_thread_write_state(thread_handle, ZX_THREAD_STATE_GENERAL_REGS,
                                     &regs, sizeof(regs)), ZX_OK, "");
 
     // Firstly, if we read back the register flag, the extra flag bits
     // should have been ignored and should not be reported as set.
-    ASSERT_EQ(zx_thread_read_state(thread_handle, ZX_THREAD_STATE_REGSET0,
-                                   &regs, sizeof(regs), &size_read), ZX_OK, "");
-    ASSERT_EQ(size_read, sizeof(regs), "");
+    ASSERT_EQ(zx_thread_read_state(thread_handle, ZX_THREAD_STATE_GENERAL_REGS,
+                                   &regs, sizeof(regs)), ZX_OK, "");
     EXPECT_EQ(regs.cpsr, original_cpsr, "");
 
     // Secondly, if we resume the thread, we should be able to kill it.  If
@@ -862,7 +1144,7 @@ static bool test_writing_arm_flags_register(void) {
     // thread gets scheduled, it will never get interrupted and we will not
     // be able to kill and join the thread.
     arg.v = 0;
-    ASSERT_EQ(zx_task_resume(thread_handle, 0), ZX_OK, "");
+    ASSERT_EQ(zx_handle_close(suspend_token), ZX_OK, "");
     // Wait until the thread has actually resumed execution.
     while (arg.v != 1) {
         ASSERT_EQ(zx_nanosleep(zx_deadline_after(ZX_USEC(1))), ZX_OK, "");
@@ -872,7 +1154,6 @@ static bool test_writing_arm_flags_register(void) {
                                  ZX_TIME_INFINITE, NULL), ZX_OK, "");
 
     // Clean up.
-    ASSERT_EQ(zx_handle_close(eport), ZX_OK, "");
 #endif
 
     END_TEST;
@@ -895,7 +1176,10 @@ RUN_TEST(test_suspend_sleeping)
 RUN_TEST(test_suspend_channel_call)
 RUN_TEST(test_suspend_port_call)
 RUN_TEST(test_suspend_stops_thread)
+RUN_TEST(test_suspend_multiple)
 RUN_TEST(test_kill_suspended_thread)
+RUN_TEST(test_suspend_single_wait_async_signal_delivery)
+RUN_TEST(test_suspend_repeating_wait_async_signal_delivery)
 RUN_TEST(test_reading_register_state)
 RUN_TEST(test_writing_register_state)
 RUN_TEST(test_noncanonical_rip_address)

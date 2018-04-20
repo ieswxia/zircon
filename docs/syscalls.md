@@ -38,14 +38,16 @@
 + [job_set_relative_importance](syscalls/job_set_relative_importance.md) - update a global ordering of jobs
 
 ## Tasks (Thread, Process, or Job)
-+ [task_resume](syscalls/task_resume.md) - cause a suspended task to continue running
 + [task_bind_exception_port](syscalls/task_bind_exception_port.md) - attach an exception port to a task
 + [task_kill](syscalls/task_kill.md) - cause a task to stop running
++ [task_resume](syscalls/task_resume.md) - cause a suspended task to continue running
++ [task_suspend](syscalls/task_suspend.md) - cause a task to be suspended
 
 ## Channels
 + [channel_call](syscalls/channel_call.md) - synchronously send a message and receive a reply
 + [channel_create](syscalls/channel_create.md) - create a new channel
 + [channel_read](syscalls/channel_read.md) - receive a message from a channel
++ [channel_read_etc](syscalls/channel_read.md) - receive a message from a channel with handle information
 + [channel_write](syscalls/channel_write.md) - write a message to a channel
 
 ## Sockets
@@ -66,7 +68,7 @@
 + [port_create](syscalls/port_create.md) - create a port
 + [port_queue](syscalls/port_queue.md) - send a packet to a port
 + [port_wait](syscalls/port_wait.md) - wait for packets to arrive on a port
-+ [port_cancel](syscalls/port_cancel.md) - cancel notificaitons from async_wait
++ [port_cancel](syscalls/port_cancel.md) - cancel notifications from async_wait
 
 ## Futexes
 + [futex_wait](syscalls/futex_wait.md) - wait on a futex
@@ -95,7 +97,7 @@
 
 ## Time
 + [nanosleep](syscalls/nanosleep.md) - sleep for some number of nanoseconds
-+ [time_get](syscalls/time_get.md) - read a system clock
++ [clock_get](syscalls/clock_get.md) - read a system clock
 + [ticks_get](syscalls/ticks_get.md) - read high-precision timer ticks
 + [ticks_per_second](syscalls/ticks_per_second.md) - read the number of high-precision timer ticks in a second
 
@@ -104,7 +106,19 @@
 + [timer_set](syscalls/timer_set.md) - start a timer
 + [timer_cancel](syscalls/timer_cancel.md) - cancel a timer
 
+## Hypervisor guests
++ [guest_create](syscalls/guest_create.md) - create a hypervisor guest
++ [guest_set_trap](syscalls/guest_set_trap.md) - set a trap in a hypervisor guest
+
+## Virtual CPUs
++ [vcpu_create](syscalls/vcpu_create.md) - create a virtual cpu
++ [vcpu_resume](syscalls/vcpu_resume.md) - resume execution of a virtual cpu
++ [vcpu_interrupt](syscalls/vcpu_interrupt.md) - raise an interrupt on a virtual cpu
++ [vcpu_read_state](syscalls/vcpu_read_state.md) - read state from a virtual cpu
++ [vcpu_write_state](syscalls/vcpu_write_state.md) - write state to a virtual cpu
+
 ## Global system information
++ [system_get_features](syscalls/system_get_features.md) - get hardware-specific features
 + [system_get_num_cpus](syscalls/system_get_num_cpus.md) - get number of CPUs
 + [system_get_physmem](syscalls/system_get_physmem.md) - get physical memory size
 + [system_get_version](syscalls/system_get_version.md) - get version string
@@ -117,3 +131,18 @@
 ## Multi-function
 + [vmar_unmap_handle_close_thread_exit](syscalls/vmar_unmap_handle_close_thread_exit.md) - three-in-one
 + [futex_wake_handle_close_thread_exit](syscalls/futex_wake_handle_close_thread_exit.md) - three-in-one
+
+## DDK
++ [cache_flush](syscalls/cache_flush.md) - Flush CPU data and/or instruction caches
++ [interrupt_create](syscalls/interrupt_create.md) - Create an interrupt object
++ [interrupt_bind](syscalls/interrupt_bind.md) - Bind an interrupt vector to interrupt object
++ [interrupt_wait](syscalls/interrupt_wait.md) - Wait for an interrupt on an interrupt object
++ [interrupt_get_timestamp](syscalls/interrupt_get_timestamp.md) - Get the timestamp for an interrupt
++ [interrupt_signal](syscalls/interrupt_signal.md) - Signals a virtual interrupt on an interrupt object
++ [smc_call](syscalls/smc_call.md) - Make an SMC call from user space
++ acpi_uefi_rsdp
++ mmap_device_io
++ set_framebuffer
++ set_framebuffer_vmo
++ vmo_create_contiguous
++ vmo_create_physical

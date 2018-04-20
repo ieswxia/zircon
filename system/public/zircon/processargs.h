@@ -139,7 +139,6 @@ struct zx_proc_args {
 // Used by libfdio for passing fdtable, fsroot, etc
 
 // Handle types the fdio library uses
-#define PA_FDIO_CWD              0x31
 #define PA_FDIO_REMOTE           0x32
 #define PA_FDIO_PIPE             0x33
 #define PA_FDIO_EVENT            0x34
@@ -148,7 +147,7 @@ struct zx_proc_args {
 
 // Server endpoint for remoteio "/svc" directory provided
 // to enable handling of inbound connections to services
-#define PA_SERVICE_REQUEST       0x3B
+#define PA_DIRECTORY_REQUEST     0x3B
 
 // Used by devmgr and devhosts
 #define PA_RESOURCE              0x3F
@@ -156,59 +155,10 @@ struct zx_proc_args {
 
 // --- Various ---
 
-// Handle types used by the application model
-#define PA_APP_SERVICES          0x43
-
 // Handle types for one-off use and prototyping
 #define PA_USER0                 0xF0
 #define PA_USER1                 0xF1
 #define PA_USER2                 0xF2
-
-
-// Dynamic Loader Service Messages
-// Used by dynamic loader to obtain objects to link.
-typedef struct zx_loader_svc_msg zx_loader_svc_msg_t;
-struct zx_loader_svc_msg {
-    zx_txid_t txid;
-    uint32_t opcode;
-    int32_t arg;
-    uint32_t reserved0;
-    uint32_t reserved1;
-    uint8_t data[0];
-};
-
-#define LOADER_SVC_OP_STATUS 0
-// reply message, arg=status
-
-#define LOADER_SVC_OP_DONE 1
-// Clean shutdown of service
-
-#define LOADER_SVC_OP_LOAD_OBJECT 2
-// arg=0, data[] object name (asciiz)
-// reply includes vmo handle on success
-
-#define LOADER_SVC_OP_DEBUG_PRINT 3
-// arg=0, data[] debug text (asciiz)
-
-#define LOADER_SVC_OP_LOAD_SCRIPT_INTERP 4
-// arg=0, data[] object name (asciiz)
-// reply includes vmo handle on success
-
-#define LOADER_SVC_OP_PUBLISH_DATA_SINK 5
-// arg=0, data[] sink name (asciiz)
-// Request includes a VMO handle.
-
-#define LOADER_SVC_OP_LOAD_DEBUG_CONFIG 6
-// arg=0, data[] configuration (file) name (asciiz)
-// reply includes vmo handle on success
-
-#define LOADER_SVC_OP_CONFIG 7
-// arg=0, data[] configuration string to affect later loading (asciiz)
-// e.g. "asan"
-
-#define LOADER_SVC_OP_CLONE 8
-// obtain a new loader service connection/context
-// arg=0, data[] empty, request includes channel for new connection
 
 #ifdef __cplusplus
 }

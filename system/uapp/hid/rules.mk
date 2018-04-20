@@ -10,7 +10,13 @@ MODULE_TYPE := userapp
 MODULE_GROUP := misc
 
 MODULE_SRCS += \
-    $(LOCAL_DIR)/main.c
+    $(LOCAL_DIR)/main.cpp \
+    $(LOCAL_DIR)/report.cpp
+
+MODULE_STATIC_LIBS := \
+    system/ulib/fbl \
+    system/ulib/hid-parser \
+    system/ulib/zxcpp
 
 MODULE_LIBS := \
     system/ulib/zircon \

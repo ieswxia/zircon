@@ -22,7 +22,6 @@ struct zx_device {
     zx_handle_t event;
     zx_handle_t local_event;
     zx_handle_t rpc;
-    zx_handle_t resource;
 
     // most devices implement a single
     // protocol beyond the base device protocol
@@ -35,19 +34,14 @@ struct zx_device {
     // parent in the device tree
     zx_device_t* parent;
 
-    // driver that is bound to this device, NULL if unbound
-    zx_driver_t* owner;
-
-    void* owner_cookie;
-
     // for the parent's device_list
     struct list_node node;
 
     // list of this device's children in the device tree
     struct list_node children;
 
-    // list of this device's instances
-    struct list_node instances;
+    // list node for the defer_device_list
+    struct list_node defer;
 
     // iostate
     void* ios;
@@ -69,6 +63,9 @@ struct zx_device {
 #define DEV_FLAG_INSTANCE       0x00000020  // this device was created-on-open
 #define DEV_FLAG_MULTI_BIND     0x00000080  // this device accepts many children
 #define DEV_FLAG_ADDED          0x00000100  // device_add() has been called for this device
+#define DEV_FLAG_INVISIBLE      0x00000200  // device not visible via devfs
+#define DEV_FLAG_UNBOUND        0x00000400  // informed that it should self-delete asap
+#define DEV_FLAG_WANTS_REBIND   0x00000800  // when last child goes, rebind this device
 
 #define DEV_MAGIC 'MDEV'
 

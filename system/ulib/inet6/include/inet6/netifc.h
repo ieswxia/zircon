@@ -5,7 +5,8 @@
 #pragma once
 
 // setup networking
-int netifc_open(void);
+// if interface != NULL, only use the given topological path for networking
+int netifc_open(const char* interface);
 
 // process inbound packet(s)
 int netifc_poll(void);
@@ -22,10 +23,9 @@ void netifc_set_timer(uint32_t ms);
 // returns true once the timer has expired
 int netifc_timer_expired(void);
 
-// write packet to network
-// packet is discarded if too large, too small, network offline, etc
-void netifc_send(const void* data, size_t len);
-
 void netifc_recv(void* data, size_t len);
+
+// send out next pending packet, and return value indicating if more are available to send
+bool netifc_send_pending(void);
 
 void netifc_get_info(uint8_t* addr, uint16_t* mtu);

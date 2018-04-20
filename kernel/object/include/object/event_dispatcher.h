@@ -9,24 +9,23 @@
 #include <zircon/types.h>
 #include <fbl/canary.h>
 #include <object/dispatcher.h>
-#include <object/state_tracker.h>
 
 #include <sys/types.h>
 
-class EventDispatcher final : public Dispatcher {
+class EventDispatcher final : public SoloDispatcher {
 public:
     static zx_status_t Create(uint32_t options, fbl::RefPtr<Dispatcher>* dispatcher,
                               zx_rights_t* rights);
 
     ~EventDispatcher() final;
     zx_obj_type_t get_type() const final { return ZX_OBJ_TYPE_EVENT; }
-    StateTracker* get_state_tracker() final { return &state_tracker_; }
+    bool has_state_tracker() const final { return true; }
     CookieJar* get_cookie_jar() final { return &cookie_jar_; }
-    zx_status_t user_signal(uint32_t clear_mask, uint32_t set_mask, bool peer) final;
+
+    zx_signals_t allowed_user_signals() const final { return ZX_USER_SIGNAL_ALL | ZX_EVENT_SIGNALED; }
 
 private:
     explicit EventDispatcher(uint32_t options);
     fbl::Canary<fbl::magic("EVTD")> canary_;
-    StateTracker state_tracker_;
     CookieJar cookie_jar_;
 };

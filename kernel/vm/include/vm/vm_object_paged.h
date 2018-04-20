@@ -14,11 +14,12 @@
 #include <fbl/ref_counted.h>
 #include <fbl/ref_ptr.h>
 #include <kernel/mutex.h>
-#include <kernel/vm.h>
 #include <lib/user_copy/user_ptr.h>
 #include <list.h>
 #include <stdint.h>
 #include <vm/pmm.h>
+#include <vm/vm.h>
+#include <vm/vm_aspace.h>
 #include <vm/vm_object.h>
 #include <vm/vm_page_list.h>
 #include <zircon/thread_annotations.h>
@@ -29,6 +30,12 @@ class VmObjectPaged final : public VmObject {
 public:
     static zx_status_t Create(uint32_t pmm_alloc_flags, uint64_t size, fbl::RefPtr<VmObject>* vmo);
 
+    // Create a VMO backed by a contiguous range of physical memory.  The
+    // returned vmo has all of its pages committed, and does not allow
+    // decommitting them.
+    static zx_status_t CreateContiguous(uint32_t pmm_alloc_flags, uint64_t size,
+                                        uint8_t alignment_log2, fbl::RefPtr<VmObject>* vmo);
+
     static zx_status_t CreateFromROData(const void* data, size_t size, fbl::RefPtr<VmObject>* vmo);
 
     zx_status_t Resize(uint64_t size) override;
@@ -38,28 +45,25 @@ public:
         // any deadlocks.
         TA_NO_THREAD_SAFETY_ANALYSIS { return size_; }
     bool is_paged() const override { return true; }
+    bool is_contiguous() const override { return is_contiguous_; }
 
     size_t AllocatedPagesInRange(uint64_t offset, uint64_t len) const override;
 
     zx_status_t CommitRange(uint64_t offset, uint64_t len, uint64_t* committed) override;
-    zx_status_t CommitRangeContiguous(uint64_t offset, uint64_t len, uint64_t* committed,
-                                      uint8_t alignment_log2) override;
     zx_status_t DecommitRange(uint64_t offset, uint64_t len, uint64_t* decommitted) override;
 
     zx_status_t Pin(uint64_t offset, uint64_t len) override;
     void Unpin(uint64_t offset, uint64_t len) override;
 
-    zx_status_t Read(void* ptr, uint64_t offset, size_t len, size_t* bytes_read) override;
-    zx_status_t Write(const void* ptr, uint64_t offset, size_t len, size_t* bytes_written) override;
+    zx_status_t Read(void* ptr, uint64_t offset, size_t len) override;
+    zx_status_t Write(const void* ptr, uint64_t offset, size_t len) override;
     zx_status_t Lookup(uint64_t offset, uint64_t len, uint pf_flags,
                        vmo_lookup_fn_t lookup_fn, void* context) override;
 
-    zx_status_t ReadUser(user_ptr<void> ptr, uint64_t offset, size_t len,
-                         size_t* bytes_read) override;
-    zx_status_t WriteUser(user_ptr<const void> ptr, uint64_t offset, size_t len,
-                          size_t* bytes_written) override;
+    zx_status_t ReadUser(user_out_ptr<void> ptr, uint64_t offset, size_t len) override;
+    zx_status_t WriteUser(user_in_ptr<const void> ptr, uint64_t offset, size_t len) override;
 
-    zx_status_t LookupUser(uint64_t offset, uint64_t len, user_ptr<paddr_t> buffer,
+    zx_status_t LookupUser(uint64_t offset, uint64_t len, user_inout_ptr<paddr_t> buffer,
                            size_t buffer_size) override;
 
     void Dump(uint depth, bool verbose) override;
@@ -83,9 +87,16 @@ public:
         // Called under the parent's lock, which confuses analysis.
         TA_NO_THREAD_SAFETY_ANALYSIS;
 
+    zx_status_t GetMappingCachePolicy(uint32_t* cache_policy) override;
+    zx_status_t SetMappingCachePolicy(const uint32_t cache_policy) override;
+
+    // maximum size of a VMO is one page less than the full 64bit range
+    static const uint64_t MAX_SIZE = ROUNDDOWN(UINT64_MAX, PAGE_SIZE);
+
 private:
     // private constructor (use Create())
-    explicit VmObjectPaged(uint32_t pmm_alloc_flags, fbl::RefPtr<VmObject> parent);
+    VmObjectPaged(uint32_t pmm_alloc_flags, uint64_t size, fbl::RefPtr<VmObject> parent,
+                  bool is_contiguous);
 
     // private destructor, only called from refptr
     ~VmObjectPaged() override;
@@ -115,19 +126,17 @@ private:
 
     // internal read/write routine that takes a templated copy function to help share some code
     template <typename T>
-    zx_status_t ReadWriteInternal(uint64_t offset, size_t len, size_t* bytes_copied, bool write,
-                                  T copyfunc);
+    zx_status_t ReadWriteInternal(uint64_t offset, size_t len, bool write, T copyfunc);
 
     // set our offset within our parent
     zx_status_t SetParentOffsetLocked(uint64_t o) TA_REQ(lock_);
-
-    // maximum size of a VMO is one page less than the full 64bit range
-    static const uint64_t MAX_SIZE = ROUNDDOWN(UINT64_MAX, PAGE_SIZE);
 
     // members
     uint64_t size_ TA_GUARDED(lock_) = 0;
     uint64_t parent_offset_ TA_GUARDED(lock_) = 0;
     uint32_t pmm_alloc_flags_ TA_GUARDED(lock_) = PMM_ALLOC_FLAG_ANY;
+    uint32_t cache_policy_ TA_GUARDED(lock_) = ARCH_MMU_FLAG_CACHED;
+    const bool is_contiguous_;
 
     // a tree of pages
     VmPageList page_list_ TA_GUARDED(lock_);

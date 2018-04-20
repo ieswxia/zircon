@@ -16,7 +16,7 @@
 #include <arch/defines.h>
 
 #include <kernel/thread.h>
-#include <kernel/vm.h>
+#include <vm/vm.h>
 #include <vm/vm_aspace.h>
 #include <vm/vm_object.h>
 
@@ -27,9 +27,7 @@
 
 #include <object/diagnostics.h>
 #include <object/futex_context.h>
-#include <object/handle_owner.h>
-#include <object/handle_reaper.h>
-#include <object/handles.h>
+#include <object/handle.h>
 #include <object/job_dispatcher.h>
 #include <object/thread_dispatcher.h>
 #include <object/vm_address_region_dispatcher.h>
@@ -42,7 +40,7 @@ using fbl::AutoLock;
 
 #define LOCAL_TRACE 0
 
-static zx_handle_t map_handle_to_value(const Handle* handle, zx_handle_t mixer) {
+static zx_handle_t map_handle_to_value(const Handle* handle, uint32_t mixer) {
     // Ensure that the last bit of the result is not zero, and make sure
     // we don't lose any base_value bits or make the result negative
     // when shifting.
@@ -50,12 +48,12 @@ static zx_handle_t map_handle_to_value(const Handle* handle, zx_handle_t mixer) 
     DEBUG_ASSERT((handle->base_value() & 0xc0000000) == 0);
 
     auto handle_id = (handle->base_value() << 1) | 0x1;
-    return mixer ^ handle_id;
+    return static_cast<zx_handle_t>(mixer ^ handle_id);
 }
 
-static Handle* map_value_to_handle(zx_handle_t value, zx_handle_t mixer) {
-    auto handle_id = (value ^ mixer) >> 1;
-    return MapU32ToHandle(handle_id);
+static Handle* map_value_to_handle(zx_handle_t value, uint32_t mixer) {
+    auto handle_id = (static_cast<uint32_t>(value) ^ mixer) >> 1;
+    return Handle::FromU32(handle_id);
 }
 
 zx_status_t ProcessDispatcher::Create(
@@ -96,7 +94,7 @@ zx_status_t ProcessDispatcher::Create(
 ProcessDispatcher::ProcessDispatcher(fbl::RefPtr<JobDispatcher> job,
                                      fbl::StringPiece name,
                                      uint32_t flags)
-  : job_(fbl::move(job)), policy_(job_->GetPolicy()), state_tracker_(0u),
+  : job_(fbl::move(job)), policy_(job_->GetPolicy()),
     name_(name.data(), name.length()) {
     LTRACE_ENTRY_OBJ;
 
@@ -124,6 +122,22 @@ ProcessDispatcher::~ProcessDispatcher() {
     job_->RemoveChildProcess(this);
 
     LTRACE_EXIT_OBJ;
+}
+
+void ProcessDispatcher::on_zero_handles() {
+    // If the process is in the initial state and the last handle is closed
+    // we never detach from the parent job, so run the shutdown sequence for
+    // that case.
+    {
+        AutoLock lock(&state_lock_);
+        if (state_ != State::INITIAL) {
+            // Use the normal cleanup path instead.
+            return;
+        }
+        SetStateLocked(State::DEAD);
+    }
+
+    FinishDeadTransition();
 }
 
 void ProcessDispatcher::get_name(char out_name[ZX_MAX_NAME_LEN]) const {
@@ -213,7 +227,7 @@ void ProcessDispatcher::Kill() {
     }
 
     if (became_dead)
-        job_->RemoveChildProcess(this);
+        FinishDeadTransition();
 }
 
 void ProcessDispatcher::KillAllThreadsLocked() {
@@ -277,14 +291,7 @@ void ProcessDispatcher::RemoveThread(ThreadDispatcher* t) {
     }
 
     if (became_dead)
-        job_->RemoveChildProcess(this);
-}
-
-void ProcessDispatcher::on_zero_handles() {
-    LTRACE_ENTRY_OBJ;
-
-    // last handle going away acts as a kill to the process object
-    Kill();
+        FinishDeadTransition();
 }
 
 zx_koid_t ProcessDispatcher::get_related_koid() const {
@@ -320,72 +327,61 @@ void ProcessDispatcher::SetStateLocked(State s) {
     if (s == State::DYING) {
         // send kill to all of our threads
         KillAllThreadsLocked();
-    } else if (s == State::DEAD) {
-        // clean up the handle table
-        LTRACEF_LEVEL(2, "cleaning up handle table on proc %p\n", this);
-        {
-            AutoLock lock(&handle_table_lock_);
-            for (auto& handle : handles_) {
-                handle.set_process_id(0u);
-            }
-            // Delete handles out-of-band to avoid the worst case recursive
-            // destruction behavior.
-            ReapHandles(&handles_);
-        }
-        LTRACEF_LEVEL(2, "done cleaning up handle table on proc %p\n", this);
-
-        // tear down the address space
-        aspace_->Destroy();
-
-        // Send out exception reports before signalling ZX_TASK_TERMINATED,
-        // the theory being that marking the process as terminated is the
-        // last thing that is done.
-        //
-        // Note: If we need OnProcessExit for the debugger to do an exchange
-        // with the debugger then this should preceed aspace destruction.
-        // For now it is left here, following aspace destruction.
-        //
-        // Note: If an eport is bound, it will have a reference to the
-        // ProcessDispatcher and thus keep the object around until someone
-        // unbinds the port or closes all handles to its underlying
-        // PortDispatcher.
-        //
-        // There's no need to hold |exception_lock_| across OnProcessExit
-        // here so don't. We don't assume anything about what OnProcessExit
-        // does. If it blocks the exception port could get removed out from
-        // underneath us, so make a copy.
-        {
-            fbl::RefPtr<ExceptionPort> eport(exception_port());
-            if (eport) {
-                eport->OnProcessExit(this);
-            }
-        }
-        {
-            fbl::RefPtr<ExceptionPort> debugger_eport(debugger_exception_port());
-            if (debugger_eport) {
-                debugger_eport->OnProcessExit(this);
-            }
-        }
-
-        // signal waiter
-        LTRACEF_LEVEL(2, "signaling waiters\n");
-        state_tracker_.UpdateState(0u, ZX_TASK_TERMINATED);
-
-        // IWBN to call job_->RemoveChildProcess(this) here, but that risks
-        // a deadlock as we have |state_lock_| and RemoveChildProcess grabs the
-        // job's |lock_|, whereas JobDispatcher::EnumerateChildren obtains the
-        // locks in the opposite order. We want to keep lock acquisition order
-        // consistent, and JobDispatcher::EnumerateChildren's order makes
-        // sense. We don't need |state_lock_| when calling RemoveChildProcess
-        // here, so we leave that to the caller after it has released
-        // |state_lock_|. ZX-880
-        // The caller should call RemoveChildProcess soon so that the semantics
-        // of signaling ZX_JOB_NO_PROCESSES match that of ZX_TASK_TERMINATED.
-
-        // The PROC_CREATE record currently emits a uint32_t.
-        uint32_t koid = static_cast<uint32_t>(get_koid());
-        ktrace(TAG_PROC_EXIT, koid, 0, 0, 0);
     }
+}
+
+// Finish processing of the transition to State::DEAD. Some things need to be done
+// outside of holding |state_lock_|. Beware this is called from several places
+// including on_zero_handles().
+void ProcessDispatcher::FinishDeadTransition() {
+    DEBUG_ASSERT(!completely_dead_);
+    completely_dead_ = true;
+
+    // clean up the handle table
+    LTRACEF_LEVEL(2, "cleaning up handle table on proc %p\n", this);
+
+    fbl::DoublyLinkedList<Handle*> to_clean;
+    {
+        AutoLock lock(&handle_table_lock_);
+        for (auto& handle : handles_) {
+            handle.set_process_id(0u);
+        }
+        to_clean.swap(handles_);
+    }
+
+    // zx-1544: Here is where if we're the last holder of a handle of one of
+    // our exception ports then ResetExceptionPort will get called (by
+    // ExceptionPort::OnPortZeroHandles) and will need to grab |state_lock_|.
+    // This needs to be done outside of |state_lock_|.
+    while (!to_clean.is_empty()) {
+        // Delete handle via HandleOwner dtor.
+        HandleOwner ho(to_clean.pop_front());
+    }
+
+    LTRACEF_LEVEL(2, "done cleaning up handle table on proc %p\n", this);
+
+    // tear down the address space
+    aspace_->Destroy();
+
+    // signal waiter
+    LTRACEF_LEVEL(2, "signaling waiters\n");
+    UpdateState(0u, ZX_TASK_TERMINATED);
+
+    // The PROC_CREATE record currently emits a uint32_t koid.
+    uint32_t koid = static_cast<uint32_t>(get_koid());
+    ktrace(TAG_PROC_EXIT, koid, 0, 0, 0);
+
+    // Call job_->RemoveChildProcess(this) outside of |state_lock_|. Otherwise
+    // we risk a deadlock as we have |state_lock_| and RemoveChildProcess grabs
+    // the job's |lock_|, whereas JobDispatcher::EnumerateChildren obtains the
+    // locks in the opposite order. We want to keep lock acquisition order
+    // consistent, and JobDispatcher::EnumerateChildren's order makes
+    // sense. We don't need |state_lock_| when calling RemoveChildProcess
+    // here. ZX-880
+    // RemoveChildProcess is called soon after releasing |state_lock_| so that
+    // the semantics of signaling ZX_JOB_NO_PROCESSES match that of
+    // ZX_TASK_TERMINATED.
+    job_->RemoveChildProcess(this);
 }
 
 // process handle manipulation routines
@@ -482,13 +478,17 @@ zx_status_t ProcessDispatcher::GetDispatcherWithRightsInternal(zx_handle_t handl
 }
 
 zx_status_t ProcessDispatcher::GetInfo(zx_info_process_t* info) {
+    memset(info, 0, sizeof(*info));
+
     // retcode_ depends on the state: make sure they're consistent.
     state_lock_.Acquire();
     int retcode = retcode_;
     State state = state_;
+    if (debugger_exception_port_) {  // TODO: Protect with rights if necessary.
+        info->debugger_attached = true;
+    }
     state_lock_.Release();
 
-    memset(info, 0, sizeof(*info));
     switch (state) {
     case State::DEAD:
     case State::DYING:
@@ -502,12 +502,7 @@ zx_status_t ProcessDispatcher::GetInfo(zx_info_process_t* info) {
     default:
         break;
     }
-    {
-        AutoLock lock(&exception_lock_);
-        if (debugger_exception_port_) {  // TODO: Protect with rights if necessary.
-            info->debugger_attached = true;
-        }
-    }
+
     return ZX_OK;
 }
 
@@ -530,7 +525,7 @@ zx_status_t ProcessDispatcher::GetStats(zx_info_task_stats_t* stats) {
 }
 
 zx_status_t ProcessDispatcher::GetAspaceMaps(
-    user_ptr<zx_info_maps_t> maps, size_t max,
+    user_out_ptr<zx_info_maps_t> maps, size_t max,
     size_t* actual, size_t* available) {
     AutoLock lock(&state_lock_);
     if (state_ != State::RUNNING) {
@@ -540,7 +535,7 @@ zx_status_t ProcessDispatcher::GetAspaceMaps(
 }
 
 zx_status_t ProcessDispatcher::GetVmos(
-    user_ptr<zx_info_vmo_t> vmos, size_t max,
+    user_out_ptr<zx_info_vmo_t> vmos, size_t max,
     size_t* actual_out, size_t* available_out) {
     AutoLock lock(&state_lock_);
     if (state_ != State::RUNNING) {
@@ -598,10 +593,9 @@ zx_status_t ProcessDispatcher::SetExceptionPort(fbl::RefPtr<ExceptionPort> eport
         break;
     }
 
-    // Lock both |state_lock_| and |exception_lock_| to ensure the process
-    // doesn't transition to dead while we're setting the exception handler.
+    // Lock |state_lock_| to ensure the process doesn't transition to dead
+    // while we're setting the exception handler.
     AutoLock state_lock(&state_lock_);
-    AutoLock excp_lock(&exception_lock_);
     if (state_ == State::DEAD)
         return ZX_ERR_NOT_FOUND;
     if (debugger) {
@@ -625,7 +619,7 @@ bool ProcessDispatcher::ResetExceptionPort(bool debugger, bool quietly) {
     // want them to hit another exception and get back into
     // ExceptionHandlerExchange.
     {
-        AutoLock lock(&exception_lock_);
+        AutoLock lock(&state_lock_);
         if (debugger) {
             debugger_exception_port_.swap(eport);
         } else {
@@ -663,12 +657,12 @@ bool ProcessDispatcher::ResetExceptionPort(bool debugger, bool quietly) {
 }
 
 fbl::RefPtr<ExceptionPort> ProcessDispatcher::exception_port() {
-    AutoLock lock(&exception_lock_);
+    AutoLock lock(&state_lock_);
     return exception_port_;
 }
 
 fbl::RefPtr<ExceptionPort> ProcessDispatcher::debugger_exception_port() {
-    AutoLock lock(&exception_lock_);
+    AutoLock lock(&state_lock_);
     return debugger_exception_port_;
 }
 
@@ -678,6 +672,23 @@ void ProcessDispatcher::OnExceptionPortRemoval(
     for (auto& thread : thread_list_) {
         thread.OnExceptionPortRemoval(eport);
     }
+}
+
+uint32_t ProcessDispatcher::ThreadCount() const {
+    canary_.Assert();
+
+    fbl::AutoLock lock(&state_lock_);
+    return static_cast<uint32_t>(thread_list_.size_slow());
+}
+
+size_t ProcessDispatcher::PageCount() const {
+    canary_.Assert();
+
+    AutoLock lock(&state_lock_);
+    if (state_ != State::RUNNING) {
+        return 0;
+    }
+    return aspace_->AllocatedPages();
 }
 
 class FindProcessByKoid final : public JobEnumerator {
@@ -740,7 +751,7 @@ zx_status_t ProcessDispatcher::QueryPolicy(uint32_t condition) const {
         thread_signal_policy_exception();
     }
     // TODO(cpu): check for the ZX_POL_KILL bit and return an error code
-    // that sysgen understands as termination.
+    // that abigen understands as termination.
     return (action & ZX_POL_ACTION_DENY) ? ZX_ERR_ACCESS_DENIED : ZX_OK;
 }
 

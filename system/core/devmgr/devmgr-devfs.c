@@ -12,6 +12,7 @@
 
 #include <zircon/device/vfs.h>
 
+#include <fdio/io.fidl.h>
 #include <fdio/remoteio.h>
 #include <fdio/util.h>
 
@@ -124,6 +125,15 @@ static void prepopulate_protocol_dirs(void) {
     }
 }
 
+void describe_error(zx_handle_t h, zx_status_t status) {
+    zxrio_describe_t msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.op = ZXRIO_ON_OPEN;
+    msg.status = status;
+    zx_channel_write(h, 0, &msg, sizeof(zxrio_describe_t), NULL, 0);
+    zx_handle_close(h);
+}
+
 static zx_status_t iostate_create(devnode_t* dn, zx_handle_t h) {
     iostate_t* ios = calloc(1, sizeof(iostate_t));
     if (ios == NULL) {
@@ -230,6 +240,9 @@ static zx_status_t devfs_watch(devnode_t* dn, zx_handle_t h, uint32_t mask) {
     if (mask & VFS_WATCH_MASK_EXISTING) {
         devnode_t* child;
         list_for_every_entry(&dn->children, child, devnode_t, node) {
+            if (child->device && (child->device->flags & DEV_CTX_INVISIBLE)) {
+                continue;
+            }
             //TODO: send multiple per write
             devfs_notify(dn, child->name, VFS_WATCH_EVT_EXISTING);
         }
@@ -284,6 +297,29 @@ static devnode_t* devfs_lookup(devnode_t* parent, const char* name) {
     return NULL;
 }
 
+void devfs_advertise(device_t* dev) {
+    if (dev->link) {
+        devnode_t* dir = proto_dir(dev->protocol_id);
+        devfs_notify(dir, dev->link->name, VFS_WATCH_EVT_ADDED);
+    }
+    if (dev->parent && dev->parent->self) {
+        devfs_notify(dev->parent->self, dev->self->name, VFS_WATCH_EVT_ADDED);
+    }
+}
+
+// TODO: generate a MODIFIED event rather than back to back REMOVED and ADDED
+void devfs_advertise_modified(device_t* dev) {
+    if (dev->link) {
+        devnode_t* dir = proto_dir(dev->protocol_id);
+        devfs_notify(dir, dev->link->name, VFS_WATCH_EVT_REMOVED);
+        devfs_notify(dir, dev->link->name, VFS_WATCH_EVT_ADDED);
+    }
+    if (dev->parent && dev->parent->self) {
+        devfs_notify(dev->parent->self, dev->self->name, VFS_WATCH_EVT_REMOVED);
+        devfs_notify(dev->parent->self, dev->self->name, VFS_WATCH_EVT_ADDED);
+    }
+}
+
 zx_status_t devfs_publish(device_t* parent, device_t* dev) {
     if ((parent->self == NULL) || (dev->self != NULL) || (dev->link != NULL)) {
         return ZX_ERR_INTERNAL;
@@ -294,7 +330,8 @@ zx_status_t devfs_publish(device_t* parent, device_t* dev) {
         return ZX_ERR_NO_MEMORY;
     }
 
-    if ((dev->protocol_id == ZX_PROTOCOL_MISC_PARENT) ||
+    if ((dev->protocol_id == ZX_PROTOCOL_TEST_PARENT) ||
+        (dev->protocol_id == ZX_PROTOCOL_MISC_PARENT) ||
         (dev->protocol_id == ZX_PROTOCOL_MISC)) {
         // misc devices are singletons, not a class
         // in the sense of other device classes.
@@ -311,8 +348,7 @@ zx_status_t devfs_publish(device_t* parent, device_t* dev) {
         const char* name = dev->name;
         size_t namelen = 0;
 
-        if ((dev->protocol_id != ZX_PROTOCOL_MISC) &&
-            (dev->protocol_id != ZX_PROTOCOL_CONSOLE)) {
+        if (dev->protocol_id != ZX_PROTOCOL_CONSOLE) {
 
             for (unsigned n = 0; n < 1000; n++) {
                 snprintf(tmp, sizeof(tmp), "%03u", (dir->seqcount++) % 1000);
@@ -337,31 +373,22 @@ got_name:
         // add link node to class directory
         list_add_tail(&dir->children, &dnlink->node);
         dev->link = dnlink;
-        devfs_notify(dir, dnlink->name, VFS_WATCH_EVT_ADDED);
     }
 
 done:
     // add self node to parent directory
     list_add_tail(&parent->self->children, &dnself->node);
     dev->self = dnself;
-    devfs_notify(parent->self, dnself->name, VFS_WATCH_EVT_ADDED);
+
+    if (!(dev->flags & DEV_CTX_INVISIBLE)) {
+        devfs_advertise(dev);
+    }
     return ZX_OK;
 }
 
 static void _devfs_remove(devnode_t* dn) {
     if (list_in_list(&dn->node)) {
         list_delete(&dn->node);
-    }
-
-    // disconnect from device
-    if (dn->device != NULL) {
-        if (dn->device->self == dn) {
-            dn->device->self = NULL;
-        }
-        if (dn->device->link == dn) {
-            dn->device->link = NULL;
-        }
-        dn->device = NULL;
     }
 
     // detach all connected iostates
@@ -372,7 +399,33 @@ static void _devfs_remove(devnode_t* dn) {
         ios->ph.handle = ZX_HANDLE_INVALID;
     }
 
-    devfs_notify(dn, "", VFS_WATCH_EVT_DELETED);
+    // notify own file watcher
+    if ((dn->device == NULL) ||
+        !(dn->device->flags & DEV_CTX_INVISIBLE)) {
+        devfs_notify(dn, "", VFS_WATCH_EVT_DELETED);
+    }
+
+    // disconnect from device and notify parent/link directory watchers
+    if (dn->device != NULL) {
+        if (dn->device->self == dn) {
+            dn->device->self = NULL;
+
+            if ((dn->device->parent != NULL) &&
+                (dn->device->parent->self != NULL) &&
+                !(dn->device->flags & DEV_CTX_INVISIBLE)) {
+                devfs_notify(dn->device->parent->self, dn->name, VFS_WATCH_EVT_REMOVED);
+            }
+        }
+        if (dn->device->link == dn) {
+            dn->device->link = NULL;
+
+            if (!(dn->device->flags & DEV_CTX_INVISIBLE)) {
+                devnode_t* dir = proto_dir(dn->device->protocol_id);
+                devfs_notify(dir, dn->name, VFS_WATCH_EVT_REMOVED);
+            }
+        }
+        dn->device = NULL;
+    }
 
     // destroy all watchers
     watcher_t* watcher;
@@ -422,6 +475,9 @@ again:
     devnode_t* child;
     list_for_every_entry(&dn->children, child, devnode_t, node) {
         if (!strcmp(child->name, name)) {
+            if(child->device && (child->device->flags & DEV_CTX_INVISIBLE)) {
+                continue;
+            }
             dn = child;
             goto again;
         }
@@ -445,14 +501,14 @@ static void devfs_open(devnode_t* dirdn, zx_handle_t h, char* path, uint32_t fla
     devnode_t* dn = dirdn;
     zx_status_t r = devfs_walk(&dn, path, &path);
 
-    bool pipeline = flags & O_PIPELINE;
+    bool describe = flags & ZX_FS_FLAG_DESCRIBE;
 
     if (r == ZX_ERR_NEXT) {
         // we only partially matched -- there's more path to walk
         if ((dn->device == NULL) || (dn->device->hrpc == ZX_HANDLE_INVALID)) {
             // no remote to pass this on to
             r = ZX_ERR_NOT_FOUND;
-        } else if (flags & (O_NOREMOTE | O_DIRECTORY)) {
+        } else if (flags & (ZX_FS_FLAG_NOREMOTE | ZX_FS_FLAG_DIRECTORY)) {
             // local requested, but this is remote only
             r = ZX_ERR_NOT_SUPPORTED;
         } else {
@@ -464,33 +520,47 @@ static void devfs_open(devnode_t* dirdn, zx_handle_t h, char* path, uint32_t fla
 
     if (r < 0) {
 fail:
-        if (!pipeline) {
-            zxrio_object_t obj;
-            obj.status = r;
-            obj.type = 0;
-            zx_channel_write(h, 0, &obj, ZXRIO_OBJECT_MINSIZE, NULL, 0);
+        if (describe) {
+            describe_error(h, r);
+        } else {
+            zx_handle_close(h);
         }
-        zx_handle_close(h);
         return;
     }
 
     // If we are a local-only node, or we are asked to not go remote,
     // or we are asked to open-as-a-directory, open locally:
-    if ((flags & (O_NOREMOTE | O_DIRECTORY)) || devnode_is_local(dn)) {
+    if ((flags & (ZX_FS_FLAG_NOREMOTE | ZX_FS_FLAG_DIRECTORY)) || devnode_is_local(dn)) {
         if ((r = iostate_create(dn, h)) < 0) {
             goto fail;
         }
-        if (!pipeline) {
-            zxrio_object_t obj;
-            obj.status = ZX_OK;
-            obj.type = FDIO_PROTOCOL_REMOTE;
-            zx_channel_write(h, 0, &obj, ZXRIO_OBJECT_MINSIZE, NULL, 0);
+        if (describe) {
+            zxrio_describe_t msg;
+            memset(&msg, 0, sizeof(msg));
+            msg.op = ZXRIO_ON_OPEN;
+            msg.status = ZX_OK;
+            msg.extra.tag = FDIO_PROTOCOL_DIRECTORY;
+            zx_channel_write(h, 0, &msg, sizeof(zxrio_describe_t), NULL, 0);
         }
         return;
     }
 
     // Otherwise we will pass the request on to the remote
     zxrio_msg_t msg;
+    uint32_t msize;
+#ifdef ZXRIO_FIDL
+    DirectoryOpenRequest* request = (DirectoryOpenRequest*) &msg;
+    memset(request, 0, sizeof(DirectoryOpenRequest));
+    request->hdr.ordinal = ZXFIDL_OPEN;
+    request->path.size = strlen(path);
+    request->path.data = (char*) FIDL_ALLOC_PRESENT;
+    request->flags = flags;
+    request->object = FIDL_HANDLE_PRESENT;
+    void* secondary = (void*)((uintptr_t)(request) +
+                              FIDL_ALIGN(sizeof(DirectoryOpenRequest)));
+    memcpy(secondary, path, request->path.size);
+    msize = FIDL_ALIGN(sizeof(DirectoryOpenRequest)) + FIDL_ALIGN(request->path.size);
+#else
     memset(&msg, 0, ZXRIO_HDR_SZ);
     msg.op = ZXRIO_OPEN;
     msg.datalen = strlen(path);
@@ -498,12 +568,17 @@ fail:
     msg.hcount = 1;
     msg.handle[0] = h;
     memcpy(msg.data, path, msg.datalen);
-
-    if ((r = zx_channel_write(dn->device->hrpc, 0, &msg, ZXRIO_HDR_SZ + msg.datalen,
-                              msg.handle, 1)) < 0) {
+    msize = ZXRIO_HDR_SZ + msg.datalen;
+#endif
+    if ((r = zx_channel_write(dn->device->hrpc, 0, &msg, msize, &h, 1)) < 0) {
         goto fail;
     }
 }
+
+// Double-check that OPEN (the only message we forward)
+// cannot be mistaken for an internal dev coordinator RPC message
+static_assert((ZXRIO_OPEN & DC_OP_ID_BIT) == 0, "");
+static_assert((ZXFIDL_OPEN & DC_OP_ID_BIT) == 0, "");
 
 static zx_status_t fill_dirent(vdirent_t* de, size_t delen,
                                const char* name, size_t len, uint32_t type) {
@@ -530,11 +605,18 @@ static zx_status_t devfs_readdir(devnode_t* dn, uint64_t* _ino, void* data, size
         if (child->ino <= ino) {
             continue;
         }
-        // "pure" directories (like /dev/class/$NAME) do not show up
-        // if they have no children, to avoid clutter and confusion.
-        // They remain openable, so they can be watched.
-        if ((child->device == NULL) && list_is_empty(&child->children)) {
-            continue;
+        if (child->device == NULL) {
+            // "pure" directories (like /dev/class/$NAME) do not show up
+            // if they have no children, to avoid clutter and confusion.
+            // They remain openable, so they can be watched.
+            if (list_is_empty(&child->children)) {
+                continue;
+            }
+        } else {
+            // invisible devices also do not show up
+            if (child->device->flags & DEV_CTX_INVISIBLE) {
+                continue;
+            }
         }
         ino = child->ino;
         zx_status_t r = fill_dirent(ptr, len, child->name, strlen(child->name),
@@ -557,86 +639,204 @@ static zx_status_t devfs_rio_handler(zxrio_msg_t* msg, void* cookie) {
         return ZX_ERR_PEER_CLOSED;
     }
 
-    // ensure handle count specified by opcode matches reality
-    if (msg->hcount != ZXRIO_HC(msg->op)) {
-        return ZX_ERR_IO;
-    }
-    msg->hcount = 0;
-
     uint32_t len = msg->datalen;
     int32_t arg = msg->arg;
-    msg->datalen = 0;
 
+    if (!ZXRIO_FIDL_MSG(msg->op)) {
+        // ensure handle count specified by opcode matches reality
+        if (msg->hcount != ZXRIO_HC(msg->op)) {
+            return ZX_ERR_IO;
+        }
+        msg->hcount = 0;
+        msg->datalen = 0;
+    }
+
+    zx_status_t r;
     switch (ZXRIO_OP(msg->op)) {
-    case ZXRIO_CLONE:
-        msg->data[0] = 0;
-        devfs_open(dn, msg->handle[0], (char*) msg->data, arg | O_NOREMOTE);
-        return ERR_DISPATCHER_INDIRECT;
-    case ZXRIO_OPEN:
-        if ((len < 1) || (len > 1024)) {
-            zx_handle_close(msg->handle[0]);
+    case ZXFIDL_CLONE:
+    case ZXRIO_CLONE: {
+        ObjectCloneRequest* request = (ObjectCloneRequest*) msg;
+        bool fidl = ZXRIO_FIDL_MSG(msg->op);
+        zx_handle_t h;
+        uint32_t flags;
+        if (fidl) {
+            h = request->object;
+            flags = request->flags;
         } else {
-            msg->data[len] = 0;
-            devfs_open(dn, msg->handle[0], (char*) msg->data, arg);
+            h = msg->handle[0];
+            flags = arg;
+        }
+        char path[PATH_MAX];
+        path[0] = '\0';
+        devfs_open(dn, h, path, flags | ZX_FS_FLAG_NOREMOTE);
+        return ERR_DISPATCHER_INDIRECT;
+    }
+    case ZXFIDL_OPEN:
+    case ZXRIO_OPEN: {
+        DirectoryOpenRequest* request = (DirectoryOpenRequest*) msg;
+        bool fidl = ZXRIO_FIDL_MSG(msg->op);
+        zx_handle_t h;
+        char* path;
+        uint32_t flags;
+        if (fidl) {
+            len = request->path.size;
+            path = request->path.data;
+            h = request->object;
+            flags = request->flags;
+        } else {
+            path = (char*) msg->data;
+            h = msg->handle[0];
+            flags = arg;
+        }
+        if ((len < 1) || (len > 1024)) {
+            zx_handle_close(h);
+        } else {
+            path[len] = '\0';
+            devfs_open(dn, h, path, flags);
         }
         return ERR_DISPATCHER_INDIRECT;
-    case ZXRIO_STAT:
+    }
+    case ZXFIDL_STAT:
+    case ZXRIO_STAT: {
+        bool fidl = ZXRIO_FIDL_MSG(msg->op);
+        NodeGetAttrResponse* response = (NodeGetAttrResponse*) msg;
+
+        uint32_t mode;
+        if (devnode_is_dir(dn)) {
+            mode = V_TYPE_DIR | V_IRUSR | V_IWUSR;
+        } else {
+            mode = V_TYPE_CDEV | V_IRUSR | V_IWUSR;
+        }
+
+        if (fidl) {
+            memset(&response->attributes, 0, sizeof(response->attributes));
+            response->attributes.mode = mode;
+            response->attributes.content_size = 0;
+            response->attributes.link_count = 1;
+            response->attributes.id = dn->ino;
+            return ZX_OK;
+        }
+
         msg->datalen = sizeof(vnattr_t);
         vnattr_t* attr = (void*)msg->data;
         memset(attr, 0, sizeof(vnattr_t));
-        if (devnode_is_dir(dn)) {
-            attr->mode = V_TYPE_DIR | V_IRUSR | V_IWUSR;
-        } else {
-            attr->mode = V_TYPE_CDEV | V_IRUSR | V_IWUSR;
-        }
+        attr->mode = mode;
         attr->size = 0;
         attr->nlink = 1;
+        attr->inode = dn->ino;
         return msg->datalen;
-    case ZXRIO_READDIR:
-        if (arg > FDIO_CHUNK_SIZE) {
+    }
+    case ZXFIDL_REWIND: {
+        ios->readdir_ino = 0;
+        return ZX_OK;
+    }
+    case ZXFIDL_READDIR:
+    case ZXRIO_READDIR: {
+        bool fidl = ZXRIO_FIDL_MSG(msg->op);
+        DirectoryReadDirentsRequest* request = (DirectoryReadDirentsRequest*) msg;
+        DirectoryReadDirentsResponse* response = (DirectoryReadDirentsResponse*) msg;
+        uint32_t max_out;
+        void* data;
+
+        if (fidl) {
+            data = (void*)((uintptr_t)(response) + FIDL_ALIGN(sizeof(DirectoryReadDirentsResponse)));
+            max_out = request->max_out;
+        } else {
+            max_out = arg;
+            if (msg->arg2.off == READDIR_CMD_RESET) {
+                ios->readdir_ino = 0;
+            }
+            data = msg->data;
+        }
+
+        if (max_out > FDIO_CHUNK_SIZE) {
             return ZX_ERR_INVALID_ARGS;
         }
-        if (msg->arg2.off == READDIR_CMD_RESET) {
-            ios->readdir_ino = 0;
-        }
-        zx_status_t r = devfs_readdir(dn, &ios->readdir_ino, msg->data, arg);
+        r = devfs_readdir(dn, &ios->readdir_ino, data, max_out);
         if (r >= 0) {
-            msg->datalen = r;
+            if (fidl) {
+                response->dirents.count = r;
+                r = ZX_OK;
+            } else {
+                msg->datalen = r;
+            }
         }
         return r;
-    case ZXRIO_IOCTL_1H:
-        switch (msg->arg2.op) {
+    }
+    case ZXFIDL_IOCTL:
+    case ZXRIO_IOCTL:
+    case ZXRIO_IOCTL_1H: {
+        bool fidl = ZXRIO_FIDL_MSG(msg->op);
+        NodeIoctlRequest* request = (NodeIoctlRequest*) msg;
+        NodeIoctlResponse* response = (NodeIoctlResponse*) msg;
+        void* secondary = (void*)((uintptr_t)(msg) + FIDL_ALIGN(sizeof(NodeIoctlResponse)));
+
+        uint32_t op;
+        void* in_data;
+        uint32_t inlen;
+        void* out_data;
+        uint32_t outmax;
+        zx_handle_t* handles;
+        if (fidl) {
+            op = request->opcode;
+            in_data = request->in.data;
+            inlen = request->in.count;
+            out_data = secondary;
+            outmax = request->max_out;
+            handles = (zx_handle_t*) request->handles.data;
+        } else {
+            op = msg->arg2.op;
+            in_data = msg->data;
+            inlen = len;
+            out_data = msg->data;
+            outmax = arg;
+            handles = msg->handle;
+        }
+
+        switch (op) {
         case IOCTL_VFS_WATCH_DIR: {
-            vfs_watch_dir_t* wd = (vfs_watch_dir_t*) msg->data;
-            if ((len != sizeof(vfs_watch_dir_t)) ||
+            vfs_watch_dir_t* wd = (vfs_watch_dir_t*) in_data;
+            if ((inlen != sizeof(vfs_watch_dir_t)) ||
                 (wd->options != 0) ||
                 (wd->mask & (~VFS_WATCH_MASK_ALL))) {
                 r = ZX_ERR_INVALID_ARGS;
             } else {
-                r = devfs_watch(dn, msg->handle[0], wd->mask);
+                r = devfs_watch(dn, handles[0], wd->mask);
             }
             if (r != ZX_OK) {
-                zx_handle_close(msg->handle[0]);
+                zx_handle_close(handles[0]);
+            }
+            if (fidl) {
+                r = r > 0 ? ZX_OK : r;
+                response->handles.count = 0;
+                response->out.count = 0;
             }
             return r;
         }
-        }
-        break;
-    case ZXRIO_IOCTL:
-        switch (msg->arg2.op) {
         case IOCTL_VFS_QUERY_FS: {
             const char* devfs_name = "devfs";
-            if (arg < (int32_t) (sizeof(vfs_query_info_t) + strlen(devfs_name))) {
+            if (outmax < sizeof(vfs_query_info_t) + strlen(devfs_name)) {
                 return ZX_ERR_INVALID_ARGS;
             }
-            vfs_query_info_t* info = (vfs_query_info_t*) msg->data;
+            vfs_query_info_t* info = (vfs_query_info_t*) out_data;
             memset(info, 0, sizeof(*info));
             memcpy(info->name, devfs_name, strlen(devfs_name));
-            msg->datalen = sizeof(vfs_query_info_t) + strlen(devfs_name);
-            return sizeof(vfs_query_info_t) + strlen(devfs_name);
+            size_t outlen = sizeof(vfs_query_info_t) + strlen(devfs_name);
+            if (fidl) {
+                response->handles.count = 0;
+                response->out.count = outlen;
+                response->out.data = secondary;
+                r = ZX_OK;
+            } else {
+                msg->datalen = outlen;
+                r = outlen;
+            }
+            return r;
         }
+        default:
+            return ZX_ERR_NOT_SUPPORTED;
         }
-        break;
+    }
     }
 
     // close inbound handles so they do not leak
@@ -673,7 +873,7 @@ zx_handle_t devfs_root_clone(void) {
     return fdio_service_clone(devfs_root);
 }
 
-void devmgr_init(zx_handle_t root_job) {
+void devfs_init(zx_handle_t root_job) {
     printf("devmgr: init\n");
 
     prepopulate_protocol_dirs();
@@ -693,6 +893,3 @@ void devmgr_init(zx_handle_t root_job) {
     devfs_root = h1;
 }
 
-void devmgr_handle_messages(void) {
-    coordinator();
-}

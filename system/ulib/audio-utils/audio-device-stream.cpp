@@ -11,9 +11,10 @@
 #include <zircon/device/audio.h>
 #include <zircon/process.h>
 #include <zircon/syscalls.h>
-#include <zx/channel.h>
-#include <zx/handle.h>
-#include <zx/vmo.h>
+#include <lib/zx/channel.h>
+#include <lib/zx/handle.h>
+#include <lib/zx/vmar.h>
+#include <lib/zx/vmo.h>
 #include <fbl/algorithm.h>
 #include <fbl/auto_call.h>
 #include <fbl/limits.h>
@@ -24,7 +25,7 @@
 namespace audio {
 namespace utils {
 
-static constexpr zx_duration_t CALL_TIMEOUT = ZX_MSEC(500);
+static constexpr zx::duration CALL_TIMEOUT = zx::msec(500);
 template <typename ReqType, typename RespType>
 zx_status_t DoCallImpl(const zx::channel& channel,
                        const ReqType&     req,
@@ -47,7 +48,7 @@ zx_status_t DoCallImpl(const zx::channel& channel,
     uint32_t bytes, handles;
     zx_status_t read_status, write_status;
 
-    write_status = channel.call(0, zx_deadline_after(CALL_TIMEOUT), &args, &bytes, &handles,
+    write_status = channel.call(0, zx::deadline_after(CALL_TIMEOUT), &args, &bytes, &handles,
                                 &read_status);
 
     if (write_status != ZX_OK) {
@@ -103,6 +104,10 @@ AudioDeviceStream::AudioDeviceStream(bool input, const char* dev_path)
     : input_(input) {
     strncpy(name_, dev_path, sizeof(name_));
     name_[sizeof(name_) - 1] = 0;
+}
+
+AudioDeviceStream::~AudioDeviceStream() {
+    Close();
 }
 
 zx_status_t AudioDeviceStream::Open() {
@@ -202,7 +207,7 @@ zx_status_t AudioDeviceStream::GetSupportedFormats(
 
         zx_signals_t pending_sig;
         res = stream_ch_.wait_one(ZX_CHANNEL_READABLE | ZX_CHANNEL_PEER_CLOSED,
-                                  zx_deadline_after(CALL_TIMEOUT),
+                                  zx::deadline_after(CALL_TIMEOUT),
                                   &pending_sig);
         if (res != ZX_OK) {
             printf("Failed to wait for next response after processing %u/%u formats (res %d)\n",
@@ -332,7 +337,7 @@ zx_status_t AudioDeviceStream::PlugMonitor(float duration) {
         while (true) {
             zx_signals_t pending;
             res = stream_ch_.wait_one(ZX_CHANNEL_PEER_CLOSED | ZX_CHANNEL_READABLE,
-                                      deadline, &pending);
+                                      zx::time(deadline), &pending);
 
             if ((res != ZX_OK) || (pending & ZX_CHANNEL_PEER_CLOSED)) {
                 if (res != ZX_ERR_TIMED_OUT)
@@ -371,14 +376,14 @@ zx_status_t AudioDeviceStream::PlugMonitor(float duration) {
                 duration);
 
         while (true) {
-            zx_time_t now = zx_time_get(ZX_CLOCK_MONOTONIC);
+            zx_time_t now = zx_clock_get(ZX_CLOCK_MONOTONIC);
             if (now >= deadline)
                 break;
 
             zx_time_t next_wake = fbl::min(deadline, now + ZX_MSEC(100u));
 
             zx_signals_t sigs;
-            zx_status_t res = stream_ch_.wait_one(ZX_CHANNEL_PEER_CLOSED, next_wake, &sigs);
+            zx_status_t res = stream_ch_.wait_one(ZX_CHANNEL_PEER_CLOSED, zx::time(next_wake), &sigs);
 
             if ((res != ZX_OK) && (res != ZX_ERR_TIMED_OUT)) {
                 printf("Error waiting on stream channel (res %d)\n", res);
@@ -447,6 +452,8 @@ zx_status_t AudioDeviceStream::SetFormat(uint32_t frames_per_second,
                 frames_per_second, channels, sample_format, res);
     }
 
+    external_delay_nsec_ = resp.external_delay_nsec;
+
     // TODO(johngro) : Verify the type of this handle before transferring it to
     // our ring buffer channel handle.
     rb_ch_.reset(tmp.release());
@@ -479,6 +486,7 @@ zx_status_t AudioDeviceStream::GetBuffer(uint32_t frames, uint32_t irqs_per_ring
         fifo_depth_ = resp.fifo_depth;
     }
 
+    uint64_t rb_sz;
     {
         // Get a VMO representing the ring buffer we will share with the audio driver.
         audio_rb_cmd_get_buffer_req_t  req;
@@ -500,22 +508,25 @@ zx_status_t AudioDeviceStream::GetBuffer(uint32_t frames, uint32_t irqs_per_ring
             return res;
         }
 
+        rb_sz = static_cast<uint64_t>(resp.num_ring_buffer_frames) * frame_sz_;
+
         // TODO(johngro) : Verify the type of this handle before transferring it to our VMO handle.
         rb_vmo_.reset(tmp.release());
     }
 
-    // We have the buffer, fetch the size the driver finally decided on.
-    uint64_t rb_sz;
-    res = rb_vmo_.get_size(&rb_sz);
+    // We have the buffer, fetch the underlying size of the VMO (a rounded up
+    // multiple of pages) and sanity check it against the effective size the
+    // driver reported.
+    uint64_t rb_page_sz;
+    res = rb_vmo_.get_size(&rb_page_sz);
     if (res != ZX_OK) {
         printf("Failed to fetch ring buffer VMO size (res %d)\n", res);
         return res;
     }
 
-    // Sanity check the size and stash it if it checks out.
-    if ((rb_sz > fbl::numeric_limits<decltype(rb_sz_)>::max()) || ((rb_sz % frame_sz_) != 0)) {
-        printf("Bad VMO size returned by audio driver! (size = %" PRIu64 " frame_sz = %u)\n",
-                rb_sz, frame_sz_);
+    if ((rb_sz > fbl::numeric_limits<decltype(rb_sz_)>::max()) || (rb_sz > rb_page_sz)) {
+        printf("Bad ring buffer size returned by audio driver! "
+               "(kernel size = %lu driver size = %lu)\n", rb_page_sz,  rb_sz);
         return ZX_ERR_INVALID_ARGS;
     }
 
@@ -526,9 +537,10 @@ zx_status_t AudioDeviceStream::GetBuffer(uint32_t frames, uint32_t irqs_per_ring
     uint32_t flags = input_
                    ? ZX_VM_FLAG_PERM_READ
                    : ZX_VM_FLAG_PERM_READ | ZX_VM_FLAG_PERM_WRITE;
-    res = zx_vmar_map(zx_vmar_root_self(), 0u,
-                      rb_vmo_.get(), 0u, rb_sz_,
-                      flags, reinterpret_cast<uintptr_t*>(&rb_virt_));
+    res = zx::vmar::root_self().map(0u, rb_vmo_,
+                                    0u, rb_sz_,
+                                    flags, reinterpret_cast<uintptr_t*>(&rb_virt_));
+
     if (res != ZX_OK) {
         printf("Failed to map ring buffer VMO (res %d)\n", res);
         return res;
@@ -555,7 +567,7 @@ zx_status_t AudioDeviceStream::StartRingBuffer() {
     zx_status_t res = DoCall(rb_ch_, req, &resp);
 
     if (res == ZX_OK) {
-        start_ticks_ = resp.start_ticks;
+        start_time_ = resp.start_time;
     }
 
     return res;
@@ -565,7 +577,7 @@ zx_status_t AudioDeviceStream::StopRingBuffer() {
     if (rb_ch_ == ZX_HANDLE_INVALID)
         return ZX_ERR_BAD_STATE;
 
-    start_ticks_ = 0;
+    start_time_ = 0;
 
     audio_rb_cmd_stop_req_t  req;
     audio_rb_cmd_stop_resp_t resp;
@@ -577,19 +589,27 @@ zx_status_t AudioDeviceStream::StopRingBuffer() {
 }
 
 void AudioDeviceStream::ResetRingBuffer() {
+    if (rb_virt_ != nullptr) {
+        ZX_DEBUG_ASSERT(rb_sz_ != 0);
+        zx::vmar::root_self().unmap(reinterpret_cast<uintptr_t>(rb_virt_), rb_sz_);
+    }
     rb_ch_.reset();
     rb_vmo_.reset();
     rb_sz_ = 0;
     rb_virt_ = nullptr;
 }
 
+void AudioDeviceStream::Close() {
+    ResetRingBuffer();
+    stream_ch_.reset();
+}
 
 bool AudioDeviceStream::IsChannelConnected(const zx::channel& ch) {
     if (!ch.is_valid())
         return false;
 
     zx_signals_t junk;
-    return ch.wait_one(ZX_CHANNEL_PEER_CLOSED, 0u, &junk) != ZX_ERR_TIMED_OUT;
+    return ch.wait_one(ZX_CHANNEL_PEER_CLOSED, zx::time(), &junk) != ZX_ERR_TIMED_OUT;
 }
 
 

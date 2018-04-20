@@ -21,11 +21,11 @@ and that the Handle has the required Rights for the requested operation.
 System calls fall into three broad categories, from an access standpoint:
 
 1. Calls which have no limitations, of which there are only a very few, for
-example [*zx_time_get()*](syscalls/time_get.md)
+example [*zx_clock_get()*](syscalls/clock_get.md)
 and [*zx_nanosleep()*](syscalls/nanosleep.md) may be called by any thread.
 2. Calls which take a Handle as the first parameter, denoting the Object they act upon,
 which are the vast majority, for example [*zx_channel_write()*](syscalls/channel_write.md)
-and [*zx_port_bind()*](syscalls/port_bind.md).
+and [*zx_port_queue()*](syscalls/port_queue.md).
 3. Calls which create new Objects but do not take a Handle, such as
 [*zx_event_create()*](syscalls/event_create.md) and
 [*zx_channel_create()*](syscalls/channel_create.md).  Access to these (and limitations
@@ -37,8 +37,8 @@ library that the Zircon kernel provides to userspace, better known as the
 They are C ELF ABI functions of the form *zx_noun_verb()* or
 *zx_noun_verb_direct-object()*.
 
-The system calls are defined by [syscalls.sysgen](../system/public/zircon/syscalls.sysgen)
-and processed by the [sysgen](../system/host/sysgen/) tool into include files and glue
+The system calls are defined by [syscalls.abigen](../system/public/zircon/syscalls.abigen)
+and processed by the [abigen](../system/host/abigen/) tool into include files and glue
 code in libzircon and the kernel's libsyscalls.
 
 
@@ -64,6 +64,20 @@ obtain additional Handles referring to the same Object as the Handle passed in,
 optionally with reduced Rights.  The [*zx_handle_close()*](syscalls/handle_close.md)
 system call closes a Handle, releasing the Object it refers to, if that Handle is
 the last one for that Object.
+
+
+## Kernel Object IDs
+
+Every object in the kernel has a "kernel object id" or "koid" for short.
+It is a 64 bit unsigned integer that can be used to identify the object
+and is unique for the lifetime of the running system.
+This means in particular that koids are never reused.
+
+There are two special koid values:
+
+*ZX_KOID_INVALID* Has the value zero and is used as a "null" sentinel.
+
+*ZX_KOID_KERNEL* There is only one kernel, and it has its own koid.
 
 
 ## Running Code: Jobs, Processes, and Threads.
@@ -110,8 +124,11 @@ any Handles they contained are closed.
 
 See: [channel_create](syscalls/channel_create.md),
 [channel_read](syscalls/channel_read.md),
-and [channel_write](syscalls/channel_write.md).
-
+[channel_write](syscalls/channel_write.md),
+[channel_call](syscalls/channel_call.md),
+[socket_create](syscalls/socket_create.md),
+[socket_read](syscalls/socket_read.md),
+and [socket_write](syscalls/socket_write.md).
 
 ## Objects and Signals
 
@@ -139,7 +156,7 @@ pending Signals.
 See: [port_create](syscalls/port_create.md),
 [port_queue](syscalls/port_queue.md),
 [port_wait](syscalls/port_wait.md),
-[port_bind](syscalls/port_bind.md).
+[port_cancel](syscalls/port_cancel.md).
 
 
 ## Events, Event Pairs.
@@ -198,9 +215,3 @@ mutexes, condition variables, etc, implemented in terms of Futexes.
 See: [futex_wait](syscalls/futex_wait.md),
 [futex_wake](syscalls/futex_wake.md),
 [futex_requeue](syscalls/futex_requeue.md).
-
-## Zircon Device Index
-
-The Zircon Device Index (MDI) is a read-only binary data structure passed from the bootloader
-that contains configuration information for the kernel and various drivers in zircon.
-See [mdi](mdi.md).

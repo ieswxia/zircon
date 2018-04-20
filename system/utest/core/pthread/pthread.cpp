@@ -16,10 +16,10 @@
 #include <zircon/syscalls.h>
 #include <unittest/unittest.h>
 
-pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
-pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
-int process_waked = 0;
-int thread_with_lock = 0;
+static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
+static int process_waked = 0;
+static int thread_with_lock = 0;
 
 static void log(const char* str) {
     struct timespec time;
@@ -82,7 +82,7 @@ static void* cond_thread1(void* arg) {
     pthread_mutex_lock(&mutex);
     log("thread 1 waiting on condition\n");
     pthread_cond_wait(&cond, &mutex);
-    log("thread 2 waiting again\n");
+    log("thread 1 waiting again\n");
     pthread_cond_wait(&cond, &mutex);
     process_waked++;
     pthread_mutex_unlock(&mutex);

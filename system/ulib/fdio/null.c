@@ -13,12 +13,6 @@
 
 #include "private.h"
 
-void fdio_free(fdio_t* io) {
-    io->magic = 0xDEAD0123;
-    io->ops = NULL;
-    free(io);
-}
-
 ssize_t fdio_default_read(fdio_t* io, void* _data, size_t len) {
     return 0;
 }
@@ -59,7 +53,7 @@ zx_status_t fdio_default_misc(fdio_t* io, uint32_t op, int64_t off, uint32_t arg
     return ZX_ERR_NOT_SUPPORTED;
 }
 
-zx_status_t fdio_default_open(fdio_t* io, const char* path, int32_t flags, uint32_t mode, fdio_t** out) {
+zx_status_t fdio_default_open(fdio_t* io, const char* path, uint32_t flags, uint32_t mode, fdio_t** out) {
     return ZX_ERR_NOT_SUPPORTED;
 }
 
@@ -96,7 +90,7 @@ ssize_t fdio_default_posix_ioctl(fdio_t* io, int req, va_list va) {
     return ZX_ERR_NOT_SUPPORTED;
 }
 
-zx_status_t fdio_default_get_vmo(fdio_t* io, zx_handle_t* out, size_t* off, size_t* len) {
+zx_status_t fdio_default_get_vmo(fdio_t* io, int flags, zx_handle_t* out) {
     return ZX_ERR_NOT_SUPPORTED;
 }
 
@@ -124,7 +118,7 @@ static fdio_ops_t zx_null_ops = {
 };
 
 fdio_t* fdio_null_create(void) {
-    fdio_t* io = calloc(1, sizeof(*io));
+    fdio_t* io = fdio_alloc(sizeof(*io));
     if (io == NULL) {
         return NULL;
     }

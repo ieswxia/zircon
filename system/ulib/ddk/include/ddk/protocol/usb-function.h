@@ -4,7 +4,7 @@
 
 #pragma once
 
-#include <ddk/iotxn.h>
+#include <ddk/usb-request.h>
 #include <zircon/compiler.h>
 #include <zircon/types.h>
 #include <zircon/hw/usb.h>
@@ -13,13 +13,9 @@ __BEGIN_CDECLS;
 
 // This protocol is used for USB peripheral function functions
 
-// protocol data for iotxns
-typedef struct {
-    uint8_t ep_address;     // bEndpointAddress from endpoint descriptor
-} usb_function_protocol_data_t;
-
 // callbacks implemented by the function driver
 typedef struct {
+
     // return the descriptor list for the function
     // TODO(voydanoff) - descriptors will likely vary (different max packet sizes, etc)
     // depending on whether we are in low/full, high or super speed mode.
@@ -71,6 +67,12 @@ static inline zx_status_t usb_function_set_interface(usb_function_interface_t* i
 }
 
 typedef struct {
+    zx_status_t (*req_alloc)(void* ctx, usb_request_t** out, uint64_t data_size,
+                             uint8_t ep_address);
+    zx_status_t (*req_alloc_vmo)(void* ctx, usb_request_t** out, zx_handle_t vmo_handle,
+                                 uint64_t vmo_offset, uint64_t length, uint8_t ep_address);
+    zx_status_t (*req_init)(void* ctx, usb_request_t* req, zx_handle_t vmo_handle,
+                            uint64_t vmo_offset, uint64_t length, uint8_t ep_address);
     zx_status_t (*register_func)(void* ctx, usb_function_interface_t* intf);
     zx_status_t (*alloc_interface)(void* ctx, uint8_t* out_intf_num);
     zx_status_t (*alloc_ep)(void* ctx, uint8_t direction, uint8_t* out_address);
@@ -78,7 +80,7 @@ typedef struct {
                              usb_ss_ep_comp_descriptor_t* ss_comp_desc);
     zx_status_t (*disable_ep)(void* ctx, uint8_t ep_addr);
     zx_status_t (*alloc_string_desc)(void* ctx, const char* string, uint8_t* out_index);
-    void (*queue)(void* ctx, iotxn_t* txn, uint8_t ep_address);
+    void (*queue)(void* ctx, usb_request_t* req);
     zx_status_t (*ep_set_stall)(void* ctx, uint8_t ep_address);
     zx_status_t (*ep_clear_stall)(void* ctx, uint8_t ep_address);
 } usb_function_protocol_ops_t;
@@ -87,6 +89,24 @@ typedef struct {
     usb_function_protocol_ops_t* ops;
     void* ctx;
 } usb_function_protocol_t;
+
+static inline zx_status_t usb_function_req_alloc(usb_function_protocol_t* usb, usb_request_t** out,
+                                                 uint64_t data_size, uint8_t ep_address) {
+    return usb->ops->req_alloc(usb->ctx, out, data_size, ep_address);
+}
+
+static inline zx_status_t usb_function_req_alloc_vmo(usb_function_protocol_t* usb,
+                                                     usb_request_t** out, zx_handle_t vmo_handle,
+                                                     uint64_t vmo_offset, uint64_t length,
+                                                     uint8_t ep_address) {
+    return usb->ops->req_alloc_vmo(usb->ctx, out, vmo_handle, vmo_offset, length, ep_address);
+}
+
+static inline zx_status_t usb_function_req_init(usb_function_protocol_t* usb, usb_request_t* req,
+                                                zx_handle_t vmo_handle, uint64_t vmo_offset,
+                                                uint64_t length, uint8_t ep_address) {
+    return usb->ops->req_init(usb->ctx, req, vmo_handle, vmo_offset, length, ep_address);
+}
 
 // registers the function driver's callback interface
 static inline void usb_function_register(usb_function_protocol_t* func,
@@ -127,10 +147,9 @@ static inline zx_status_t usb_function_alloc_string_desc(usb_function_protocol_t
     return func->ops->alloc_string_desc(func->ctx, string, out_index);
 }
 
-// helper for queueing an iotxn on an endpoint.
-static inline void usb_function_queue(usb_function_protocol_t* func, iotxn_t* txn,
-                                      uint8_t ep_address) {
-    return func->ops->queue(func->ctx, txn, ep_address);
+// helper for queueing a usb request on an endpoint.
+static inline void usb_function_queue(usb_function_protocol_t* func, usb_request_t* req) {
+    return func->ops->queue(func->ctx, req);
 }
 
 // stalls an endpoint

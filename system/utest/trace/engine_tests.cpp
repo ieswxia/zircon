@@ -10,7 +10,7 @@
 #include <fbl/string.h>
 #include <fbl/string_printf.h>
 #include <fbl/vector.h>
-#include <zx/event.h>
+#include <lib/zx/event.h>
 #include <trace-engine/instrumentation.h>
 
 namespace {
@@ -68,13 +68,13 @@ bool test_state() {
 bool test_is_enabled() {
     BEGIN_TRACE_TEST;
 
-    EXPECT_FALSE(trace_is_enabled(), "");
+    EXPECT_FALSE(trace_is_enabled());
 
     fixture_start_tracing();
-    EXPECT_TRUE(trace_is_enabled(), "");
+    EXPECT_TRUE(trace_is_enabled());
 
     fixture_stop_tracing();
-    EXPECT_FALSE(trace_is_enabled(), "");
+    EXPECT_FALSE(trace_is_enabled());
 
     END_TRACE_TEST;
 }
@@ -82,19 +82,19 @@ bool test_is_enabled() {
 bool test_is_category_enabled() {
     BEGIN_TRACE_TEST;
 
-    EXPECT_FALSE(trace_is_category_enabled("+enabled"), "");
-    EXPECT_FALSE(trace_is_category_enabled("-disabled"), "");
-    EXPECT_FALSE(trace_is_category_enabled(""), "");
+    EXPECT_FALSE(trace_is_category_enabled("+enabled"));
+    EXPECT_FALSE(trace_is_category_enabled("-disabled"));
+    EXPECT_FALSE(trace_is_category_enabled(""));
 
     fixture_start_tracing();
-    EXPECT_TRUE(trace_is_category_enabled("+enabled"), "");
-    EXPECT_FALSE(trace_is_category_enabled("-disabled"), "");
-    EXPECT_FALSE(trace_is_category_enabled(""), "");
+    EXPECT_TRUE(trace_is_category_enabled("+enabled"));
+    EXPECT_FALSE(trace_is_category_enabled("-disabled"));
+    EXPECT_FALSE(trace_is_category_enabled(""));
 
     fixture_stop_tracing();
-    EXPECT_FALSE(trace_is_category_enabled("+enabled"), "");
-    EXPECT_FALSE(trace_is_category_enabled("-disabled"), "");
-    EXPECT_FALSE(trace_is_category_enabled(""), "");
+    EXPECT_FALSE(trace_is_category_enabled("+enabled"));
+    EXPECT_FALSE(trace_is_category_enabled("-disabled"));
+    EXPECT_FALSE(trace_is_category_enabled(""));
 
     END_TRACE_TEST;
 }
@@ -120,16 +120,16 @@ bool test_observer() {
     EXPECT_EQ(ZX_OK, zx::event::create(0u, &event));
 
     EXPECT_EQ(ZX_OK, trace_register_observer(event.get()));
-    EXPECT_EQ(ZX_ERR_TIMED_OUT, event.wait_one(ZX_EVENT_SIGNALED, 0u, nullptr));
+    EXPECT_EQ(ZX_ERR_TIMED_OUT, event.wait_one(ZX_EVENT_SIGNALED, zx::time(), nullptr));
 
     fixture_start_tracing();
-    EXPECT_EQ(ZX_OK, event.wait_one(ZX_EVENT_SIGNALED, 0u, nullptr));
+    EXPECT_EQ(ZX_OK, event.wait_one(ZX_EVENT_SIGNALED, zx::time(), nullptr));
 
     EXPECT_EQ(ZX_OK, event.signal(ZX_EVENT_SIGNALED, 0u));
-    EXPECT_EQ(ZX_ERR_TIMED_OUT, event.wait_one(ZX_EVENT_SIGNALED, 0u, nullptr));
+    EXPECT_EQ(ZX_ERR_TIMED_OUT, event.wait_one(ZX_EVENT_SIGNALED, zx::time(), nullptr));
 
     fixture_stop_tracing();
-    EXPECT_EQ(ZX_OK, event.wait_one(ZX_EVENT_SIGNALED, 0u, nullptr));
+    EXPECT_EQ(ZX_OK, event.wait_one(ZX_EVENT_SIGNALED, zx::time(), nullptr));
 
     EXPECT_EQ(ZX_OK, trace_unregister_observer(event.get()));
 

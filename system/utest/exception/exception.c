@@ -19,32 +19,24 @@
 #include <zircon/process.h>
 #include <zircon/processargs.h>
 #include <zircon/syscalls.h>
+#include <zircon/syscalls/debug.h>
 #include <zircon/syscalls/exception.h>
 #include <zircon/syscalls/port.h>
 #include <zircon/threads.h>
 #include <test-utils/test-utils.h>
 #include <unittest/unittest.h>
 
-// 0.5 seconds
-#define WATCHDOG_DURATION_TICK ZX_MSEC(500)
-// 5 seconds
-#define WATCHDOG_DURATION_TICKS 10
-
 static int thread_func(void* arg);
 
 // argv[0]
 static char* program_path;
 
-static const char test_child_name[] = "test-child";
+// This is the key that is assigned to the port when bound.
+// This value appears in |packet.key| in all exception messages.
+static const uint64_t EXCEPTION_PORT_KEY = 0x6b6579; // "key"
 
-// Setting to true when done turns off the watchdog timer.  This
-// must be an atomic so that the compiler does not assume anything
-// about when it can be touched.  Otherwise, since the compiler
-// knows that vDSO calls don't make direct callbacks, it assumes
-// that nothing can happen inside the watchdog loop that would touch
-// this variable.  In fact, it will be touched in parallel by
-// another thread.
-static volatile atomic_bool done_tests;
+static const char test_child_name[] = "test-child";
+static const char exit_closing_excp_handle_child_name[] = "exit-closing-excp-handle";
 
 enum message {
     // Make the type of this enum signed so that we don't get a compile failure
@@ -151,19 +143,25 @@ static void resume_thread_from_exception(zx_handle_t process, zx_koid_t tid,
 
     status = zx_task_resume(thread, ZX_RESUME_EXCEPTION | flags);
     if (status < 0)
-        tu_fatal("zx_mark_exception_handled", status);
+        tu_fatal("resume_thread_from_exception", status);
     zx_handle_close(thread);
 }
 
-// Wait for and receive an exception on |eport|.
+// Wait for and receive an exception or signal on |eport|.
 
-static bool read_exception(zx_handle_t eport, zx_port_packet_t* packet)
+static bool read_packet(zx_handle_t eport, zx_port_packet_t* packet)
 {
-    ASSERT_EQ(zx_port_wait(eport, ZX_TIME_INFINITE, packet, 0), ZX_OK, "zx_port_wait failed");
-    ASSERT_EQ(packet->key, 0u, "bad report key");
-    unittest_printf("exception received: pid %"
-                    PRIu64 ", tid %" PRIu64 ", type %d\n",
-                    packet->exception.pid, packet->exception.tid, packet->type);
+    ASSERT_EQ(zx_port_wait(eport, ZX_TIME_INFINITE, packet, 1), ZX_OK, "zx_port_wait failed");
+    if (ZX_PKT_IS_SIGNAL_REP(packet->type)) {
+        unittest_printf("signal received: key %" PRIu64 ", observed 0x%x\n",
+                        packet->key, packet->signal.observed);
+    } else {
+        ASSERT_TRUE(ZX_PKT_IS_EXCEPTION(packet->type), "");
+        ASSERT_EQ(packet->key, EXCEPTION_PORT_KEY, "bad report key");
+        unittest_printf("exception received: pid %"
+                        PRIu64 ", tid %" PRIu64 ", type %d\n",
+                        packet->exception.pid, packet->exception.tid, packet->type);
+    }
     return true;
 }
 
@@ -173,14 +171,31 @@ static bool verify_exception(const zx_port_packet_t* packet,
                              zx_handle_t process,
                              zx_excp_type_t expected_type)
 {
-    EXPECT_EQ(packet->type, expected_type, "unexpected exception type");
+    ASSERT_EQ(packet->type, expected_type, "");
+    EXPECT_EQ(packet->key, EXCEPTION_PORT_KEY, "");
 
     // Verify the exception was from |process|.
     if (process != ZX_HANDLE_INVALID) {
-        zx_info_handle_basic_t process_info;
-        tu_handle_get_basic_info(process, &process_info);
-        EXPECT_EQ(process_info.koid, packet->exception.pid, "wrong process in exception report");
+        zx_koid_t pid = tu_get_koid(process);
+        EXPECT_EQ(pid, packet->exception.pid, "");
     }
+
+    return true;
+}
+
+// The bool result is because we use the unittest EXPECT/ASSERT macros.
+
+static bool verify_signal(const zx_port_packet_t* packet,
+                          uint64_t key,
+                          zx_signals_t expected_signals)
+{
+    ASSERT_TRUE(ZX_PKT_IS_SIGNAL_ONE(packet->type) ||
+                ZX_PKT_IS_SIGNAL_REP(packet->type),
+                "");
+
+    if (key != 0u)
+        EXPECT_EQ(packet->key, key, "");
+    EXPECT_TRUE(packet->signal.observed & expected_signals, "");
 
     return true;
 }
@@ -191,7 +206,7 @@ static bool read_and_verify_exception(zx_handle_t eport,
                                       zx_koid_t* tid)
 {
     zx_port_packet_t packet;
-    if (!read_exception(eport, &packet))
+    if (!read_packet(eport, &packet))
         return false;
     *tid = packet.exception.tid;
     return verify_exception(&packet, process, expected_type);
@@ -199,20 +214,30 @@ static bool read_and_verify_exception(zx_handle_t eport,
 
 // Wait for a process to exit, and while it's exiting verify we get the
 // expected exception reports.
+// The caller must have attached an async-wait for |process| to |eport|.
+// See start_test_child_with_eport().
 // We may receive thread-exit reports while the process is terminating but
-// any other kind of exception besides ZX_EXCP_GONE is an error.
+// any other kind of exception is an error.
 // This may be used when attached to the process or debugger exception port.
 // The bool result is because we use the unittest EXPECT/ASSERT macros.
 
 static bool wait_process_exit(zx_handle_t eport, zx_handle_t process) {
     zx_port_packet_t packet;
+    zx_koid_t pid = tu_get_koid(process);
 
     for (;;) {
-        if (!read_exception(eport, &packet))
+        unittest_printf("%s: calling read_packet\n", __func__);
+        if (!read_packet(eport, &packet))
             return false;
-        // If we get a process gone report then all threads have exited.
-        if (packet.type == ZX_EXCP_GONE)
-            break;
+        unittest_printf("%s: read_packet done\n", __func__);
+        // If we get a process exit signal then all threads have exited.
+        // Any other signal packet is an error.
+        if (ZX_PKT_IS_SIGNAL_ONE(packet.type) ||
+            ZX_PKT_IS_SIGNAL_REP(packet.type)) {
+            if (packet.key == pid && (packet.signal.observed & ZX_PROCESS_TERMINATED))
+                break;
+            ASSERT_TRUE(false, "");
+        }
         if (!verify_exception(&packet, process, ZX_EXCP_THREAD_EXITING))
             return false;
         // ZX_EXCP_THREAD_EXITING reports must normally be responded to.
@@ -221,17 +246,16 @@ static bool wait_process_exit(zx_handle_t eport, zx_handle_t process) {
         // need to resume them here.
     }
 
-    verify_exception(&packet, process, ZX_EXCP_GONE);
-    EXPECT_EQ(packet.exception.tid, 0u, "non-zero tid in process gone report");
-    // There is no reply to a "process gone" notification.
-
-    // The ZX_TASK_TERMINATED signal comes last.
+    // This isn't necessary, but it tests being able to wait on the process
+    // handle directly, after having waited on it via |eport|.
     tu_process_wait_signaled(process);
     return true;
 }
 
 // Wait for a process to exit, and while it's exiting verify we get the
 // expected exception reports.
+// The caller must have attached an async-wait for |process| to |eport|.
+// See start_test_child_with_eport().
 // N.B. This is only for use when attached to the debugger exception port:
 // only it gets thread-exit reports.
 // A thread-exit report for |tid| is expected to be seen.
@@ -243,32 +267,48 @@ static bool wait_process_exit(zx_handle_t eport, zx_handle_t process) {
 static bool wait_process_exit_from_debugger(zx_handle_t eport, zx_handle_t process, zx_koid_t tid) {
     bool tid_seen = false;
     zx_port_packet_t packet;
+    zx_koid_t pid = tu_get_koid(process);
 
     ASSERT_NE(tid, ZX_KOID_INVALID, "invalid koid");
 
     for (;;) {
-        if (!read_exception(eport, &packet))
+        unittest_printf("%s: calling read_packet\n", __func__);
+        if (!read_packet(eport, &packet))
             return false;
-        // If we get a process gone report then all threads have exited.
-        if (packet.type == ZX_EXCP_GONE)
-            break;
+        unittest_printf("%s: read_packet done\n", __func__);
+        // If we get a process exit signal then all threads have exited.
+        // Any other signal packet is an error.
+        if (ZX_PKT_IS_SIGNAL_ONE(packet.type) ||
+            ZX_PKT_IS_SIGNAL_REP(packet.type)) {
+            if (packet.key == pid && (packet.signal.observed & ZX_PROCESS_TERMINATED))
+                break;
+            ASSERT_TRUE(false, "");
+        }
         if (!verify_exception(&packet, process, ZX_EXCP_THREAD_EXITING))
             return false;
         if (packet.exception.tid == tid)
             tid_seen = true;
         // ZX_EXCP_THREAD_EXITING reports must normally be responded to.
         // However, when the process exits it kills all threads which will
-        // kick them out of the ExceptionHandlerExchange. Thus there's no
-        // need to resume them here.
+        // kick them out of the ExceptionHandlerExchange. So send this thread
+        // on its way, but it's ok if the thread is gone.
+        zx_handle_t thread;
+        zx_status_t status = zx_object_get_child(process, tid, ZX_RIGHT_SAME_RIGHTS, &thread);
+        if (status == ZX_OK) {
+            status = zx_task_resume(thread, ZX_RESUME_EXCEPTION);
+            if (status < 0) {
+                // If the resume failed the thread must be dying or dead.
+                EXPECT_EQ(status, ZX_ERR_BAD_STATE, "");
+                EXPECT_TRUE(tu_thread_is_dying_or_dead(thread), "");
+            }
+            zx_handle_close(thread);
+        }
     }
 
     EXPECT_TRUE(tid_seen, "missing ZX_EXCP_THREAD_EXITING report");
 
-    verify_exception(&packet, process, ZX_EXCP_GONE);
-    EXPECT_EQ(packet.exception.tid, 0u, "non-zero tid in process gone report");
-    // There is no reply to a "process gone" notification.
-
-    // The ZX_TASK_TERMINATED signal comes last.
+    // This isn't necessary, but it tests being able to wait on the process
+    // handle directly, after having waited on it via |eport|.
     tu_process_wait_signaled(process);
     return true;
 }
@@ -294,7 +334,7 @@ static void msg_loop(zx_handle_t channel)
     bool my_done_tests = false;
     zx_handle_t channel_to_thread = ZX_HANDLE_INVALID;
 
-    while (!done_tests && !my_done_tests)
+    while (!my_done_tests)
     {
         enum message msg;
         if (!recv_msg(channel, &msg)) {
@@ -329,8 +369,7 @@ static void msg_loop(zx_handle_t channel)
                 // debugger exception port is bound later.
                 if (ensure_child_running(channel_to_thread)) {
                     zx_handle_t thread_handle = thrd_get_zx_handle(thread);
-                    zx_handle_t copy = ZX_HANDLE_INVALID;
-                    zx_handle_duplicate(thread_handle, ZX_RIGHT_SAME_RIGHTS, &copy);
+                    zx_handle_t copy = tu_handle_duplicate(thread_handle);
                     send_msg_new_thread_handle(channel, copy);
                 } else {
                     // We could terminate the thread or some such, but the
@@ -380,21 +419,17 @@ static void __NO_RETURN test_child(void)
 static launchpad_t* setup_test_child(zx_handle_t job, const char* arg,
                                      zx_handle_t* out_channel)
 {
-    if (arg)
-        unittest_printf("Starting test child %s.\n", arg);
-    else
-        unittest_printf("Starting test child.\n");
+    unittest_printf("Starting test child %s.\n", arg);
     zx_handle_t our_channel, their_channel;
     tu_channel_create(&our_channel, &their_channel);
     const char* test_child_path = program_path;
     const char verbosity_string[] = { 'v', '=', utest_verbosity_level + '0', '\0' };
     const char* const argv[] = {
         test_child_path,
-        test_child_name,
-        verbosity_string,
         arg,
+        verbosity_string,
     };
-    int argc = countof(argv) - (arg == NULL);
+    int argc = countof(argv);
     zx_handle_t handles[1] = { their_channel };
     uint32_t handle_ids[1] = { PA_USER0 };
     *out_channel = our_channel;
@@ -412,7 +447,7 @@ static void start_test_child(zx_handle_t job, const char* arg,
     unittest_printf("Test child started.\n");
 }
 
-static void setup_test_child_with_eport(zx_handle_t job, const char* arg,
+static void start_test_child_with_eport(zx_handle_t job, const char* arg,
                                         zx_handle_t* out_child,
                                         zx_handle_t* out_eport,
                                         zx_handle_t* out_channel)
@@ -421,24 +456,15 @@ static void setup_test_child_with_eport(zx_handle_t job, const char* arg,
     zx_handle_t eport = tu_io_port_create();
     // Note: child is a borrowed handle, launchpad still owns it at this point.
     zx_handle_t child = launchpad_get_process_handle(lp);
-    tu_set_exception_port(child, eport, 0, ZX_EXCEPTION_PORT_DEBUGGER);
+    tu_set_exception_port(child, eport, EXCEPTION_PORT_KEY, ZX_EXCEPTION_PORT_DEBUGGER);
     child = tu_launch_fdio_fini(lp);
     // Now we own the child handle, and lp is destroyed.
+    // Note: This is a different handle, the previous child handle is gone at
+    // this point (transfered to the child process).
+    unittest_printf("child 0x%x, eport 0x%x\n", child, eport);
+    tu_object_wait_async(child, eport, ZX_PROCESS_TERMINATED);
     *out_child = child;
     *out_eport = eport;
-}
-
-static int watchdog_thread_func(void* arg)
-{
-    for (int i = 0; i < WATCHDOG_DURATION_TICKS; ++i)
-    {
-        zx_nanosleep(zx_deadline_after(WATCHDOG_DURATION_TICK));
-        if (atomic_load(&done_tests))
-            return 0;
-    }
-    unittest_printf_critical("\n\n*** WATCHDOG TIMER FIRED ***\n");
-    // This should *cleanly* kill the entire process, not just this thread.
-    exit(5);
 }
 
 // Tests binding and unbinding behavior.
@@ -606,7 +632,7 @@ static bool dead_process_unbind_helper(bool debugger, bool bind_while_alive) {
 
     // Start a new process.
     zx_handle_t child, our_channel;
-    start_test_child(zx_job_default(), NULL, &child, &our_channel);
+    start_test_child(zx_job_default(), test_child_name, &child, &our_channel);
 
     // Possibly bind an eport to it.
     zx_handle_t eport = ZX_HANDLE_INVALID;
@@ -618,7 +644,8 @@ static bool dead_process_unbind_helper(bool debugger, bool bind_while_alive) {
             ASSERT_TRUE(ensure_child_running(our_channel), "");
         }
         eport = tu_io_port_create();
-        tu_set_exception_port(child, eport, 0, options);
+        tu_set_exception_port(child, eport, EXCEPTION_PORT_KEY, options);
+        tu_object_wait_async(child, eport, ZX_PROCESS_TERMINATED);
     }
 
     // Tell the process to exit and wait for it.
@@ -699,15 +726,13 @@ static bool dead_thread_unbind_helper(bool bind_while_alive) {
 
     // Duplicate the thread's handle. thrd_join() will close the |thread|
     // handle, but we need to be able to refer to the thread after that.
-    zx_handle_t thread_copy = ZX_HANDLE_INVALID;
-    zx_handle_duplicate(thread, ZX_RIGHT_SAME_RIGHTS, &thread_copy);
-    ASSERT_NE(thread_copy, ZX_HANDLE_INVALID, "failed to copy thread handle");
+    zx_handle_t thread_copy = tu_handle_duplicate(thread);
 
     // Possibly bind an eport to it.
     zx_handle_t eport = ZX_HANDLE_INVALID;
     if (bind_while_alive) {
         eport = tu_io_port_create();
-        tu_set_exception_port(thread, eport, 0, 0);
+        tu_set_exception_port(thread, eport, EXCEPTION_PORT_KEY, 0);
     }
 
     // Tell the thread to exit and wait for it.
@@ -773,9 +798,9 @@ static bool job_handler_test(void)
 
     zx_handle_t job = tu_job_create(zx_job_default());
     zx_handle_t child, our_channel;
-    start_test_child(job, NULL, &child, &our_channel);
+    start_test_child(job, test_child_name, &child, &our_channel);
     zx_handle_t eport = tu_io_port_create();
-    tu_set_exception_port(job, eport, 0, 0);
+    tu_set_exception_port(job, eport, EXCEPTION_PORT_KEY, 0);
     REGISTER_CRASH(child);
 
     finish_basic_test(child, eport, our_channel, MSG_CRASH, ZX_EXCEPTION_PORT_TYPE_JOB);
@@ -791,9 +816,9 @@ static bool grandparent_job_handler_test(void)
     zx_handle_t parent_job = tu_job_create(grandparent_job);
     zx_handle_t job = tu_job_create(parent_job);
     zx_handle_t child, our_channel;
-    start_test_child(job, NULL, &child, &our_channel);
+    start_test_child(job, test_child_name, &child, &our_channel);
     zx_handle_t eport = tu_io_port_create();
-    tu_set_exception_port(grandparent_job, eport, 0, 0);
+    tu_set_exception_port(grandparent_job, eport, EXCEPTION_PORT_KEY, 0);
     REGISTER_CRASH(child);
 
     finish_basic_test(child, eport, our_channel, MSG_CRASH, ZX_EXCEPTION_PORT_TYPE_JOB);
@@ -809,9 +834,9 @@ static bool process_handler_test(void)
     unittest_printf("process exception handler basic test\n");
 
     zx_handle_t child, our_channel;
-    start_test_child(zx_job_default(), NULL, &child, &our_channel);
+    start_test_child(zx_job_default(), test_child_name, &child, &our_channel);
     zx_handle_t eport = tu_io_port_create();
-    tu_set_exception_port(child, eport, 0, 0);
+    tu_set_exception_port(child, eport, EXCEPTION_PORT_KEY, 0);
     REGISTER_CRASH(child);
 
     finish_basic_test(child, eport, our_channel, MSG_CRASH, ZX_EXCEPTION_PORT_TYPE_PROCESS);
@@ -824,13 +849,13 @@ static bool thread_handler_test(void)
     unittest_printf("thread exception handler basic test\n");
 
     zx_handle_t child, our_channel;
-    start_test_child(zx_job_default(), NULL, &child, &our_channel);
+    start_test_child(zx_job_default(), test_child_name, &child, &our_channel);
     zx_handle_t eport = tu_io_port_create();
     send_msg(our_channel, MSG_CREATE_AUX_THREAD);
     zx_handle_t thread;
     recv_msg_new_thread_handle(our_channel, &thread);
     if (thread != ZX_HANDLE_INVALID) {
-        tu_set_exception_port(thread, eport, 0, 0);
+        tu_set_exception_port(thread, eport, EXCEPTION_PORT_KEY, 0);
         REGISTER_CRASH(child);
         finish_basic_test(child, eport, our_channel, MSG_CRASH_AUX_THREAD, ZX_EXCEPTION_PORT_TYPE_THREAD);
         tu_handle_close(thread);
@@ -848,7 +873,7 @@ static bool debugger_handler_test(void)
     unittest_printf("debugger exception handler basic test\n");
 
     zx_handle_t child, our_channel;
-    start_test_child(zx_job_default(), NULL, &child, &our_channel);
+    start_test_child(zx_job_default(), test_child_name, &child, &our_channel);
 
     // We're binding to the debugger exception port so make sure the
     // child is running first so that we don't have to process
@@ -856,7 +881,7 @@ static bool debugger_handler_test(void)
     ASSERT_TRUE(ensure_child_running(our_channel), "");
 
     zx_handle_t eport = tu_io_port_create();
-    tu_set_exception_port(child, eport, 0, ZX_EXCEPTION_PORT_DEBUGGER);
+    tu_set_exception_port(child, eport, EXCEPTION_PORT_KEY, ZX_EXCEPTION_PORT_DEBUGGER);
 
     finish_basic_test(child, eport, our_channel, MSG_CRASH, ZX_EXCEPTION_PORT_TYPE_DEBUGGER);
     END_TEST;
@@ -867,13 +892,14 @@ static bool packet_pid_test(void)
     BEGIN_TEST;
 
     zx_handle_t child, eport, our_channel;
-    setup_test_child_with_eport(zx_job_default(), NULL, &child, &eport, &our_channel);
+    start_test_child_with_eport(zx_job_default(), test_child_name,
+                                &child, &eport, &our_channel);
 
     zx_info_handle_basic_t child_info;
     tu_handle_get_basic_info(child, &child_info);
 
     zx_port_packet_t start_packet;
-    ASSERT_TRUE(read_exception(eport, &start_packet), "error reading start exception");
+    ASSERT_TRUE(read_packet(eport, &start_packet), "error reading start exception");
     ASSERT_TRUE(verify_exception(&start_packet, child, ZX_EXCP_THREAD_STARTING),
                 "unexpected exception");
     zx_koid_t packet_pid = start_packet.exception.pid;
@@ -892,13 +918,91 @@ static bool packet_pid_test(void)
     END_TEST;
 }
 
+// Check that zx_thread_read_state() and zx_thread_write_state() both
+// return ZX_ERR_NOT_SUPPORTED.  This is used for testing the cases where a
+// thread is paused in the ZX_EXCP_THREAD_STARTING or or
+// ZX_EXCP_THREAD_EXITING states.
+static bool check_read_or_write_regs_is_rejected(zx_handle_t process,
+                                                 zx_handle_t tid)
+{
+    zx_handle_t thread;
+    ASSERT_EQ(zx_object_get_child(process, tid, ZX_RIGHT_SAME_RIGHTS, &thread), ZX_OK, "");
+    zx_thread_state_general_regs_t regs;
+    EXPECT_EQ(zx_thread_read_state(thread, ZX_THREAD_STATE_GENERAL_REGS, &regs, sizeof(regs)),
+              ZX_ERR_NOT_SUPPORTED, "");
+    EXPECT_EQ(zx_thread_write_state(thread, ZX_THREAD_STATE_GENERAL_REGS, &regs, sizeof(regs)),
+              ZX_ERR_NOT_SUPPORTED, "");
+    ASSERT_EQ(zx_handle_close(thread), ZX_OK, "");
+    return true;
+}
+
+// Test the behavior of zx_thread_read_state() and zx_thread_write_state()
+// when a thread is paused in the ZX_EXCP_THREAD_STARTING or
+// ZX_EXCP_THREAD_EXITING states.
+//
+// For ZX_EXCP_THREAD_EXITING, this tests the case where a thread is
+// exiting without the whole process also exiting.
+static bool thread_state_when_starting_or_exiting_test(void)
+{
+    BEGIN_TEST;
+
+    zx_handle_t child, eport, our_channel;
+    start_test_child_with_eport(zx_job_default(), test_child_name,
+                                &child, &eport, &our_channel);
+
+    // Wait for the ZX_EXCP_THREAD_STARTING message for the subprocess's
+    // initial thread.
+    zx_koid_t initial_tid;
+    ASSERT_TRUE(read_and_verify_exception(eport, child, ZX_EXCP_THREAD_STARTING,
+                                          &initial_tid), "");
+    EXPECT_TRUE(check_read_or_write_regs_is_rejected(child, initial_tid), "");
+    resume_thread_from_exception(child, initial_tid,
+                                 ZX_EXCEPTION_PORT_TYPE_DEBUGGER, 0);
+
+    // Tell the subprocess to create a second thread.
+    send_msg(our_channel, MSG_CREATE_AUX_THREAD);
+    // Wait for the ZX_EXCP_THREAD_STARTING message about that thread.
+    zx_koid_t tid;
+    ASSERT_TRUE(read_and_verify_exception(eport, child, ZX_EXCP_THREAD_STARTING,
+                                          &tid), "");
+    EXPECT_NE(tid, initial_tid, "");
+    EXPECT_TRUE(check_read_or_write_regs_is_rejected(child, tid), "");
+    resume_thread_from_exception(child, tid, ZX_EXCEPTION_PORT_TYPE_DEBUGGER,
+                                 0);
+
+    // Tell the second thread to exit.
+    send_msg(our_channel, MSG_SHUTDOWN_AUX_THREAD);
+    // Wait for the ZX_EXCP_THREAD_EXITING message about that thread.
+    zx_koid_t tid2;
+    ASSERT_TRUE(read_and_verify_exception(eport, child, ZX_EXCP_THREAD_EXITING,
+                                          &tid2), "");
+    EXPECT_EQ(tid2, tid, "");
+    EXPECT_TRUE(check_read_or_write_regs_is_rejected(child, tid), "");
+
+    // Clean up: Resume the thread so that the process can exit.
+    zx_handle_t thread;
+    ASSERT_EQ(zx_object_get_child(child, tid, ZX_RIGHT_SAME_RIGHTS, &thread),
+              ZX_OK, "");
+    ASSERT_EQ(zx_task_resume(thread, ZX_RESUME_EXCEPTION), ZX_OK, "");
+    tu_handle_close(thread);
+    // Clean up: Tell the process to exit and wait for it to exit.
+    send_msg(our_channel, MSG_DONE);
+    tu_process_wait_signaled(child);
+    tu_handle_close(child);
+    tu_handle_close(eport);
+    tu_handle_close(our_channel);
+
+    END_TEST;
+}
+
 static bool process_start_test(void)
 {
     BEGIN_TEST;
     unittest_printf("process start test\n");
 
     zx_handle_t child, eport, our_channel;
-    setup_test_child_with_eport(zx_job_default(), NULL, &child, &eport, &our_channel);
+    start_test_child_with_eport(zx_job_default(), test_child_name,
+                                &child, &eport, &our_channel);
 
     zx_koid_t tid;
     if (read_and_verify_exception(eport, child, ZX_EXCP_THREAD_STARTING, &tid)) {
@@ -914,16 +1018,20 @@ static bool process_start_test(void)
     END_TEST;
 }
 
-static bool process_gone_notification_test(void)
+// Verify ZX_PROCESS_TERMINATED comes through bound exception port
+// via async wait.
+
+static bool process_exit_notification_test(void)
 {
     BEGIN_TEST;
-    unittest_printf("process gone notification test\n");
+    unittest_printf("process exit notification test\n");
 
     zx_handle_t child, our_channel;
-    start_test_child(zx_job_default(), NULL, &child, &our_channel);
+    start_test_child(zx_job_default(), test_child_name, &child, &our_channel);
 
     zx_handle_t eport = tu_io_port_create();
-    tu_set_exception_port(child, eport, 0, 0);
+    tu_set_exception_port(child, eport, EXCEPTION_PORT_KEY, 0);
+    tu_object_wait_async(child, eport, ZX_PROCESS_TERMINATED);
 
     send_msg(our_channel, MSG_DONE);
 
@@ -936,10 +1044,13 @@ static bool process_gone_notification_test(void)
     END_TEST;
 }
 
-static bool thread_gone_notification_test(void)
+// Verify ZX_THREAD_TERMINATED comes through bound exception port
+// via async wait.
+
+static bool thread_exit_notification_test(void)
 {
     BEGIN_TEST;
-    unittest_printf("thread gone notification test\n");
+    unittest_printf("thread exit notification test\n");
 
     zx_handle_t our_channel, their_channel;
     tu_channel_create(&our_channel, &their_channel);
@@ -947,21 +1058,27 @@ static bool thread_gone_notification_test(void)
     thrd_t thread;
     tu_thread_create_c11(&thread, thread_func, (void*) (uintptr_t) their_channel, "thread-gone-test-thread");
     zx_handle_t thread_handle = thrd_get_zx_handle(thread);
-    // Attach to the thread exception report as we're testing for ZX_EXCP_GONE
+
+    // |thread_handle| isn't usable to us, the thread exits before we're done
+    // with the handle. So make a copy.
+    zx_handle_t thread_handle_copy = tu_handle_duplicate(thread_handle);
+
+    // Attach to the thread exception report as we're testing for ZX_THREAD_TERMINATED
     // reports from the thread here.
-    tu_set_exception_port(thread_handle, eport, 0, 0);
+    tu_set_exception_port(thread_handle_copy, eport, EXCEPTION_PORT_KEY, 0);
+    tu_object_wait_async(thread_handle_copy, eport, ZX_THREAD_TERMINATED);
 
     send_msg(our_channel, MSG_DONE);
-    // TODO(dje): The passing of "self" here is wip.
-    zx_koid_t tid;
-    if (read_and_verify_exception(eport, ZX_HANDLE_INVALID /*self*/, ZX_EXCP_GONE, &tid)) {
-        ASSERT_GT(tid, 0u, "tid not >= 0");
-    }
-    // there's no reply to a "gone" notification
+
+    zx_port_packet_t packet;
+    ASSERT_TRUE(read_packet(eport, &packet), "");
+    zx_koid_t tid = tu_get_koid(thread_handle_copy);
+    ASSERT_TRUE(verify_signal(&packet, tid, ZX_THREAD_TERMINATED), "");
 
     // thrd_join doesn't provide a timeout, but we have the watchdog for that.
     thrd_join(thread, NULL);
 
+    tu_handle_close(thread_handle_copy);
     tu_handle_close(eport);
     tu_handle_close(our_channel);
 
@@ -1024,6 +1141,49 @@ static void __NO_RETURN trigger_hw_bkpt(void)
     trigger_unsupported();
 }
 
+// ARM does not trap on integer divide-by-zero.
+#if defined(__x86_64__)
+static void __NO_RETURN trigger_integer_divide_by_zero(void)
+{
+    // Use an x86 division instruction (rather than doing division from C)
+    // to ensure that the compiler does not convert the division into
+    // something else.
+    uint32_t result;
+    __asm__ volatile("idivb %1"
+                     : "=a"(result)
+                     : "r"((uint8_t) 0), "a"((uint16_t) 1));
+    trigger_unsupported();
+}
+
+static void __NO_RETURN trigger_sse_divide_by_zero(void)
+{
+    // Unmask all exceptions for SSE operations.
+    uint32_t mxcsr = 0;
+    __asm__ volatile("ldmxcsr %0" : : "m"(mxcsr));
+
+    double a = 1;
+    double b = 0;
+    __asm__ volatile("divsd %1, %0" : "+x"(a) : "x"(b));
+    trigger_unsupported();
+}
+
+static void __NO_RETURN trigger_x87_divide_by_zero(void)
+{
+    // Unmask all exceptions for x87 operations.
+    uint16_t control_word = 0;
+    __asm__ volatile("fldcw %0" : : "m"(control_word));
+
+    double a = 1;
+    double b = 0;
+    __asm__ volatile("fldl %0\n"
+                     "fdivl %1\n"
+                     // Check for the pending exception.
+                     "fwait\n"
+                     : : "m"(a), "m"(b));
+    trigger_unsupported();
+}
+#endif
+
 static const struct {
     zx_excp_type_t type;
     const char* name;
@@ -1035,6 +1195,11 @@ static const struct {
     { ZX_EXCP_UNDEFINED_INSTRUCTION, "undefined-insn", true, trigger_undefined_insn },
     { ZX_EXCP_SW_BREAKPOINT, "sw-bkpt", true, trigger_sw_bkpt },
     { ZX_EXCP_HW_BREAKPOINT, "hw-bkpt", false, trigger_hw_bkpt },
+#if defined(__x86_64__)
+    { ZX_EXCP_GENERAL, "integer-divide-by-zero", true, trigger_integer_divide_by_zero },
+    { ZX_EXCP_GENERAL, "sse-divide-by-zero", true, trigger_sse_divide_by_zero },
+    { ZX_EXCP_GENERAL, "x87-divide-by-zero", true, trigger_x87_divide_by_zero },
+#endif
 };
 
 static void __NO_RETURN trigger_exception(const char* excp_name)
@@ -1067,7 +1232,7 @@ static bool trigger_test(void)
         const char *excp_name = exceptions[i].name;
         zx_handle_t child, eport, our_channel;
         char* arg = tu_asprintf("trigger=%s", excp_name);
-        setup_test_child_with_eport(zx_job_default(), arg,
+        start_test_child_with_eport(zx_job_default(), arg,
                                     &child, &eport, &our_channel);
         free(arg);
 
@@ -1080,11 +1245,12 @@ static bool trigger_test(void)
         resume_thread_from_exception(child, tid, ZX_EXCEPTION_PORT_TYPE_DEBUGGER, 0);
 
         zx_port_packet_t packet;
-        if (read_exception(eport, &packet)) {
+        if (read_packet(eport, &packet)) {
             // ZX_EXCP_THREAD_EXITING reports must normally be responded to.
             // However, when the process exits it kills all threads which will
             // kick them out of the ExceptionHandlerExchange. Thus there's no
             // need to resume them here.
+            ASSERT_TRUE(ZX_PKT_IS_EXCEPTION(packet.type), "");
             if (packet.type != ZX_EXCP_THREAD_EXITING) {
                 tid = packet.exception.tid;
                 verify_exception(&packet, child, excp_type);
@@ -1095,6 +1261,13 @@ static bool trigger_test(void)
                 if (read_and_verify_exception(eport, child, ZX_EXCP_THREAD_EXITING, &tid2)) {
                     ASSERT_EQ(tid2, tid, "exiting tid mismatch");
                 }
+            } else {
+                EXPECT_EQ(packet.exception.tid, tid, "");
+                // Either the process exited cleanly because the exception
+                // is unsupported, or it exited because exception processing
+                // finished and the kernel killed the process. Either way
+                // the process is dead thus there's no need to resume the
+                // thread.
             }
 
             // We've already seen tid's thread-exit report, so just skip that
@@ -1152,19 +1325,20 @@ static bool walkthrough_setup(walkthrough_state_t* state)
     state->thread_eport = tu_io_port_create();
     state->debugger_eport = tu_io_port_create();
 
-    start_test_child(state->job, NULL, &state->child, &state->our_channel);
+    start_test_child(state->job, test_child_name,
+                     &state->child, &state->our_channel);
 
     send_msg(state->our_channel, MSG_CREATE_AUX_THREAD);
     recv_msg_new_thread_handle(state->our_channel, &state->thread);
     ASSERT_NE(state->thread, ZX_HANDLE_INVALID, "");
     state->tid = tu_get_koid(state->thread);
 
-    tu_set_exception_port(state->grandparent_job, state->grandparent_job_eport, 0, 0);
-    tu_set_exception_port(state->parent_job, state->parent_job_eport, 0, 0);
-    tu_set_exception_port(state->job, state->job_eport, 0, 0);
-    tu_set_exception_port(state->child, state->child_eport, 0, 0);
-    tu_set_exception_port(state->thread, state->thread_eport, 0, 0);
-    tu_set_exception_port(state->child, state->debugger_eport, 0, ZX_EXCEPTION_PORT_DEBUGGER);
+    tu_set_exception_port(state->grandparent_job, state->grandparent_job_eport, EXCEPTION_PORT_KEY, 0);
+    tu_set_exception_port(state->parent_job, state->parent_job_eport, EXCEPTION_PORT_KEY, 0);
+    tu_set_exception_port(state->job, state->job_eport, EXCEPTION_PORT_KEY, 0);
+    tu_set_exception_port(state->child, state->child_eport, EXCEPTION_PORT_KEY, 0);
+    tu_set_exception_port(state->thread, state->thread_eport, EXCEPTION_PORT_KEY, 0);
+    tu_set_exception_port(state->child, state->debugger_eport, EXCEPTION_PORT_KEY, ZX_EXCEPTION_PORT_DEBUGGER);
 
     // Non-debugger exception ports don't get synthetic exceptions like
     // ZX_EXCP_THREAD_STARTING. We have to trigger an architectural exception.
@@ -1288,8 +1462,7 @@ static bool unbind_while_stopped_test(void)
     unittest_printf("unbind_while_stopped tests\n");
 
     zx_handle_t child, eport, our_channel;
-    const char* arg = "";
-    setup_test_child_with_eport(zx_job_default(), arg,
+    start_test_child_with_eport(zx_job_default(), test_child_name,
                                 &child, &eport, &our_channel);
 
     {
@@ -1317,14 +1490,13 @@ static bool unbind_rebind_while_stopped_test(void)
     unittest_printf("unbind_rebind_while_stopped tests\n");
 
     zx_handle_t child, eport, our_channel;
-    const char* arg = "";
-    setup_test_child_with_eport(zx_job_default(), arg,
+    start_test_child_with_eport(zx_job_default(), test_child_name,
                                 &child, &eport, &our_channel);
 
     zx_port_packet_t start_packet;
     // Assert reading the start packet succeeds because otherwise the rest
     // of the test is moot.
-    ASSERT_TRUE(read_exception(eport, &start_packet), "error reading start exception");
+    ASSERT_TRUE(read_packet(eport, &start_packet), "error reading start exception");
     ASSERT_TRUE(verify_exception(&start_packet, child, ZX_EXCP_THREAD_STARTING),
                 "unexpected exception");
     zx_koid_t tid = start_packet.exception.tid;
@@ -1353,7 +1525,7 @@ static bool unbind_rebind_while_stopped_test(void)
     // Rebind and fetch the exception report, it should match the one
     // we just got.
 
-    tu_set_exception_port(child, eport, 0, ZX_EXCEPTION_PORT_DEBUGGER);
+    tu_set_exception_port(child, eport, EXCEPTION_PORT_KEY, ZX_EXCEPTION_PORT_DEBUGGER);
 
     // Verify exception report matches current exception.
     zx_exception_report_t report;
@@ -1390,8 +1562,7 @@ static bool kill_while_stopped_at_start_test(void)
     unittest_printf("kill_while_stopped_at_start tests\n");
 
     zx_handle_t child, eport, our_channel;
-    const char* arg = "";
-    setup_test_child_with_eport(zx_job_default(), arg,
+    start_test_child_with_eport(zx_job_default(), test_child_name,
                                 &child, &eport, &our_channel);
 
     zx_koid_t tid;
@@ -1467,6 +1638,8 @@ static bool multiple_threads_registered_death_test(void)
         tu_thread_create_c11(&thread, thread_func,
                              (void*)(uintptr_t)thread_info[i].their_channel,
                              "registered-death-thread");
+        // Note: We're assuming the thread won't exit before we're done with
+        // the result of thrd_get_zx_handle.
         thread_info[i].thread_handle = thrd_get_zx_handle(thread);
         REGISTER_CRASH(thread_info[i].thread_handle);
     }
@@ -1490,6 +1663,51 @@ static bool multiple_threads_registered_death_test(void)
     END_TEST;
 }
 
+static void __NO_RETURN test_child_exit_closing_excp_handle(void)
+{
+    unittest_printf("Exit closing excp handle starting.\n");
+
+    // Test ZX-1544. Process termination closing the last handle of the eport
+    // should not cause a panic.
+    zx_handle_t eport = tu_io_port_create();
+    tu_set_exception_port(zx_process_self(), eport, EXCEPTION_PORT_KEY, 0);
+    exit(0);
+
+    /* NOTREACHED */
+}
+
+static bool exit_closing_excp_handle_test(void)
+{
+    BEGIN_TEST;
+
+    unittest_printf("Starting test child.\n");
+
+    const char* test_child_path = program_path;
+    const char verbosity_string[] = { 'v', '=', utest_verbosity_level + '0', '\0' };
+    const char* const argv[] = {
+        test_child_path,
+        exit_closing_excp_handle_child_name,
+        verbosity_string,
+    };
+    int argc = countof(argv);
+
+    launchpad_t* lp = tu_launch_fdio_init(zx_job_default(),
+                                          exit_closing_excp_handle_child_name,
+                                          argc, argv,
+                                          NULL, 0, NULL, NULL);
+    zx_handle_t child = tu_launch_fdio_fini(lp);
+
+    zx_signals_t signals = ZX_PROCESS_TERMINATED;
+    zx_signals_t pending;
+    zx_status_t result = tu_wait(1, &child, &signals, &pending, ZX_TIME_INFINITE);
+    EXPECT_EQ(result, ZX_OK, "");
+    EXPECT_TRUE(pending & ZX_PROCESS_TERMINATED, "");
+
+    EXPECT_EQ(tu_process_get_return_code(child), 0, "");
+
+    END_TEST;
+}
+
 BEGIN_TEST_CASE(exceptions_tests)
 RUN_TEST(job_set_close_set_test);
 RUN_TEST(process_set_close_set_test);
@@ -1509,9 +1727,10 @@ RUN_TEST_ENABLE_CRASH_HANDLER(grandparent_job_handler_test);
 RUN_TEST_ENABLE_CRASH_HANDLER(process_handler_test);
 RUN_TEST_ENABLE_CRASH_HANDLER(thread_handler_test);
 RUN_TEST(packet_pid_test);
+RUN_TEST(thread_state_when_starting_or_exiting_test);
 RUN_TEST(process_start_test);
-RUN_TEST(process_gone_notification_test);
-RUN_TEST(thread_gone_notification_test);
+RUN_TEST(process_exit_notification_test);
+RUN_TEST(thread_exit_notification_test);
 RUN_TEST_ENABLE_CRASH_HANDLER(trigger_test);
 RUN_TEST(unbind_walkthrough_by_reset_test);
 RUN_TEST(unbind_walkthrough_by_close_test);
@@ -1521,15 +1740,18 @@ RUN_TEST(kill_while_stopped_at_start_test);
 RUN_TEST(death_test);
 RUN_TEST_ENABLE_CRASH_HANDLER(self_death_test);
 RUN_TEST_ENABLE_CRASH_HANDLER(multiple_threads_registered_death_test);
+RUN_TEST(exit_closing_excp_handle_test);
 END_TEST_CASE(exceptions_tests)
 
-static void check_verbosity(int argc, char** argv)
+static void scan_argv(int argc, char** argv)
 {
     for (int i = 1; i < argc; ++i) {
         if (strncmp(argv[i], "v=", 2) == 0) {
             int verbosity = atoi(argv[i] + 2);
             unittest_set_verbosity_level(verbosity);
-            break;
+        } else if (strncmp(argv[i], "ts=", 3) == 0) {
+            int scale = atoi(argv[i] + 3);
+            tu_set_timeout_scale(scale);
         }
     }
 }
@@ -1548,24 +1770,29 @@ static const char* check_trigger(int argc, char** argv)
 int main(int argc, char **argv)
 {
     program_path = argv[0];
+    scan_argv(argc, argv);
 
-    if (argc >= 2 && strcmp(argv[1], test_child_name) == 0) {
-        check_verbosity(argc, argv);
+    if (argc >= 2) {
         const char* excp_name = check_trigger(argc, argv);
-        if (excp_name)
+        if (excp_name) {
             test_child_trigger(excp_name);
-        else
+            return 0;
+        }
+        if (strcmp(argv[1], test_child_name) == 0) {
             test_child();
-        return 0;
+            return 0;
+        }
+        if (strcmp(argv[1], exit_closing_excp_handle_child_name) == 0) {
+            test_child_exit_closing_excp_handle();
+            /* NOTREACHED */
+        }
     }
 
-    thrd_t watchdog_thread;
-    tu_thread_create_c11(&watchdog_thread, watchdog_thread_func, NULL, "watchdog-thread");
+    tu_watchdog_start();
 
     bool success = unittest_run_all_tests(argc, argv);
 
-    atomic_store(&done_tests, true);
-    // TODO: Add an alarm as thrd_join doesn't provide a timeout.
-    thrd_join(watchdog_thread, NULL);
+    tu_watchdog_cancel();
+
     return success ? 0 : -1;
 }

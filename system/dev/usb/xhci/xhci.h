@@ -17,9 +17,11 @@
 #include <ddk/protocol/pci.h>
 #include <ddk/protocol/platform-device.h>
 #include <ddk/protocol/usb-bus.h>
+#include <ddk/usb-request.h>
 
 #include "xhci-hw.h"
 #include "xhci-root-hub.h"
+#include "xhci-transfer-common.h"
 #include "xhci-trb.h"
 
 // choose ring sizes to allow each ring to fit in a single page
@@ -34,42 +36,42 @@
 
 #define ISOCH_INTERRUPTER 1
 
-// state for endpoint's current transfer
-typedef struct {
-    iotxn_phys_iter_t   phys_iter;
-    uint32_t            packet_count;       // remaining packets to send
-    uint8_t             ep_type;
-    uint8_t             direction;
-    bool                needs_data_event;   // true if we still need to queue data event TRB
-    bool                needs_status;       // true if we still need to queue status TRB
-    bool                needs_transfer_trb; // true if we still need to queue transfer TRB
-} xhci_transfer_state_t;
+#if __x86_64__
+// cache is coherent on x86, so we always use cached buffers
+#define XHCI_IO_BUFFER_UNCACHED 0
+#else
+#define XHCI_IO_BUFFER_UNCACHED IO_BUFFER_UNCACHED
+#endif
 
 typedef enum {
-    EP_STATE_DEAD = 0,      // device does not exist or has been removed
+    EP_STATE_DEAD = 0, // device does not exist or has been removed
     EP_STATE_RUNNING,
-    EP_STATE_HALTED,        // halted due to stall or error condition
-    EP_STATE_PAUSED,        // temporarily stopped for canceling a transfer
-    EP_STATE_DISABLED,      // endpoint is not enabled
+    EP_STATE_HALTED,   // halted due to stall
+    EP_STATE_PAUSED,   // temporarily stopped for canceling a transfer
+    EP_STATE_DISABLED, // endpoint is not enabled
+    EP_STATE_ERROR,    // endpoint has error condition
 } xhci_ep_state_t;
 
 typedef struct {
-    xhci_endpoint_context_t* epc;
+    const xhci_endpoint_context_t* epc;
     xhci_transfer_ring_t transfer_ring;
-    list_node_t queued_txns;    // iotxns waiting to be processed
-    iotxn_t* current_txn;       // iotxn currently being processed
-    list_node_t pending_txns;   // processed txns waiting for completion, including current_txn
-    xhci_transfer_state_t* transfer_state;  // transfer state for current_txn
+    list_node_t queued_reqs;     // requests waiting to be processed
+    usb_request_t* current_req;  // request currently being processed
+    list_node_t pending_reqs;    // processed requests waiting for completion, including current_req
+    xhci_transfer_state_t* transfer_state;  // transfer state for current_req
     mtx_t lock;
     xhci_ep_state_t state;
+    uint16_t max_packet_size;
+    uint8_t ep_type;
 } xhci_endpoint_t;
 
 typedef struct xhci_slot {
     // buffer for our device context
     io_buffer_t buffer;
-    xhci_slot_context_t* sc;
+    const xhci_slot_context_t* sc;
     // epcs point into DMA memory past sc
     xhci_endpoint_t eps[XHCI_NUM_EPS];
+    usb_request_t* current_ctrl_req;
     uint32_t hub_address;
     uint32_t port;
     uint32_t rh_port;
@@ -100,17 +102,20 @@ struct xhci {
     usb_bus_interface_t bus;
 
     xhci_mode_t mode;
+    atomic_bool suspended;
 
     // Desired number of interrupters. This may be greater than what is
     // supported by hardware. The actual number of interrupts configured
     // will not exceed this, and is stored in num_interrupts.
 #define INTERRUPTER_COUNT 2
+    thrd_t completer_threads[INTERRUPTER_COUNT];
     zx_handle_t irq_handles[INTERRUPTER_COUNT];
-    zx_handle_t mmio_handle;
-    thrd_t irq_thread;
+    // actual number of interrupts we are using
+    uint32_t num_interrupts;
 
-    // used by the start thread
-    zx_device_t* parent;
+    zx_handle_t mmio_handle;
+    void* mmio;
+    size_t mmio_size;
 
     // PCI support
     pci_protocol_t pci;
@@ -141,13 +146,9 @@ struct xhci {
 
     size_t page_size;
     size_t max_slots;
-    uint32_t num_interrupts;
     size_t context_size;
     // true if controller supports large ESIT payloads
     bool large_esit;
-
-    // For reading and writing to the USBSTS register from completer threads.
-    mtx_t usbsts_lock;
 
     // total number of ports for the root hub
     uint32_t rh_num_ports;
@@ -194,16 +195,29 @@ struct xhci {
     io_buffer_t scratch_pad_pages_buffer;
     // VMO buffer for scratch pad index
     io_buffer_t scratch_pad_index_buffer;
+
+    zx_handle_t bti_handle;
+
+    // pool of control requests that can be reused
+    usb_request_pool_t free_reqs;
 };
 
-zx_status_t xhci_init(xhci_t* xhci, void* mmio, xhci_mode_t mode, uint32_t num_interrupts);
-int xhci_get_ep_ctx_state(xhci_endpoint_t* ep);
+zx_status_t xhci_init(xhci_t* xhci, xhci_mode_t mode, uint32_t num_interrupts);
+// Returns the max number of interrupters supported by the xhci.
+// This is different to xhci->num_interrupts.
+uint32_t xhci_get_max_interrupters(xhci_t* xhci);
+int xhci_get_slot_ctx_state(xhci_slot_t* slot);
+int xhci_get_ep_ctx_state(xhci_slot_t* slot, xhci_endpoint_t* ep);
+void xhci_set_dbcaa(xhci_t* xhci, uint32_t slot_id, zx_paddr_t paddr);
 zx_status_t xhci_start(xhci_t* xhci);
 void xhci_handle_interrupt(xhci_t* xhci, uint32_t interrupter);
 void xhci_post_command(xhci_t* xhci, uint32_t command, uint64_t ptr, uint32_t control_bits,
                        xhci_command_context_t* context);
 void xhci_wait_bits(volatile uint32_t* ptr, uint32_t bits, uint32_t expected);
 void xhci_wait_bits64(volatile uint64_t* ptr, uint64_t bits, uint64_t expected);
+
+void xhci_stop(xhci_t* xhci);
+void xhci_free(xhci_t* xhci);
 
 // returns monotonically increasing frame count
 uint64_t xhci_get_current_frame(xhci_t* xhci);
@@ -220,3 +234,5 @@ static inline bool xhci_is_root_hub(xhci_t* xhci, uint32_t device_id) {
 // upper layer routines in usb-xhci.c
 zx_status_t xhci_add_device(xhci_t* xhci, int slot_id, int hub_address, int speed);
 void xhci_remove_device(xhci_t* xhci, int slot_id);
+
+void xhci_request_queue(xhci_t* xhci, usb_request_t* req);

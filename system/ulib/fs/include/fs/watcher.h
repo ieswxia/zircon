@@ -14,7 +14,7 @@
 #include <fbl/unique_ptr.h>
 #include <fs/vfs.h>
 #include <zircon/device/vfs.h>
-#include <zx/channel.h>
+#include <lib/zx/channel.h>
 
 namespace fs {
 
@@ -24,12 +24,11 @@ public:
     WatcherContainer();
     ~WatcherContainer();
 
-    zx_status_t WatchDir(zx::channel* out);
-    zx_status_t WatchDirV2(Vfs* vfs, Vnode* vn, const vfs_watch_dir_t* cmd);
+    zx_status_t WatchDir(Vfs* vfs, Vnode* vn, const vfs_watch_dir_t* cmd);
 
     // Notifies all VnodeWatchers in the watch list, if their mask
     // indicates they are interested in the incoming event.
-    void Notify(const char* name, size_t len, unsigned event);
+    void Notify(fbl::StringPiece name, unsigned event);
 private:
     DISALLOW_COPY_ASSIGN_AND_MOVE(WatcherContainer);
 

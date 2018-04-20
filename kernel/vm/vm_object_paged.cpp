@@ -12,15 +12,16 @@
 #include <assert.h>
 #include <err.h>
 #include <fbl/alloc_checker.h>
+#include <fbl/auto_call.h>
 #include <fbl/auto_lock.h>
 #include <inttypes.h>
-#include <kernel/vm.h>
 #include <lib/console.h>
-#include <safeint/safe_math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <trace.h>
 #include <vm/fault.h>
+#include <vm/physmap.h>
+#include <vm/vm.h>
 #include <vm/vm_address_region.h>
 #include <zircon/types.h>
 
@@ -31,7 +32,7 @@ using fbl::AutoLock;
 namespace {
 
 void ZeroPage(paddr_t pa) {
-    void* ptr = paddr_to_kvaddr(pa);
+    void* ptr = paddr_to_physmap(pa);
     DEBUG_ASSERT(ptr);
 
     arch_zero_page(ptr);
@@ -46,14 +47,30 @@ void InitializeVmPage(vm_page_t* p) {
     DEBUG_ASSERT(p->state == VM_PAGE_STATE_ALLOC);
     p->state = VM_PAGE_STATE_OBJECT;
     p->object.pin_count = 0;
-    p->object.contiguous_pin = 0;
+}
+
+// round up the size to the next page size boundary and make sure we dont wrap
+zx_status_t RoundSize(uint64_t size, uint64_t* out_size) {
+    *out_size = ROUNDUP_PAGE_SIZE(size);
+    if (*out_size < size)
+        return ZX_ERR_OUT_OF_RANGE;
+
+    // there's a max size to keep indexes within range
+    if (*out_size > VmObjectPaged::MAX_SIZE)
+        return ZX_ERR_OUT_OF_RANGE;
+
+    return ZX_OK;
 }
 
 } // namespace
 
-VmObjectPaged::VmObjectPaged(uint32_t pmm_alloc_flags, fbl::RefPtr<VmObject> parent)
-    : VmObject(fbl::move(parent)), pmm_alloc_flags_(pmm_alloc_flags) {
+VmObjectPaged::VmObjectPaged(uint32_t pmm_alloc_flags, uint64_t size, fbl::RefPtr<VmObject> parent,
+                             bool is_contiguous)
+    : VmObject(fbl::move(parent)), size_(size), pmm_alloc_flags_(pmm_alloc_flags),
+      is_contiguous_(is_contiguous) {
     LTRACEF("%p\n", this);
+
+    DEBUG_ASSERT(IS_PAGE_ALIGNED(size_));
 }
 
 VmObjectPaged::~VmObjectPaged() {
@@ -62,8 +79,8 @@ VmObjectPaged::~VmObjectPaged() {
     LTRACEF("%p\n", this);
 
     page_list_.ForEveryPage(
-        [](const auto p, uint64_t off) {
-            if (p->object.contiguous_pin) {
+        [this](const auto p, uint64_t off) {
+            if (this->is_contiguous()) {
                 p->object.pin_count--;
             }
             ASSERT(p->object.pin_count == 0);
@@ -75,21 +92,87 @@ VmObjectPaged::~VmObjectPaged() {
 }
 
 zx_status_t VmObjectPaged::Create(uint32_t pmm_alloc_flags, uint64_t size, fbl::RefPtr<VmObject>* obj) {
-    // there's a max size to keep indexes within range
-    if (size > MAX_SIZE)
-        return ZX_ERR_INVALID_ARGS;
+    // make sure size is page aligned
+    zx_status_t status = RoundSize(size, &size);
+    if (status != ZX_OK)
+        return status;
 
     fbl::AllocChecker ac;
-    auto vmo = fbl::AdoptRef<VmObject>(new (&ac) VmObjectPaged(pmm_alloc_flags, nullptr));
+    auto vmo = fbl::AdoptRef<VmObject>(new (&ac) VmObjectPaged(pmm_alloc_flags, size, nullptr,
+                                                               false /* is_contiguous */));
     if (!ac.check())
         return ZX_ERR_NO_MEMORY;
 
-    auto err = vmo->Resize(size);
-    if (err != ZX_OK)
-        return err;
-
     *obj = fbl::move(vmo);
 
+    return ZX_OK;
+}
+
+zx_status_t VmObjectPaged::CreateContiguous(uint32_t pmm_alloc_flags, uint64_t size,
+                                            uint8_t alignment_log2, fbl::RefPtr<VmObject>* obj) {
+    DEBUG_ASSERT(alignment_log2 < sizeof(uint64_t) * 8);
+    // make sure size is page aligned
+    zx_status_t status = RoundSize(size, &size);
+    if (status != ZX_OK) {
+        return status;
+    }
+
+    fbl::AllocChecker ac;
+    auto vmo = fbl::AdoptRef<VmObject>(new (&ac) VmObjectPaged(pmm_alloc_flags, size, nullptr,
+                                                               true /* is_contiguous */));
+    if (!ac.check()) {
+        return ZX_ERR_NO_MEMORY;
+    }
+
+    if (size == 0) {
+        *obj = fbl::move(vmo);
+        return ZX_OK;
+    }
+
+    // allocate the pages
+    list_node page_list;
+    list_initialize(&page_list);
+
+    size_t num_pages = size / PAGE_SIZE;
+    size_t allocated = pmm_alloc_contiguous(num_pages, pmm_alloc_flags, alignment_log2, nullptr, &page_list);
+    if (allocated != num_pages) {
+        LTRACEF("failed to allocate enough pages (asked for %zu, got %zu)\n", num_pages, allocated);
+        pmm_free(&page_list);
+        return ZX_ERR_NO_MEMORY;
+    }
+    auto cleanup_phys_pages = fbl::MakeAutoCall([&page_list]() {
+        pmm_free(&page_list);
+    });
+
+    DEBUG_ASSERT(list_length(&page_list) == allocated);
+
+    // add them to the appropriate range of the object
+    VmObjectPaged* vmop = static_cast<VmObjectPaged*>(vmo.get());
+    for (uint64_t off = 0; off < size; off += PAGE_SIZE) {
+        vm_page_t* p = list_remove_head_type(&page_list, vm_page_t, free.node);
+        ASSERT(p);
+
+        InitializeVmPage(p);
+
+        // TODO: remove once pmm returns zeroed pages
+        ZeroPage(p);
+
+        // We don't need thread-safety analysis here, since this VMO has not
+        // been shared anywhere yet.
+        [&]() TA_NO_THREAD_SAFETY_ANALYSIS {
+            status = vmop->page_list_.AddPage(p, off);
+        }();
+        if (status != ZX_OK) {
+            return status;
+        }
+
+        // Mark the pages as pinned, so they can't be physically rearranged
+        // underneath us.
+        p->object.pin_count++;
+    }
+
+    cleanup_phys_pages.cancel();
+    *obj = fbl::move(vmo);
     return ZX_OK;
 }
 
@@ -98,20 +181,28 @@ zx_status_t VmObjectPaged::CloneCOW(uint64_t offset, uint64_t size, bool copy_na
 
     canary_.Assert();
 
+    // make sure size is page aligned
+    zx_status_t status = RoundSize(size, &size);
+    if (status != ZX_OK)
+        return status;
+
+    // allocate the clone up front outside of our lock
     fbl::AllocChecker ac;
-    auto vmo = fbl::AdoptRef<VmObjectPaged>(new (&ac) VmObjectPaged(pmm_alloc_flags_, fbl::WrapRefPtr(this)));
+    auto vmo = fbl::AdoptRef<VmObjectPaged>(new (&ac) VmObjectPaged(pmm_alloc_flags_, size, fbl::WrapRefPtr(this),
+                                                                    false /* is_contiguous */));
     if (!ac.check())
         return ZX_ERR_NO_MEMORY;
 
     AutoLock a(&lock_);
 
-    // add it as a child to us
+    // add the new VMO as a child before we do anything, since its
+    // dtor expects to find it in its parent's child list
     AddChildLocked(vmo.get());
 
-    // set the new clone's size
-    auto status = vmo->ResizeLocked(size);
-    if (status != ZX_OK)
-        return status;
+    // check that we're not uncached in some way
+    if (cache_policy_ != ARCH_MMU_FLAG_CACHED) {
+        return ZX_ERR_BAD_STATE;
+    }
 
     // set the offset with the parent
     status = vmo->SetParentOffsetLocked(offset);
@@ -207,6 +298,8 @@ zx_status_t VmObjectPaged::AddPageLocked(vm_page_t* p, uint64_t offset) {
 }
 
 zx_status_t VmObjectPaged::CreateFromROData(const void* data, size_t size, fbl::RefPtr<VmObject>* obj) {
+    LTRACEF("data %p, size %zu\n", data, size);
+
     fbl::RefPtr<VmObject> vmo;
     zx_status_t status = Create(PMM_ALLOC_FLAG_ANY, size, &vmo);
     if (status != ZX_OK)
@@ -246,14 +339,6 @@ zx_status_t VmObjectPaged::CreateFromROData(const void* data, size_t size, fbl::
             auto vmo2 = static_cast<VmObjectPaged*>(vmo.get());
             vmo2->AddPage(page, count * PAGE_SIZE);
         }
-
-        // TODO(mcgrathr): If the last reference to this VMO were released
-        // so the VMO got destroyed, that would attempt to return these
-        // pages to the system.  On arm and arm64, the kernel cannot
-        // tolerate a hole being created in the kernel image mapping, so
-        // bad things happen.  Until that issue is fixed, just leak a
-        // reference here so that the new VMO will never be destroyed.
-        vmo.reset(vmo.leak_ref());
     }
 
     *obj = fbl::move(vmo);
@@ -295,14 +380,14 @@ zx_status_t VmObjectPaged::GetPageLocked(uint64_t offset, uint pf_flags, list_no
 
     // if we have a parent see if they have a page for us
     if (parent_) {
-        safeint::CheckedNumeric<uint64_t> parent_offset = parent_offset_;
-        parent_offset += offset;
-        DEBUG_ASSERT(parent_offset.IsValid());
+        uint64_t parent_offset;
+        bool overflowed = add_overflow(parent_offset_, offset, &parent_offset);
+        ASSERT(!overflowed);
 
         // make sure we don't cause the parent to fault in new pages, just ask for any that already exist
         uint parent_pf_flags = pf_flags & ~(VMM_PF_FLAG_FAULT_MASK);
 
-        zx_status_t status = parent_->GetPageLocked(parent_offset.ValueOrDie(), parent_pf_flags,
+        zx_status_t status = parent_->GetPageLocked(parent_offset, parent_pf_flags,
                                                     nullptr, &p, &pa);
         if (status == ZX_OK) {
             // we have a page from them. if we're read-only faulting, return that page so they can map
@@ -337,8 +422,8 @@ zx_status_t VmObjectPaged::GetPageLocked(uint64_t offset, uint pf_flags, list_no
             InitializeVmPage(p_clone);
 
             // do a direct copy of the two pages
-            const void* src = paddr_to_kvaddr(pa);
-            void* dst = paddr_to_kvaddr(pa_clone);
+            const void* src = paddr_to_physmap(pa);
+            void* dst = paddr_to_physmap(pa_clone);
 
             DEBUG_ASSERT(src && dst);
 
@@ -393,6 +478,13 @@ zx_status_t VmObjectPaged::GetPageLocked(uint64_t offset, uint pf_flags, list_no
 
     // TODO: remove once pmm returns zeroed pages
     ZeroPage(pa);
+
+    // if ARM and not fully cached, clean/invalidate the page after zeroing it
+#if ARCH_ARM64
+    if (cache_policy_ != ARCH_MMU_FLAG_CACHED) {
+        arch_clean_invalidate_cache_range((addr_t)paddr_to_physmap(pa), PAGE_SIZE);
+    }
+#endif
 
     zx_status_t status = AddPageLocked(p, offset);
     DEBUG_ASSERT(status == ZX_OK);
@@ -494,96 +586,16 @@ zx_status_t VmObjectPaged::CommitRange(uint64_t offset, uint64_t len, uint64_t* 
     return ZX_OK;
 }
 
-zx_status_t VmObjectPaged::CommitRangeContiguous(uint64_t offset, uint64_t len, uint64_t* committed,
-                                                 uint8_t alignment_log2) {
-    canary_.Assert();
-    LTRACEF("offset %#" PRIx64 ", len %#" PRIx64 ", alignment %hhu\n", offset, len, alignment_log2);
-
-    if (committed)
-        *committed = 0;
-
-    AutoLock a(&lock_);
-
-    // This function does not support cloned VMOs.
-    if (unlikely(parent_)) {
-        return ZX_ERR_NOT_SUPPORTED;
-    }
-
-    // trim the size
-    uint64_t new_len;
-    if (!TrimRange(offset, len, size_, &new_len))
-        return ZX_ERR_OUT_OF_RANGE;
-
-    // was in range, just zero length
-    if (new_len == 0)
-        return ZX_OK;
-
-    // compute a page aligned end to do our searches in to make sure we cover all the pages
-    uint64_t end = ROUNDUP_PAGE_SIZE(offset + new_len);
-    DEBUG_ASSERT(end > offset);
-
-    // make a pass through the list, making sure we have an empty run on the object
-    size_t count = 0;
-    for (uint64_t o = offset; o < end; o += PAGE_SIZE) {
-        if (!page_list_.GetPage(o))
-            count++;
-    }
-
-    DEBUG_ASSERT(count == new_len / PAGE_SIZE);
-    if (count != new_len / PAGE_SIZE) {
-        return ZX_ERR_BAD_STATE;
-    }
-
-    // allocate count number of pages
-    list_node page_list;
-    list_initialize(&page_list);
-
-    size_t allocated = pmm_alloc_contiguous(count, pmm_alloc_flags_, alignment_log2, nullptr, &page_list);
-    if (allocated < count) {
-        LTRACEF("failed to allocate enough pages (asked for %zu, got %zu)\n", count, allocated);
-        pmm_free(&page_list);
-        return ZX_ERR_NO_MEMORY;
-    }
-
-    DEBUG_ASSERT(list_length(&page_list) == allocated);
-
-    // unmap all of the pages in this range on all the mapping regions
-    RangeChangeUpdateLocked(offset, end - offset);
-
-    // add them to the appropriate range of the object
-    for (uint64_t o = offset; o < end; o += PAGE_SIZE) {
-        vm_page_t* p = list_remove_head_type(&page_list, vm_page_t, free.node);
-        ASSERT(p);
-
-        InitializeVmPage(p);
-
-        // TODO: remove once pmm returns zeroed pages
-        ZeroPage(p);
-
-        auto status = page_list_.AddPage(p, o);
-        DEBUG_ASSERT(status == ZX_OK);
-
-        // Mark the pages as pinned, so they can't be physically rearranged
-        // underneath us.
-        p->object.pin_count++;
-        p->object.contiguous_pin = true;
-
-        if (committed)
-            *committed += PAGE_SIZE;
-    }
-
-    // for now we only support committing as much as we were asked for
-    DEBUG_ASSERT(!committed || *committed == count * PAGE_SIZE);
-
-    return ZX_OK;
-}
-
 zx_status_t VmObjectPaged::DecommitRange(uint64_t offset, uint64_t len, uint64_t* decommitted) {
     canary_.Assert();
     LTRACEF("offset %#" PRIx64 ", len %#" PRIx64 "\n", offset, len);
 
     if (decommitted)
         *decommitted = 0;
+
+    if (is_contiguous_) {
+        return ZX_ERR_NOT_SUPPORTED;
+    }
 
     AutoLock a(&lock_);
 
@@ -617,6 +629,7 @@ zx_status_t VmObjectPaged::DecommitRange(uint64_t offset, uint64_t len, uint64_t
     RangeChangeUpdateLocked(start, page_aligned_len);
 
     // iterate through the pages, freeing them
+    // TODO: use page_list iterator, move pages to list, free at once
     while (start < end) {
         auto status = page_list_.FreePage(start);
         if (status == ZX_OK && decommitted) {
@@ -744,44 +757,45 @@ zx_status_t VmObjectPaged::ResizeLocked(uint64_t s) {
 
     LTRACEF("vmo %p, size %" PRIu64 "\n", this, s);
 
-    // there's a max size to keep indexes within range
-    if (s > MAX_SIZE)
-        return ZX_ERR_OUT_OF_RANGE;
+    // round up the size to the next page size boundary and make sure we dont wrap
+    zx_status_t status = RoundSize(s, &s);
+    if (status != ZX_OK)
+        return status;
+
+    // make sure everything is aligned before we get started
+    DEBUG_ASSERT(IS_PAGE_ALIGNED(size_));
+    DEBUG_ASSERT(IS_PAGE_ALIGNED(s));
 
     // see if we're shrinking or expanding the vmo
     if (s < size_) {
         // shrinking
-        // figure the starting and ending page offset that is affected
-        uint64_t start = ROUNDUP_PAGE_SIZE(s);
-        uint64_t end = ROUNDUP_PAGE_SIZE(size_);
-        uint64_t page_aligned_len = end - start;
+        uint64_t start = s;
+        uint64_t end = size_;
+        uint64_t len = end - start;
 
-        // we're only worried about whole pages to be removed
-        if (page_aligned_len > 0) {
-            if (AnyPagesPinnedLocked(start, page_aligned_len)) {
-                return ZX_ERR_BAD_STATE;
-            }
-            // unmap all of the pages in this range on all the mapping regions
-            RangeChangeUpdateLocked(start, page_aligned_len);
+        // bail if there are any pinned pages in the range we're trimming
+        if (AnyPagesPinnedLocked(start, len)) {
+            return ZX_ERR_BAD_STATE;
+        }
 
-            // iterate through the pages, freeing them
-            while (start < end) {
-                page_list_.FreePage(start);
-                start += PAGE_SIZE;
-            }
+        // unmap all of the pages in this range on all the mapping regions
+        RangeChangeUpdateLocked(start, len);
+
+        // iterate through the pages, freeing them
+        // TODO: use page_list iterator, move pages to list, free at once
+        while (start < end) {
+            page_list_.FreePage(start);
+            start += PAGE_SIZE;
         }
     } else if (s > size_) {
         // expanding
         // figure the starting and ending page offset that is affected
-        uint64_t start = ROUNDUP_PAGE_SIZE(size_);
-        uint64_t end = ROUNDUP_PAGE_SIZE(s);
-        uint64_t page_aligned_len = end - start;
+        uint64_t start = size_;
+        uint64_t end = s;
+        uint64_t len = end - start;
 
-        // we're only worried about whole pages to be added
-        if (page_aligned_len > 0) {
-            // inform all our children or mapping that there's new bits
-            RangeChangeUpdateLocked(start, page_aligned_len);
-        }
+        // inform all our children or mapping that there's new bits
+        RangeChangeUpdateLocked(start, len);
     }
 
     // save bytewise size
@@ -806,10 +820,10 @@ zx_status_t VmObjectPaged::SetParentOffsetLocked(uint64_t offset) {
     // TODO: ZX-692 make sure that the accumulated offset of the entire parent chain doesn't wrap 64bit space
 
     // make sure the size + this offset are still valid
-    safeint::CheckedNumeric<uint64_t> end = offset;
-    end += size_;
-    if (!end.IsValid())
+    uint64_t end;
+    if (add_overflow(offset, size_, &end)) {
         return ZX_ERR_OUT_OF_RANGE;
+    }
 
     parent_offset_ = offset;
 
@@ -819,29 +833,27 @@ zx_status_t VmObjectPaged::SetParentOffsetLocked(uint64_t offset) {
 // perform some sort of copy in/out on a range of the object using a passed in lambda
 // for the copy routine
 template <typename T>
-zx_status_t VmObjectPaged::ReadWriteInternal(uint64_t offset, size_t len, size_t* bytes_copied, bool write,
-                                             T copyfunc) {
+zx_status_t VmObjectPaged::ReadWriteInternal(uint64_t offset, size_t len, bool write, T copyfunc) {
     canary_.Assert();
-    if (bytes_copied)
-        *bytes_copied = 0;
 
     AutoLock a(&lock_);
 
-    // trim the size
-    uint64_t new_len;
-    if (!TrimRange(offset, len, size_, &new_len))
-        return ZX_ERR_OUT_OF_RANGE;
+    // are we uncached? abort in this case
+    if (cache_policy_ != ARCH_MMU_FLAG_CACHED)
+        return  ZX_ERR_BAD_STATE;
 
-    // was in range, just zero length
-    if (new_len == 0)
-        return 0;
+    // test if in range
+    uint64_t end_offset;
+    if (add_overflow(offset, len, &end_offset) || end_offset > size_) {
+        return ZX_ERR_OUT_OF_RANGE;
+    }
 
     // walk the list of pages and do the write
     uint64_t src_offset = offset;
     size_t dest_offset = 0;
-    while (new_len > 0) {
+    while (len > 0) {
         size_t page_offset = src_offset % PAGE_SIZE;
-        size_t tocopy = MIN(PAGE_SIZE - page_offset, new_len);
+        size_t tocopy = MIN(PAGE_SIZE - page_offset, len);
 
         // fault in the page
         paddr_t pa;
@@ -852,7 +864,7 @@ zx_status_t VmObjectPaged::ReadWriteInternal(uint64_t offset, size_t len, size_t
             return status;
 
         // compute the kernel mapping of this page
-        uint8_t* page_ptr = reinterpret_cast<uint8_t*>(paddr_to_kvaddr(pa));
+        uint8_t* page_ptr = reinterpret_cast<uint8_t*>(paddr_to_physmap(pa));
 
         // call the copy routine
         auto err = copyfunc(page_ptr + page_offset, dest_offset, tocopy);
@@ -860,16 +872,14 @@ zx_status_t VmObjectPaged::ReadWriteInternal(uint64_t offset, size_t len, size_t
             return err;
 
         src_offset += tocopy;
-        if (bytes_copied)
-            *bytes_copied += tocopy;
         dest_offset += tocopy;
-        new_len -= tocopy;
+        len -= tocopy;
     }
 
     return ZX_OK;
 }
 
-zx_status_t VmObjectPaged::Read(void* _ptr, uint64_t offset, size_t len, size_t* bytes_read) {
+zx_status_t VmObjectPaged::Read(void* _ptr, uint64_t offset, size_t len) {
     canary_.Assert();
     // test to make sure this is a kernel pointer
     if (!is_kernel_address(reinterpret_cast<vaddr_t>(_ptr))) {
@@ -884,10 +894,10 @@ zx_status_t VmObjectPaged::Read(void* _ptr, uint64_t offset, size_t len, size_t*
         return ZX_OK;
     };
 
-    return ReadWriteInternal(offset, len, bytes_read, false, read_routine);
+    return ReadWriteInternal(offset, len, false, read_routine);
 }
 
-zx_status_t VmObjectPaged::Write(const void* _ptr, uint64_t offset, size_t len, size_t* bytes_written) {
+zx_status_t VmObjectPaged::Write(const void* _ptr, uint64_t offset, size_t len) {
     canary_.Assert();
     // test to make sure this is a kernel pointer
     if (!is_kernel_address(reinterpret_cast<vaddr_t>(_ptr))) {
@@ -902,7 +912,7 @@ zx_status_t VmObjectPaged::Write(const void* _ptr, uint64_t offset, size_t len, 
         return ZX_OK;
     };
 
-    return ReadWriteInternal(offset, len, bytes_written, true, write_routine);
+    return ReadWriteInternal(offset, len, true, write_routine);
 }
 
 zx_status_t VmObjectPaged::Lookup(uint64_t offset, uint64_t len, uint pf_flags,
@@ -981,7 +991,7 @@ zx_status_t VmObjectPaged::Lookup(uint64_t offset, uint64_t len, uint pf_flags,
     return ZX_OK;
 }
 
-zx_status_t VmObjectPaged::ReadUser(user_ptr<void> ptr, uint64_t offset, size_t len, size_t* bytes_read) {
+zx_status_t VmObjectPaged::ReadUser(user_out_ptr<void> ptr, uint64_t offset, size_t len) {
     canary_.Assert();
 
     // read routine that uses copy_to_user
@@ -989,11 +999,10 @@ zx_status_t VmObjectPaged::ReadUser(user_ptr<void> ptr, uint64_t offset, size_t 
         return ptr.byte_offset(offset).copy_array_to_user(src, len);
     };
 
-    return ReadWriteInternal(offset, len, bytes_read, false, read_routine);
+    return ReadWriteInternal(offset, len, false, read_routine);
 }
 
-zx_status_t VmObjectPaged::WriteUser(user_ptr<const void> ptr, uint64_t offset, size_t len,
-                                     size_t* bytes_written) {
+zx_status_t VmObjectPaged::WriteUser(user_in_ptr<const void> ptr, uint64_t offset, size_t len) {
     canary_.Assert();
 
     // write routine that uses copy_from_user
@@ -1001,10 +1010,10 @@ zx_status_t VmObjectPaged::WriteUser(user_ptr<const void> ptr, uint64_t offset, 
         return ptr.byte_offset(offset).copy_array_from_user(dst, len);
     };
 
-    return ReadWriteInternal(offset, len, bytes_written, true, write_routine);
+    return ReadWriteInternal(offset, len, true, write_routine);
 }
 
-zx_status_t VmObjectPaged::LookupUser(uint64_t offset, uint64_t len, user_ptr<paddr_t> buffer,
+zx_status_t VmObjectPaged::LookupUser(uint64_t offset, uint64_t len, user_inout_ptr<paddr_t> buffer,
                                       size_t buffer_size) {
     canary_.Assert();
 
@@ -1016,7 +1025,7 @@ zx_status_t VmObjectPaged::LookupUser(uint64_t offset, uint64_t len, user_ptr<pa
         return ZX_ERR_BUFFER_TOO_SMALL;
 
     auto copy_to_user = [](void* context, size_t offset, size_t index, paddr_t pa) -> zx_status_t {
-        user_ptr<paddr_t>* buffer = static_cast<user_ptr<paddr_t>*>(context);
+        user_inout_ptr<paddr_t>* buffer = static_cast<user_inout_ptr<paddr_t>*>(context);
         return buffer->element_offset(index).copy_to_user(pa);
     };
     // only lookup pages that are already present
@@ -1072,8 +1081,10 @@ zx_status_t VmObjectPaged::CacheOp(const uint64_t start_offset, const uint64_t l
 
         if (likely(status == ZX_OK)) {
             // Convert the page address to a Kernel virtual address.
-            const void* ptr = paddr_to_kvaddr(pa);
+            const void* ptr = paddr_to_physmap(pa);
             const addr_t cache_op_addr = reinterpret_cast<addr_t>(ptr) + page_offset;
+
+            LTRACEF("ptr %p op %d\n", ptr, (int)type);
 
             // Perform the necessary cache op against this page.
             switch (type) {
@@ -1094,6 +1105,45 @@ zx_status_t VmObjectPaged::CacheOp(const uint64_t start_offset, const uint64_t l
 
         op_start_offset += cache_op_len;
     }
+
+    return ZX_OK;
+}
+
+zx_status_t VmObjectPaged::GetMappingCachePolicy(uint32_t* cache_policy) {
+    AutoLock lock(&lock_);
+
+    *cache_policy = cache_policy_;
+
+    return ZX_OK;
+}
+
+zx_status_t VmObjectPaged::SetMappingCachePolicy(const uint32_t cache_policy) {
+    // Is it a valid cache flag?
+    if (cache_policy & ~ZX_CACHE_POLICY_MASK) {
+        return ZX_ERR_INVALID_ARGS;
+    }
+
+    AutoLock lock(&lock_);
+
+    // conditions for allowing the cache policy to be set:
+    // 1) vmo has no pages committed currently
+    // 2) vmo has no mappings
+    // 3) vmo has no clones
+    // 4) vmo is not a clone
+    if (!page_list_.IsEmpty()) {
+        return ZX_ERR_BAD_STATE;
+    }
+    if (!mapping_list_.is_empty()) {
+        return ZX_ERR_BAD_STATE;
+    }
+    if (!children_list_.is_empty()) {
+        return ZX_ERR_BAD_STATE;
+    }
+    if (parent_) {
+        return ZX_ERR_BAD_STATE;
+    }
+
+    cache_policy_ = cache_policy;
 
     return ZX_OK;
 }

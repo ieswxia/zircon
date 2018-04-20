@@ -7,7 +7,6 @@
 
 # use linker garbage collection, if requested
 ifeq ($(call TOBOOL,$(USE_LINKER_GC)),true)
-GLOBAL_COMPILEFLAGS += -ffunction-sections -fdata-sections
 GLOBAL_LDFLAGS += --gc-sections
 endif
 
@@ -15,14 +14,22 @@ ifneq (,$(EXTRA_BUILDRULES))
 -include $(EXTRA_BUILDRULES)
 endif
 
-$(OUTLKBIN): $(OUTLKELF)
-	$(call BUILDECHO,generating image $@)
-	$(NOECHO)$(OBJCOPY) -O binary $< $@
+# Generate an input linker script to define as symbols all the
+# variables set in makefiles that the linker script needs to use.
+LINKER_SCRIPT_VARS := KERNEL_BASE SMP_MAX_CPUS BOOT_HEADER_SIZE
+DEFSYM_SCRIPT := $(BUILDDIR)/kernel-vars.ld
+$(DEFSYM_SCRIPT): FORCE
+	$(call BUILDECHO,generating $@)
+	@$(MKDIR)
+	$(NOECHO)($(foreach var,$(LINKER_SCRIPT_VARS),\
+			    echo 'PROVIDE_HIDDEN($(var) = $($(var)));';)\
+		 ) > $@.tmp
+	@$(call TESTANDREPLACEFILE,$@.tmp,$@)
+GENERATED += $(DEFSYM_SCRIPT)
 
-$(OUTLKELF): $(ALLMODULE_OBJS) $(EXTRA_OBJS) $(LINKER_SCRIPT)
+$(OUTLKELF): kernel/kernel.ld $(DEFSYM_SCRIPT) $(ALLMODULE_OBJS) $(EXTRA_OBJS)
 	$(call BUILDECHO,linking $@)
-	$(NOECHO)$(LD) $(GLOBAL_LDFLAGS) $(KERNEL_LDFLAGS) -T $(LINKER_SCRIPT) \
-		$(ALLMODULE_OBJS) $(EXTRA_OBJS) -o $@
+	$(NOECHO)$(LD) $(GLOBAL_LDFLAGS) $(KERNEL_LDFLAGS) -T $^ -o $@
 # enable/disable the size output based on a combination of ENABLE_BUILD_LISTFILES
 # and QUIET
 ifeq ($(call TOBOOL,$(ENABLE_BUILD_LISTFILES)),true)
@@ -30,6 +37,58 @@ ifeq ($(call TOBOOL,$(QUIET)),false)
 	$(NOECHO)$(SIZE) $@
 endif
 endif
+
+# Tell the linker to record all the relocations it applied.
+KERNEL_LDFLAGS += --emit-relocs
+
+# Use the --emit-relocs records to extract the fixups needed to relocate
+# the kernel at boot.
+OUTLKELF_FIXUPS := $(BUILDDIR)/$(LKNAME)-fixups.inc
+$(OUTLKELF_FIXUPS): scripts/gen-kaslr-fixups.sh $(OUTLKELF)
+	$(call BUILDECHO,extracting relocations into $@)
+	$(NOECHO)$(SHELLEXEC) $^ '$(READELF)' $@
+GENERATED += $(OUTLKELF_FIXUPS)
+
+# Canned sequence to convert an ELF file to a raw binary.
+define elf2bin-commands
+	$(call BUILDECHO,generating image $@)
+	$(NOECHO)$(OBJCOPY) -O binary $< $@
+endef
+
+# Extract the raw binary image of the kernel proper.
+OUTLKELF_RAW := $(OUTLKELF).bin
+$(OUTLKELF_RAW): $(OUTLKELF); $(elf2bin-commands)
+
+OUTLKELF_IMAGE_ASM := kernel/arch/$(ARCH)/image.S
+OUTLKELF_IMAGE_OBJ := $(BUILDDIR)/$(LKNAME).image.o
+ALLOBJS += $(OUTLKELF_IMAGE_OBJ)
+KERNEL_DEFINES += \
+    BOOT_HEADER_SIZE=$(BOOT_HEADER_SIZE) \
+    KERNEL_IMAGE='"$(OUTLKELF_RAW)"' \
+
+# Assemble the kernel image along with boot headers and relocation fixup code.
+# TODO(mcgrathr): Reuse compile.mk $(MODULE_ASMOBJS) commands here somehow.
+$(OUTLKELF_IMAGE_OBJ): $(OUTLKELF_IMAGE_ASM) $(OUTLKELF_FIXUPS) $(OUTLKELF_RAW)
+	@$(MKDIR)
+	$(call BUILDECHO, assembling $<)
+	$(NOECHO)$(CC) $(GLOBAL_OPTFLAGS)  \
+	    $(GLOBAL_COMPILEFLAGS) $(KERNEL_COMPILEFLAGS) $(ARCH_COMPILEFLAGS) \
+	    $(GLOBAL_ASMFLAGS) $(KERNEL_ASMFLAGS) $(ARCH_ASMFLAGS) \
+	    $(GLOBAL_INCLUDES) $(KERNEL_INCLUDES) -I$(BUILDDIR) \
+	    -c $< -MD -MP -MT $@ -MF $(@:.o=.d) -o $@
+
+# Now link the final load image, using --just-symbols to let image.S refer
+# to symbols defined in the kernel proper.
+$(OUTLKELF_IMAGE): $(OUTLKELF_IMAGE_OBJ) $(OUTLKELF) $(DEFSYM_SCRIPT) \
+		   kernel/image.ld
+	$(call BUILDECHO,linking $@)
+	@$(MKDIR)
+	$(NOECHO)$(LD) $(GLOBAL_LDFLAGS) --build-id=none \
+		       -o $@ -T kernel/image.ld --just-symbols $(OUTLKELF) \
+		       $(DEFSYM_SCRIPT) $(OUTLKELF_IMAGE_OBJ)
+
+# Finally, extract the raw binary of the kernel load image.
+$(OUTLKBIN): $(OUTLKELF_IMAGE); $(elf2bin-commands)
 
 $(OUTLKELF)-gdb.py: scripts/$(LKNAME).elf-gdb.py
 	$(call BUILDECHO, generating $@)
@@ -71,7 +130,7 @@ $(BUILDDIR)/%.debug.lst: $(BUILDDIR)/%
 
 $(BUILDDIR)/%.strip: $(BUILDDIR)/%
 	$(call BUILDECHO,generating $@)
-	$(NOECHO)$(STRIP) $< -o $@
+	$(NOECHO)$(STRIP) $< $@
 
 $(BUILDDIR)/%.sym: $(BUILDDIR)/%
 	$(call BUILDECHO,generating symbols $@)
@@ -89,8 +148,13 @@ $(BUILDDIR)/%.id: $(BUILDDIR)/%
 	$(call BUILDECHO,generating id file $@)
 	$(NOECHO)env READELF="$(READELF)" scripts/get-build-id $< > $@
 
-ifneq ($(USER_AUTORUN),)
-USER_MANIFEST_LINES += autorun=$(USER_AUTORUN)
+# EXTRA_USER_MANIFEST_LINES is a space-separated list of
+# </boot-relative-path>=<local-host-path> entries to add to USER_MANIFEST.
+# This lets users add files to the bootfs via make without needing to edit the
+# manifest or call mkbootfs directly.
+ifneq ($(EXTRA_USER_MANIFEST_LINES),)
+USER_MANIFEST_LINES += $(EXTRA_USER_MANIFEST_LINES)
+$(info EXTRA_USER_MANIFEST_LINES = $(EXTRA_USER_MANIFEST_LINES))
 endif
 
 # generate a new manifest and compare to see if it differs from the previous one
@@ -114,6 +178,19 @@ GENERATED += $(USER_MANIFEST)
 # to generate dependencies
 USER_MANIFEST_DEPS := $(foreach x,$(USER_MANIFEST_LINES),$(lastword $(subst =,$(SPACE),$(strip $(x)))))
 
+.PHONY: user-manifest additional-bootdata
+user-manifest: $(USER_MANIFEST) $(USER_MANIFEST_DEPS)
+additional-bootdata: $(ADDITIONAL_BOOTDATA_ITEMS)
+
+.PHONY: user-only
+user-only: user-manifest
+ifeq ($(call TOBOOL,$(ENABLE_BUILD_SYSROOT)),true)
+user-only: sysroot
+endif
+
+.PHONY: kernel-only
+kernel-only: kernel 
+
 $(USER_BOOTDATA): $(MKBOOTFS) $(USER_MANIFEST) $(USER_MANIFEST_DEPS) $(ADDITIONAL_BOOTDATA_ITEMS)
 	$(call BUILDECHO,generating $@)
 	@$(MKDIR)
@@ -129,34 +206,3 @@ $(USER_FS): $(USER_BOOTDATA)
 
 # add the fs image to the clean list
 GENERATED += $(USER_FS)
-
-# If we're using prebuilt toolchains, check to make sure
-# they are up to date and complain if they are not
-ifneq ($(wildcard $(LKMAKEROOT)/prebuilt/config.mk),)
-# Complain if we haven't run a new enough download script to have
-# the information we need to do the verification
-# TODO: remove at some point in the future
-ifeq ($(PREBUILT_TOOLCHAINS),)
-$(info WARNING:)
-$(info WARNING: prebuilt/config.mk is out of date)
-$(info WARNING: run scripts/download-toolchain)
-$(info WARNING:)
-else
-# For each prebuilt toolchain, check if the shafile (checked in)
-# differs from the stamp file (written after downlad), indicating
-# an out of date toolchain
-PREBUILT_STALE :=
-$(foreach tool,$(PREBUILT_TOOLCHAINS),\
-$(eval A := $(shell cat $(PREBUILT_$(tool)_TOOLCHAIN_SHAFILE)))\
-$(eval B := $(shell cat $(PREBUILT_$(tool)_TOOLCHAIN_STAMP)))\
-$(if $(filter-out $(A),$(B)),$(eval PREBUILT_STALE += $(tool))))
-ifneq ($(PREBUILT_STALE),)
-# If there are out of date toolchains, complain:
-$(info WARNING:)
-$(foreach tool,$(PREBUILT_STALE),\
-$(info WARNING: toolchain $(tool) is out of date))
-$(info WARNING: run scripts/download-toolchain)
-$(info WARNING:)
-endif
-endif
-endif

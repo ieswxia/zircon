@@ -22,7 +22,7 @@
 #include <zircon/compiler.h>
 #include <zircon/types.h>
 
-#include <async/dispatcher.h>
+#include <lib/async/dispatcher.h>
 #include <trace-engine/instrumentation.h>
 
 __BEGIN_CDECLS
@@ -50,6 +50,9 @@ struct trace_handler_ops {
     // Called by instrumentation on any thread.  Must be thread-safe.
     bool (*is_category_enabled)(trace_handler_t* handler, const char* category);
 
+    // Called by the trace engine to indicate it has completed startup.
+    void (*trace_started)(trace_handler_t* handler);
+
     // Called by the trace engine when tracing has stopped.
     //
     // The trace collection status is |ZX_OK| if trace collection was successful.
@@ -64,6 +67,12 @@ struct trace_handler_ops {
     // Called on an asynchronous dispatch thread.
     void (*trace_stopped)(trace_handler_t* handler, async_t* async,
                           zx_status_t disposition, size_t buffer_bytes_written);
+
+    // Called by the trace engine after an attempt to allocate space
+    // for a new record has failed because the buffer is full.
+    //
+    // Called by instrumentation on any thread.  Must be thread-safe.
+    void (*buffer_overflow)(trace_handler_t* handler);
 };
 
 // Asynchronously starts the trace engine.

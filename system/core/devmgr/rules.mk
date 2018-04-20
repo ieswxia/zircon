@@ -4,29 +4,23 @@
 
 LOCAL_DIR := $(GET_LOCAL_DIR)
 
-MODULE := $(LOCAL_DIR)
-
 # devmgr - core userspace services process
 #
-MODULE_NAME := devmgr
+MODULE := $(LOCAL_DIR)
 
+MODULE_NAME := devmgr
 MODULE_TYPE := userapp
 MODULE_GROUP := core
 
 MODULE_SRCS += \
-    $(LOCAL_DIR)/acpi.c \
-    $(LOCAL_DIR)/block-watcher.c \
-    $(LOCAL_DIR)/dnode.cpp \
+    $(LOCAL_DIR)/bootfs.c \
     $(LOCAL_DIR)/devhost-shared.c \
     $(LOCAL_DIR)/devmgr.c \
     $(LOCAL_DIR)/devmgr-binding.c \
     $(LOCAL_DIR)/devmgr-coordinator.c \
     $(LOCAL_DIR)/devmgr-devfs.c \
     $(LOCAL_DIR)/devmgr-drivers.c \
-    $(LOCAL_DIR)/devmgr-fdio.c \
-    $(LOCAL_DIR)/vfs-boot.cpp \
-    $(LOCAL_DIR)/vfs-memory.cpp \
-    $(LOCAL_DIR)/vfs-rpc.cpp \
+    $(LOCAL_DIR)/devmgr-fdio.c
 
 # userboot supports loading via the dynamic linker, so libc (system/ulib/c)
 # can be linked dynamically.  But it doesn't support any means to look
@@ -34,27 +28,65 @@ MODULE_SRCS += \
 
 # ddk is needed only for ddk/device.h
 MODULE_HEADER_DEPS := \
-	system/ulib/ddk
+    system/ulib/ddk
 
 MODULE_STATIC_LIBS := \
-    system/ulib/fs \
-    system/ulib/async \
-    system/ulib/async.loop \
-    system/ulib/gpt \
-    system/ulib/zx \
+    system/ulib/fidl \
     system/ulib/bootdata \
+    system/ulib/loader-service \
+    system/ulib/async \
+    system/ulib/async-loop \
     third_party/ulib/lz4 \
-    system/ulib/zxcpp \
-    system/ulib/fbl \
     system/ulib/port \
-    system/ulib/acpisvc-client \
     system/ulib/driver-info \
 
 MODULE_LIBS := \
     system/ulib/async.default \
-    system/ulib/fs-management \
     system/ulib/launchpad \
     system/ulib/fdio \
+    system/ulib/zircon \
+    system/ulib/c
+
+include make/module.mk
+
+
+# fshost - container for filesystems
+
+MODULE := $(LOCAL_DIR).fshost
+
+MODULE_NAME := fshost
+MODULE_TYPE := userapp
+MODULE_GROUP := core
+
+MODULE_SRCS := \
+    $(LOCAL_DIR)/bootfs.c \
+    $(LOCAL_DIR)/block-watcher.c \
+    $(LOCAL_DIR)/devmgr-fdio.c \
+    $(LOCAL_DIR)/fshost.c \
+    $(LOCAL_DIR)/vfs-rpc.cpp
+
+MODULE_STATIC_LIBS := \
+    system/ulib/memfs \
+    system/ulib/fs \
+    system/ulib/loader-service \
+    system/ulib/async.cpp \
+    system/ulib/async \
+    system/ulib/async-loop.cpp \
+    system/ulib/async-loop \
+    system/ulib/bootdata \
+    system/ulib/fbl \
+    system/ulib/gpt \
+    system/ulib/trace \
+    system/ulib/zx \
+    system/ulib/zxcpp \
+    third_party/ulib/lz4 \
+
+MODULE_LIBS := \
+    system/ulib/async.default \
+    system/ulib/launchpad \
+    system/ulib/fdio \
+    system/ulib/fs-management \
+    system/ulib/trace-engine \
     system/ulib/zircon \
     system/ulib/c
 

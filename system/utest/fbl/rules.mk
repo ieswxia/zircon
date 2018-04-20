@@ -2,6 +2,10 @@
 # Use of this source code is governed by a BSD-style license that can be
 # found in the LICENSE file.
 
+# If set, disable building these tests which account for a fair amount
+# of build time
+ifeq ($(call TOBOOL,$(DISABLE_FBL_TEST)),false)
+
 LOCAL_DIR := $(GET_LOCAL_DIR)
 
 fbl_common_tests := \
@@ -25,18 +29,29 @@ fbl_common_tests := \
     $(LOCAL_DIR)/string_piece_tests.cpp \
     $(LOCAL_DIR)/string_printf_tests.cpp \
     $(LOCAL_DIR)/string_tests.cpp \
+    $(LOCAL_DIR)/string_traits_tests.cpp \
     $(LOCAL_DIR)/type_support_tests.cpp \
     $(LOCAL_DIR)/unique_free_ptr_tests.cpp \
     $(LOCAL_DIR)/unique_ptr_tests.cpp \
+    $(LOCAL_DIR)/unique_fd_tests.cpp \
     $(LOCAL_DIR)/vector_tests.cpp \
 
 fbl_device_tests := $(fbl_common_tests)
 
-# These tests need fbl::Mutex which currently isn't supported on the host.
-# TODO(ZX-1053): Support fbl::Mutex on the host and make these tests work.
+# These tests won't run on the host.
+#
+# Some of these tests need fbl::Mutex which currently isn't supported on the
+# host. TODO(ZX-1053): Support fbl::Mutex on the host and make the ref counted
+# and slab allocator tests work.
 fbl_device_tests += \
+    $(LOCAL_DIR)/memory_probe_tests.cpp \
     $(LOCAL_DIR)/ref_counted_tests.cpp \
     $(LOCAL_DIR)/slab_allocator_tests.cpp \
+
+# These tests need zircon VMO and VMARs which are not currently supported on the
+# host.
+fbl_device_tests += \
+    $(LOCAL_DIR)/vmo_vmar_tests.cpp \
 
 fbl_host_tests := $(fbl_common_tests)
 
@@ -53,6 +68,7 @@ MODULE_SRCS := $(fbl_device_tests)
 MODULE_STATIC_LIBS := \
     system/ulib/zxcpp \
     system/ulib/fbl \
+    system/ulib/zx \
 
 MODULE_LIBS := \
     system/ulib/c \
@@ -88,3 +104,5 @@ include make/module.mk
 fbl_common_tests :=
 fbl_device_tests :=
 fbl_host_tests :=
+
+endif # DISABLE_FBL_TEST

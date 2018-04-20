@@ -11,7 +11,6 @@
 #include <inttypes.h>
 #include <kernel/auto_lock.h>
 #include <kernel/mutex.h>
-#include <kernel/vm.h>
 #include <lib/console.h>
 #include <lib/ktrace.h>
 #include <object/diagnostics.h>
@@ -19,6 +18,7 @@
 #include <trace.h>
 #include <vm/fault.h>
 #include <vm/pmm.h>
+#include <vm/vm.h>
 #include <vm/vm_address_region.h>
 #include <vm/vm_aspace.h>
 #include <zircon/types.h>
@@ -69,6 +69,8 @@ zx_status_t vmm_page_fault_handler(vaddr_t addr, uint flags) {
         DumpProcessMemoryUsage("PageFault: MemoryUsed: ", 8 * 256);
     }
 
+    ktrace(TAG_PAGE_FAULT_EXIT, (uint32_t)(addr >> 32), (uint32_t)addr, flags, arch_curr_cpu_num());
+
     return status;
 }
 
@@ -99,6 +101,7 @@ static int cmd_vmm(int argc, const cmd_args* argv, uint32_t flags) {
     usage:
         printf("usage:\n");
         printf("%s aspaces\n", argv[0].str);
+        printf("%s kaspace\n", argv[0].str);
         printf("%s alloc <size> <align_pow2>\n", argv[0].str);
         printf("%s alloc_physical <paddr> <size> <align_pow2>\n", argv[0].str);
         printf("%s alloc_contig <size> <align_pow2>\n", argv[0].str);
@@ -116,6 +119,8 @@ static int cmd_vmm(int argc, const cmd_args* argv, uint32_t flags) {
 
     if (!strcmp(argv[1].str, "aspaces")) {
         DumpAllAspaces(true);
+    } else if (!strcmp(argv[1].str, "kaspace")) {
+        VmAspace::kernel_aspace()->Dump(true);
     } else if (!strcmp(argv[1].str, "alloc")) {
         if (argc < 3)
             goto notenoughargs;

@@ -10,21 +10,12 @@
 #include <stdbool.h>
 #include <sys/types.h>
 #include <inttypes.h>
+#include <zircon/types.h>
+#include <zircon/pixelformat.h>
 
 // gfx library
 
-// different graphics formats
-typedef enum {
-    GFX_FORMAT_NONE,
-    GFX_FORMAT_RGB_565,
-    GFX_FORMAT_RGB_332,
-    GFX_FORMAT_RGB_2220,
-    GFX_FORMAT_ARGB_8888,
-    GFX_FORMAT_RGB_x888,
-    GFX_FORMAT_MONO,
-
-    GFX_FORMAT_MAX
-} gfx_format;
+typedef zx_pixel_format_t gfx_format;
 
 #define MAX_ALPHA 255
 
@@ -104,12 +95,12 @@ static inline void gfx_clear(gfx_surface *surface, uint color)
 
 // surface setup
 gfx_surface *gfx_create_surface(void *ptr, uint width, uint height, uint stride, gfx_format format, uint32_t flags);
-status_t gfx_init_surface(gfx_surface *surface, void *ptr, uint width, uint height, uint stride, gfx_format format, uint32_t flags);
+zx_status_t gfx_init_surface(gfx_surface *surface, void *ptr, uint width, uint height, uint stride, gfx_format format, uint32_t flags);
 
 // utility routine to make a surface out of a display info
 struct display_info;
 gfx_surface *gfx_create_surface_from_display(struct display_info *);
-status_t gfx_init_surface_from_display(gfx_surface *surface, struct display_info *);
+zx_status_t gfx_init_surface_from_display(gfx_surface *surface, struct display_info *);
 
 // free the surface
 // optionally frees the buffer if the free bit is set

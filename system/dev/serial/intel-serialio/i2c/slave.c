@@ -8,9 +8,11 @@
 #include <zircon/types.h>
 #include <zircon/device/i2c.h>
 #include <zircon/listnode.h>
+#include <zircon/thread_annotations.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <threads.h>
 
 #include "controller.h"
@@ -26,7 +28,7 @@ static const zx_duration_t timeout_ns = ZX_SEC(2);
         const zx_time_t deadline = zx_deadline_after(timeout_ns);             \
         int wait_for_condition_value;                                         \
         while (!(wait_for_condition_value = !!(condition))) {                 \
-            zx_time_t now = zx_time_get(ZX_CLOCK_MONOTONIC);                  \
+            zx_time_t now = zx_clock_get(ZX_CLOCK_MONOTONIC);                 \
             if (now >= deadline)                                              \
                 break;                                                        \
             if (poll_interval)                                                \
@@ -60,8 +62,12 @@ static int rx_fifo_empty(intel_serialio_i2c_device_t *controller) {
     return !(*REG32(&controller->regs->i2c_sta) & (0x1 << I2C_STA_RFNE));
 }
 
+// Thread safety analysis cannot see the control flow through the
+// gotos, and cannot prove that the lock is unheld at return through
+// all paths.
 static zx_status_t intel_serialio_i2c_slave_transfer(
-    intel_serialio_i2c_slave_device_t* slave, i2c_slave_segment_t *segments, int segment_count) {
+    intel_serialio_i2c_slave_device_t* slave, i2c_slave_segment_t *segments, int segment_count)
+    TA_NO_THREAD_SAFETY_ANALYSIS {
     zx_status_t status = ZX_OK;
 
     for (int i = 0; i < segment_count; i++) {
@@ -377,6 +383,81 @@ slave_transfer_ioctl_finish_2:
     return status;
 }
 
+static zx_status_t intel_serialio_i2c_slave_irq_ioctl(
+    intel_serialio_i2c_slave_device_t* slave, uint32_t op, const void* in_buf, size_t in_len,
+    void* out_buf, size_t out_len, size_t* out_actual) {
+
+    if (out_len < sizeof(zx_handle_t)) {
+        return ZX_ERR_BUFFER_TOO_SMALL;
+    }
+
+    // This IOCTL is a hack to get interrupts to the right devices.
+    // TODO(teisenbe): Remove this when we discover interrupts via ACPI and
+    // route more appropriately.
+    if (slave->chip_address == 0xa) {
+        zx_handle_t irq;
+        zx_status_t status = zx_interrupt_create(get_root_resource(), 0, &irq);
+        if (status != ZX_OK) {
+            return status;
+        }
+        status = zx_interrupt_bind(irq, 0, get_root_resource(), 0x1f, ZX_INTERRUPT_MODE_LEVEL_LOW);
+        if (status != ZX_OK) {
+            zx_handle_close(irq);
+            return status;
+        }
+        memcpy(out_buf, &irq, sizeof(irq));
+        *out_actual = sizeof(irq);
+        return ZX_OK;
+    } else if (slave->chip_address == 0x49) {
+        zx_handle_t irq;
+        zx_status_t status = zx_interrupt_create(get_root_resource(), 0, &irq);
+
+        if (status != ZX_OK) {
+            return status;
+        }
+        status = zx_interrupt_bind(irq, 0, get_root_resource(), 0x33, ZX_INTERRUPT_MODE_LEVEL_LOW);
+        if (status != ZX_OK) {
+            zx_handle_close(irq);
+            return status;
+        }
+       memcpy(out_buf, &irq, sizeof(irq));
+        *out_actual = sizeof(irq);
+        return ZX_OK;
+    } else if (slave->chip_address == 0x10) {
+        // Acer12
+        zx_handle_t irq;
+        zx_status_t status = zx_interrupt_create(get_root_resource(), 0, &irq);
+        if (status != ZX_OK) {
+            return status;
+        }
+        status = zx_interrupt_bind(irq, 0, get_root_resource(), 0x1f, ZX_INTERRUPT_MODE_LEVEL_LOW);
+        if (status != ZX_OK) {
+            zx_handle_close(irq);
+            return status;
+        }
+        memcpy(out_buf, &irq, sizeof(irq));
+        *out_actual = sizeof(irq);
+        return ZX_OK;
+    } else if (slave->chip_address == 0x50) {
+        zx_handle_t irq;
+        zx_status_t status = zx_interrupt_create(get_root_resource(), 0, &irq);
+
+        if (status != ZX_OK) {
+            return status;
+        }
+        status = zx_interrupt_bind(irq, 0, get_root_resource(), 0x18, ZX_INTERRUPT_MODE_EDGE_LOW);
+        if (status != ZX_OK) {
+            zx_handle_close(irq);
+            return status;
+        }
+        memcpy(out_buf, &irq, sizeof(irq));
+        *out_actual = sizeof(irq);
+        return ZX_OK;
+    }
+
+    return ZX_ERR_NOT_FOUND;
+}
+
 static zx_status_t intel_serialio_i2c_slave_ioctl(
     void* ctx, uint32_t op, const void* in_buf, size_t in_len,
     void* out_buf, size_t out_len, size_t* out_actual) {
@@ -386,6 +467,9 @@ static zx_status_t intel_serialio_i2c_slave_ioctl(
         return intel_serialio_i2c_slave_transfer_ioctl(
             slave, op, in_buf, in_len, out_buf, out_len, out_actual);
         break;
+    case IOCTL_I2C_SLAVE_IRQ:
+        return intel_serialio_i2c_slave_irq_ioctl(
+            slave, op, in_buf, in_len, out_buf, out_len, out_actual);
     default:
         return ZX_ERR_INVALID_ARGS;
     }

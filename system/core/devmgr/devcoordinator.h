@@ -34,6 +34,7 @@ struct dc_pending {
 };
 
 #define PENDING_BIND 1
+#define PENDING_SUSPEND 2
 
 struct dc_devhost {
     port_handler_t ph;
@@ -42,23 +43,38 @@ struct dc_devhost {
     zx_koid_t koid;
     int32_t refcount;
     uint32_t flags;
+    devhost_t* parent;
 
     // list of all devices on this devhost
     list_node_t devices;
+
+    // listnode for this devhost in the all devhosts list
+    list_node_t anode;
+
+    // listnode for this devhost in the order-to-suspend list
+    list_node_t snode;
+
+    // listnode for this devhost in its parent devhost's list-of-children
+    list_node_t node;
+
+    // list of all cild devhosts of this devhost
+    list_node_t children;
 };
 
 #define DEV_HOST_DYING 1
+#define DEV_HOST_SUSPEND 2
 
 struct dc_device {
     zx_handle_t hrpc;
-    zx_handle_t hrsrc;
+    uint32_t flags;
+
     port_handler_t ph;
+
     devhost_t* host;
     const char* name;
     const char* libname;
     const char* args;
     work_t work;
-    uint32_t flags;
     int32_t refcount;
     uint32_t protocol_id;
     uint32_t prop_count;
@@ -112,7 +128,14 @@ struct dc_device {
 // with the rpc channel, allowing complete destruction.
 #define DEV_CTX_ZOMBIE        0x20
 
+// Device is a proxy -- its "parent" is the device it's
+// a proxy to.
 #define DEV_CTX_PROXY         0x40
+
+// Device is not visible in devfs or bindable.
+// Devices may be created in this state, but may not
+// return to this state once made visible.
+#define DEV_CTX_INVISIBLE     0x80
 
 struct dc_driver {
     const char* name;
@@ -127,6 +150,8 @@ struct dc_driver {
 
 zx_status_t devfs_publish(device_t* parent, device_t* dev);
 void devfs_unpublish(device_t* dev);
+void devfs_advertise(device_t* dev);
+void devfs_advertise_modified(device_t* dev);
 
 device_t* coordinator_init(zx_handle_t root_job);
 void coordinator(void);
@@ -147,12 +172,15 @@ bool dc_is_bindable(driver_t* drv, uint32_t protocol_id,
 // dedicated channel for forwarding OPEN operations.
 // Our opcodes set the high bit to avoid overlap.
 typedef struct {
-    zx_txid_t txid;
+    zx_txid_t txid;     // FIDL message header
+    uint32_t reserved0;
+    uint32_t flags;
     uint32_t op;
 
     union {
         zx_status_t status;
         uint32_t protocol_id;
+        uint32_t value;
     };
     uint32_t datalen;
     uint32_t namelen;
@@ -166,23 +194,31 @@ typedef struct {
     zx_status_t status;
 } dc_status_t;
 
+// This bit differentiates DC OPs from RIO OPs
+#define DC_OP_ID_BIT                0x10000000
+
 // Coord->Host Ops
-#define DC_OP_CREATE_DEVICE_STUB 0x80000001
-#define DC_OP_CREATE_DEVICE      0x80000002
-#define DC_OP_BIND_DRIVER        0x80000003
-#define DC_OP_CONNECT_PROXY      0x80000004
+#define DC_OP_CREATE_DEVICE_STUB    0x10000001
+#define DC_OP_CREATE_DEVICE         0x10000002
+#define DC_OP_BIND_DRIVER           0x10000003
+#define DC_OP_CONNECT_PROXY         0x10000004
+#define DC_OP_SUSPEND               0x10000005
 
 // Host->Coord Ops
-#define DC_OP_STATUS             0x80000010
-#define DC_OP_ADD_DEVICE         0x80000011
-#define DC_OP_REMOVE_DEVICE      0x80000012
-#define DC_OP_BIND_DEVICE        0x80000013
-#define DC_OP_GET_TOPO_PATH      0x80000014
+#define DC_OP_STATUS                0x10000010
+#define DC_OP_ADD_DEVICE            0x10000011
+#define DC_OP_ADD_DEVICE_INVISIBLE  0x10000012
+#define DC_OP_REMOVE_DEVICE         0x10000013  // also Coord->Host
+#define DC_OP_MAKE_VISIBLE          0x10000014
+#define DC_OP_BIND_DEVICE           0x10000015
+#define DC_OP_GET_TOPO_PATH         0x10000016
+#define DC_OP_LOAD_FIRMWARE         0x10000017
 
 // Host->Coord Ops for DmCtl
-#define DC_OP_DM_COMMAND         0x80000020
-#define DC_OP_DM_OPEN_VIRTCON    0x80000021
-#define DC_OP_DM_WATCH           0x80000022
+#define DC_OP_DM_COMMAND            0x10000020
+#define DC_OP_DM_OPEN_VIRTCON       0x10000021
+#define DC_OP_DM_WATCH              0x10000022
+#define DC_OP_DM_MEXEC              0x10000023
 #define DC_PATH_MAX 1024
 
 zx_status_t dc_msg_pack(dc_msg_t* msg, uint32_t* len_out,
@@ -192,8 +228,7 @@ zx_status_t dc_msg_unpack(dc_msg_t* msg, size_t len, const void** data,
                           const char** name, const char** args);
 zx_status_t dc_msg_rpc(zx_handle_t h, dc_msg_t* msg, size_t msglen,
                        zx_handle_t* handles, size_t hcount,
-                       dc_status_t* rsp, size_t rsp_len);
-
-void devmgr_set_mdi(zx_handle_t mdi_handle);
+                       dc_status_t* rsp, size_t rsp_len,
+                       zx_handle_t* outhandle);
 
 extern bool dc_asan_drivers;

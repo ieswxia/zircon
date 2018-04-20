@@ -79,9 +79,6 @@ class PortDispatcher;
 class PortObserver;
 struct PortPacket;
 
-#define PKT_FLAG_EPHEMERAL  0x10000000u
-#define PKT_FLAG_MASK       0x0FFFFFFFu
-
 struct PortAllocator {
     virtual ~PortAllocator() = default;
 
@@ -102,6 +99,10 @@ struct PortPacket final : public fbl::DoublyLinkedListable<PortPacket*> {
     uint64_t key() const { return packet.key; }
     bool is_ephemeral() const { return allocator != nullptr; }
     void Free() { allocator->Free(this); }
+
+    // The number of outstanding packets that are allocated by this
+    // class, rather than allocated by some other client mechanism.
+    static size_t DiagnosticAllocationCount();
 };
 
 // Observers are weakly contained in state trackers until |remove_| member
@@ -120,8 +121,8 @@ private:
     // StateObserver overrides.
     Flags OnInitialize(zx_signals_t initial_state, const StateObserver::CountInfo* cinfo) final;
     Flags OnStateChange(zx_signals_t new_state) final;
-    Flags OnCancel(Handle* handle) final;
-    Flags OnCancelByKey(Handle* handle, const void* port, uint64_t key) final;
+    Flags OnCancel(const Handle* handle) final;
+    Flags OnCancelByKey(const Handle* handle, const void* port, uint64_t key) final;
     void OnRemoved() final;
 
     // The following method can only be called from
@@ -135,7 +136,7 @@ private:
     fbl::RefPtr<PortDispatcher> const port_;
 };
 
-class PortDispatcher final : public Dispatcher {
+class PortDispatcher final : public SoloDispatcher {
 public:
     static void Init();
     static PortAllocator* DefaultPortAllocator();
@@ -167,6 +168,8 @@ private:
 
     explicit PortDispatcher(uint32_t options);
 
+    void FreePacket(PortPacket* port_packet) TA_REQ(get_lock());
+
     // Adopts a RefPtr to |eport|, and adds it to |eports_|.
     // Called by ExceptionPort.
     void LinkExceptionPort(ExceptionPort* eport);
@@ -177,9 +180,8 @@ private:
     void UnlinkExceptionPort(ExceptionPort* eport);
 
     fbl::Canary<fbl::magic("PORT")> canary_;
-    fbl::Mutex lock_;
     Semaphore sema_;
-    bool zero_handles_ TA_GUARDED(lock_);
-    fbl::DoublyLinkedList<PortPacket*> packets_ TA_GUARDED(lock_);
-    fbl::DoublyLinkedList<fbl::RefPtr<ExceptionPort>> eports_ TA_GUARDED(lock_);
+    bool zero_handles_ TA_GUARDED(get_lock());
+    fbl::DoublyLinkedList<PortPacket*> packets_ TA_GUARDED(get_lock());
+    fbl::DoublyLinkedList<fbl::RefPtr<ExceptionPort>> eports_ TA_GUARDED(get_lock());
 };

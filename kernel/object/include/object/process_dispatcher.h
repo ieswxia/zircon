@@ -11,9 +11,8 @@
 #include <vm/vm_aspace.h>
 #include <object/dispatcher.h>
 #include <object/futex_context.h>
-#include <object/handle_owner.h>
+#include <object/handle.h>
 #include <object/policy_manager.h>
-#include <object/state_tracker.h>
 #include <object/thread_dispatcher.h>
 
 #include <zircon/syscalls/object.h>
@@ -29,7 +28,7 @@
 
 class JobDispatcher;
 
-class ProcessDispatcher final : public Dispatcher {
+class ProcessDispatcher final : public SoloDispatcher {
 public:
     static zx_status_t Create(
         fbl::RefPtr<JobDispatcher> job, fbl::StringPiece name, uint32_t flags,
@@ -61,7 +60,7 @@ public:
 
     // Dispatcher implementation
     zx_obj_type_t get_type() const final { return ZX_OBJ_TYPE_PROCESS; }
-    StateTracker* get_state_tracker() final { return &state_tracker_; }
+    bool has_state_tracker() const final { return true; }
     void on_zero_handles() final;
     zx_koid_t get_related_koid() const final;
 
@@ -166,11 +165,9 @@ public:
     zx_status_t ForEachHandle(T func) const {
         fbl::AutoLock lock(&handle_table_lock_);
         for (const auto& handle : handles_) {
-            // It would be nice to only pass a const Dispatcher* to the
-            // callback, but many callers will use DownCastDispatcher()
-            // which requires a (necessarily non-const) RefPtr<Dispatcher>.
+            const Dispatcher* dispatcher = handle.dispatcher().get();
             zx_status_t s = func(MapHandleToValue(&handle), handle.rights(),
-                                 fbl::move(handle.dispatcher()));
+                                 dispatcher);
             if (s != ZX_OK) {
                 return s;
             }
@@ -196,10 +193,10 @@ public:
     zx_status_t GetStats(zx_info_task_stats_t* stats);
     // NOTE: Code outside of the syscall layer should not typically know about
     // user_ptrs; do not use this pattern as an example.
-    zx_status_t GetAspaceMaps(user_ptr<zx_info_maps_t> maps, size_t max,
-                           size_t* actual, size_t* available);
-    zx_status_t GetVmos(user_ptr<zx_info_vmo_t> vmos, size_t max,
-                     size_t* actual, size_t* available);
+    zx_status_t GetAspaceMaps(user_out_ptr<zx_info_maps_t> maps, size_t max,
+                              size_t* actual, size_t* available);
+    zx_status_t GetVmos(user_out_ptr<zx_info_vmo_t> vmos, size_t max,
+                        size_t* actual, size_t* available);
 
     zx_status_t GetThreads(fbl::Array<zx_koid_t>* threads);
 
@@ -283,10 +280,12 @@ private:
     void RemoveThread(ThreadDispatcher* t);
 
     void SetStateLocked(State) TA_REQ(state_lock_);
+    void FinishDeadTransition();
 
     // Kill all threads
     void KillAllThreadsLocked() TA_REQ(state_lock_);
 
+    // TODO(dbort): Add "canary_.Assert()" calls to methods.
     fbl::Canary<fbl::magic("PROC")> canary_;
 
     // the enclosing job
@@ -299,7 +298,7 @@ private:
     fbl::DoublyLinkedListNodeState<ProcessDispatcher*> dll_job_raw_;
     fbl::SinglyLinkedListNodeState<fbl::RefPtr<ProcessDispatcher>> dll_job_;
 
-    zx_handle_t handle_rand_ = 0;
+    uint32_t handle_rand_ = 0;
 
     // list of threads in this process
     using ThreadList = fbl::DoublyLinkedList<ThreadDispatcher*, ThreadDispatcher::ThreadListTraits>;
@@ -312,21 +311,22 @@ private:
     mutable fbl::Mutex handle_table_lock_; // protects |handles_|.
     fbl::DoublyLinkedList<Handle*> handles_ TA_GUARDED(handle_table_lock_);
 
-    StateTracker state_tracker_;
-
     FutexContext futex_context_;
 
     // our state
     State state_ TA_GUARDED(state_lock_) = State::INITIAL;
     mutable fbl::Mutex state_lock_;
 
+    // True if FinishDeadTransition has been called.
+    // This is used as a sanity check only.
+    bool completely_dead_ = false;
+
     // process return code
     int retcode_ = 0;
 
     // Exception ports bound to the process.
-    fbl::RefPtr<ExceptionPort> exception_port_ TA_GUARDED(exception_lock_);
-    fbl::RefPtr<ExceptionPort> debugger_exception_port_ TA_GUARDED(exception_lock_);
-    fbl::Mutex exception_lock_;
+    fbl::RefPtr<ExceptionPort> exception_port_ TA_GUARDED(state_lock_);
+    fbl::RefPtr<ExceptionPort> debugger_exception_port_ TA_GUARDED(state_lock_);
 
     // This is the value of _dl_debug_addr from ld.so.
     // See third_party/ulib/musl/ldso/dynlink.c.

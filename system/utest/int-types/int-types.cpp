@@ -6,6 +6,7 @@
 #include <limits.h>
 #include <signal.h>
 #include <stdint.h>
+#include <wchar.h>
 
 #include <fbl/type_support.h>
 #include <unittest/unittest.h>

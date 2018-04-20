@@ -22,7 +22,6 @@ char       *strcat(char *, char const *);
 char       *strchr(char const *, int) __PURE;
 int         strcmp(char const *, char const *) __PURE;
 char       *strcpy(char *, char const *);
-char const *strerror(int) __CONST;
 size_t      strlen(char const *) __PURE;
 char       *strncat(char *, char const *, size_t);
 int         strncmp(char const *, char const *, size_t) __PURE;
@@ -35,7 +34,6 @@ char       *strstr(char const *, char const *) __PURE;
 char       *strtok(char *, char const *);
 int         strcoll(const char *s1, const char *s2) __PURE;
 size_t      strxfrm(char *dest, const char *src, size_t n) __PURE;
-char       *strdup(const char *str) __MALLOC;
 
 /* non standard */
 size_t strlcat(char *, char const *, size_t);

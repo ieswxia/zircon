@@ -2,7 +2,6 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -16,8 +15,9 @@
 
 #include <fbl/alloc_checker.h>
 #include <fs/vfs.h>
+#include <fs/vnode.h>
 #include <fs/watcher.h>
-#include <zx/channel.h>
+#include <lib/zx/channel.h>
 
 namespace fs {
 
@@ -37,7 +37,7 @@ public:
     DISALLOW_COPY_ASSIGN_AND_MOVE(WatchBuffer);
     WatchBuffer() = default;
 
-    zx_status_t AddMsg(const zx::channel& c, unsigned event, const char* name);
+    zx_status_t AddMsg(const zx::channel& c, unsigned event, fbl::StringPiece name);
     zx_status_t Send(const zx::channel& c);
 
 private:
@@ -45,8 +45,8 @@ private:
     char watch_buf_[VFS_WATCH_MSG_MAX]{};
 };
 
-zx_status_t WatchBuffer::AddMsg(const zx::channel& c, unsigned event, const char* name) {
-    size_t slen = strlen(name);
+zx_status_t WatchBuffer::AddMsg(const zx::channel& c, unsigned event, fbl::StringPiece name) {
+    size_t slen = name.length();
     size_t mlen = sizeof(vfs_watch_msg_t) + slen;
     if (mlen + watch_buf_size_ > sizeof(watch_buf_)) {
         // This message won't fit in the watch_buf; transmit first.
@@ -58,7 +58,7 @@ zx_status_t WatchBuffer::AddMsg(const zx::channel& c, unsigned event, const char
     vfs_watch_msg_t* vmsg = reinterpret_cast<vfs_watch_msg_t*>((uintptr_t)watch_buf_ + watch_buf_size_);
     vmsg->event = static_cast<uint8_t>(event);
     vmsg->len = static_cast<uint8_t>(slen);
-    memcpy(vmsg->name,name, slen);
+    memcpy(vmsg->name, name.data(), slen);
     watch_buf_size_ += mlen;
     return ZX_OK;
 }
@@ -75,24 +75,7 @@ zx_status_t WatchBuffer::Send(const zx::channel& c) {
     return ZX_OK;
 }
 
-zx_status_t WatcherContainer::WatchDir(zx::channel* out) {
-    fbl::AllocChecker ac;
-    fbl::unique_ptr<VnodeWatcher> watcher(new (&ac) VnodeWatcher(zx::channel(),
-                                                                  VFS_WATCH_MASK_ADDED));
-    if (!ac.check()) {
-        return ZX_ERR_NO_MEMORY;
-    }
-    zx::channel out_channel;
-    if (zx::channel::create(0, &out_channel, &watcher->h) != ZX_OK) {
-        return ZX_ERR_NO_RESOURCES;
-    }
-    fbl::AutoLock lock(&lock_);
-    watch_list_.push_back(fbl::move(watcher));
-    *out = fbl::move(out_channel);
-    return ZX_OK;
-}
-
-zx_status_t WatcherContainer::WatchDirV2(Vfs* vfs, Vnode* vn, const vfs_watch_dir_t* cmd) {
+zx_status_t WatcherContainer::WatchDir(Vfs* vfs, Vnode* vn, const vfs_watch_dir_t* cmd) {
     zx::channel c = zx::channel(cmd->channel);
     if ((cmd->mask & VFS_WATCH_MASK_ALL) == 0) {
         // No events to watch
@@ -112,19 +95,22 @@ zx_status_t WatcherContainer::WatchDirV2(Vfs* vfs, Vnode* vn, const vfs_watch_di
         WatchBuffer wb;
         {
             // Send "VFS_WATCH_EVT_EXISTING" for all entries in readdir
-            fbl::AutoLock lock(&vfs->vfs_lock_);
             while (true) {
-                zx_status_t status = vn->Readdir(&dircookie, &readdir_buf, sizeof(readdir_buf));
-                if (status <= 0) {
+                size_t actual;
+                zx_status_t status = vfs->Readdir(vn, &dircookie, readdir_buf,
+                                                  sizeof(readdir_buf), &actual);
+                if (status != ZX_OK || actual == 0) {
                     break;
                 }
                 void* ptr = readdir_buf;
-                while (status > 0) {
+                while (actual >= sizeof(vdirent_t)) {
                     auto dirent = reinterpret_cast<vdirent_t*>(ptr);
                     if (dirent->name[0]) {
-                        wb.AddMsg(watcher->h, VFS_WATCH_EVT_EXISTING, dirent->name);
+                        wb.AddMsg(watcher->h, VFS_WATCH_EVT_EXISTING,
+                                  fbl::StringPiece(dirent->name));
                     }
-                    status -= dirent->size;
+                    ZX_ASSERT(dirent->size <= actual); // Prevent underflow
+                    actual -= dirent->size;
                     ptr = reinterpret_cast<void*>(
                             static_cast<uintptr_t>(dirent->size) +
                             reinterpret_cast<uintptr_t>(ptr));
@@ -145,8 +131,8 @@ zx_status_t WatcherContainer::WatchDirV2(Vfs* vfs, Vnode* vn, const vfs_watch_di
     return ZX_OK;
 }
 
-void WatcherContainer::Notify(const char* name, size_t len, unsigned event) {
-    if (len > VFS_WATCH_NAME_MAX) {
+void WatcherContainer::Notify(fbl::StringPiece name, unsigned event) {
+    if (name.length() > VFS_WATCH_NAME_MAX) {
         return;
     }
 
@@ -156,11 +142,11 @@ void WatcherContainer::Notify(const char* name, size_t len, unsigned event) {
         return;
     }
 
-    uint8_t msg[sizeof(vfs_watch_msg_t) + len];
+    uint8_t msg[sizeof(vfs_watch_msg_t) + name.length()];
     vfs_watch_msg_t* vmsg = reinterpret_cast<vfs_watch_msg_t*>(msg);
     vmsg->event = static_cast<uint8_t>(event);
-    vmsg->len = static_cast<uint8_t>(len);
-    memcpy(vmsg->name, name, len);
+    vmsg->len = static_cast<uint8_t>(name.length());
+    memcpy(vmsg->name, name.data(), name.length());
 
     for (auto it = watch_list_.begin(); it != watch_list_.end();) {
         if (!(it->mask & VFS_WATCH_EVT_MASK(event))) {

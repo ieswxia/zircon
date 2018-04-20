@@ -6,13 +6,13 @@
 
 #include <lib/crypto/global_prng.h>
 
+#include <lib/unittest/unittest.h>
 #include <stdint.h>
-#include <unittest.h>
 
 namespace crypto {
 
 namespace {
-bool identical(void*) {
+bool identical() {
     BEGIN_TEST;
 
     PRNG* prng1 = GlobalPRNG::GetInstance();
@@ -29,7 +29,6 @@ bool identical(void*) {
 UNITTEST_START_TESTCASE(global_prng_tests)
 UNITTEST("Identical", identical)
 UNITTEST_END_TESTCASE(global_prng_tests, "global_prng",
-                      "Validate global PRNG singleton",
-                      nullptr, nullptr);
+                      "Validate global PRNG singleton");
 
 } // namespace crypto

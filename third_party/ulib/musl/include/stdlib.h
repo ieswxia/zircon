@@ -5,12 +5,7 @@ extern "C" {
 #endif
 
 #include <features.h>
-
-#ifdef __cplusplus
-#define NULL 0L
-#else
-#define NULL ((void*)0)
-#endif
+#include <bits/null.h>
 
 #define __NEED_size_t
 #define __NEED_wchar_t
@@ -136,7 +131,6 @@ int mkstemps(char*, int);
 int mkostemps(char*, int, int);
 void* valloc(size_t);
 void* memalign(size_t, size_t);
-int getloadavg(double*, int);
 int clearenv(void);
 #define WCOREDUMP(s) ((s)&0x80)
 #define WIFCONTINUED(s) ((s) == 0xffff)

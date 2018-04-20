@@ -5,6 +5,7 @@ extern "C" {
 #endif
 
 #include <features.h>
+#include <bits/null.h>
 
 #define STDIN_FILENO 0
 #define STDOUT_FILENO 1
@@ -13,12 +14,6 @@ extern "C" {
 #define SEEK_SET 0
 #define SEEK_CUR 1
 #define SEEK_END 2
-
-#ifdef __cplusplus
-#define NULL 0L
-#else
-#define NULL ((void*)0)
-#endif
 
 #define __NEED_size_t
 #define __NEED_ssize_t
@@ -73,7 +68,6 @@ int access(const char*, int);
 int faccessat(int, const char*, int, int);
 
 int chdir(const char*);
-int fchdir(int);
 char* getcwd(char*, size_t);
 
 unsigned alarm(unsigned);
@@ -137,8 +131,8 @@ size_t confstr(int, char*, size_t);
 #if defined(_XOPEN_SOURCE) || defined(_GNU_SOURCE) || defined(_BSD_SOURCE)
 int lockf(int, int, off_t);
 long gethostid(void);
-int nice(int);
 void sync(void);
+int syncfs(int);
 pid_t setpgrp(void);
 char* crypt(const char*, const char*);
 void encrypt(char*, int);
@@ -155,7 +149,6 @@ unsigned ualarm(unsigned, unsigned);
 #define L_SET 0
 #define L_INCR 1
 #define L_XTND 2
-pid_t vfork(void);
 int vhangup(void);
 int getpagesize(void);
 int getdtablesize(void);
@@ -164,12 +157,7 @@ int getdomainname(char*, size_t);
 int setdomainname(const char*, size_t);
 int setgroups(size_t, const gid_t*);
 char* getpass(const char*);
-int daemon(int, int);
-void setusershell(void);
-void endusershell(void);
-char* getusershell(void);
 int acct(const char*);
-long syscall(long, ...);
 int execvpe(const char*, char* const[], char* const[]);
 int issetugid(void);
 #endif
@@ -181,7 +169,6 @@ int setresgid(gid_t, gid_t, gid_t);
 int getresuid(uid_t*, uid_t*, uid_t*);
 int getresgid(gid_t*, gid_t*, gid_t*);
 char* get_current_dir_name(void);
-int syncfs(int);
 int euidaccess(const char*, int);
 int eaccess(const char*, int);
 #endif
@@ -219,7 +206,7 @@ int eaccess(const char*, int);
 #define _POSIX_THREAD_SAFE_FUNCTIONS _POSIX_VERSION
 #define _POSIX_THREAD_ATTR_STACKADDR _POSIX_VERSION
 #define _POSIX_THREAD_ATTR_STACKSIZE _POSIX_VERSION
-#define _POSIX_THREAD_PRIORITY_SCHEDULING _POSIX_VERSION
+/* #define _POSIX_THREAD_PRIORITY_SCHEDULING -1 */
 #define _POSIX_THREAD_CPUTIME _POSIX_VERSION
 #define _POSIX_TIMERS _POSIX_VERSION
 #define _POSIX_TIMEOUTS _POSIX_VERSION

@@ -35,7 +35,7 @@ brew install pkg-config glib automake libtool
 cd $SRC
 git clone --recursive https://fuchsia.googlesource.com/third_party/qemu
 cd qemu
-./configure --target-list=arm-softmmu,aarch64-softmmu,x86_64-softmmu
+./configure --target-list=aarch64-softmmu,x86_64-softmmu
 make -j32
 sudo make install
 ```
@@ -51,8 +51,8 @@ when invoking run-zircon-{arch}.
 # for aarch64
 ./scripts/run-zircon-arm64
 
-# for x86-64
-./scripts/run-zircon-x86-64
+# for x86
+./scripts/run-zircon-x64
 ```
 
 If QEMU is not on your path, use -q <directory> to specify its location.
@@ -62,9 +62,9 @@ first if necessary and -g to run with a graphical framebuffer.
 
 To exit qemu, enter Ctrl-a x. Use Ctrl-a h to see other commands.
 
-## Enabling Networking under QEMU (x86-64 only)
+## Enabling Networking under QEMU
 
-The run-zircon-x86-64 script, when given the -N argument will attempt to create
+The run-zircon script, when given the -N argument will attempt to create
 a network interface using the Linux tun/tap network device named "qemu".  QEMU
 does not need to be run with any special privileges for this, but you need to
 create a persistent tun/tap device ahead of time (which does require you be root):
@@ -85,13 +85,13 @@ macOS does not support tun/tap devices out of the box; however, there is a widel
 used set of kernel extensions called tuntaposx which can be downloaded
 [here](http://tuntaposx.sourceforge.net/download.xhtml). Once the installer
 completes, the extensions will create up to 16 tun/tap devices. The
-run-zircon-x86-64 script uses /dev/tap0.
+run-zircon-x64 script uses /dev/tap0.
 
 ```
 sudo chown $USER /dev/tap0
 
 # Run zircon in QEMU, which will open /dev/tap0
-./scripts/run-zircon-x86-64 -N
+./scripts/run-zircon-x86 -N
 
 # (In a different window) bring up tap0 with a link local IPv6 address
 sudo ifconfig tap0 inet6 fc00::/7 up
@@ -105,7 +105,7 @@ example startup script containing the above command is located in
 scripts/qemu-ifup-macos, so QEMU can be started with:
 
 ```
-./scripts/run-zircon-x86-64 -Nu ./scripts/qemu-ifup-macos
+./scripts/run-zircon-x64 -Nu ./scripts/qemu-ifup-macos
 ```
 
 ## Using Emulated Disk under QEMU
@@ -115,7 +115,7 @@ Please follow the minfs instructions on how to create a disk image
 
 After creating the image, you can run zircon in QEMU with the disk image:
 ```
-./scripts/run-zircon-x86-64 -d [-D <disk_image_path (default: "blk.bin")>]
+./scripts/run-zircon-x64 -d [-D <disk_image_path (default: "blk.bin")>]
 ```
 
 
@@ -128,7 +128,7 @@ Here is a sample session to get you started.
 In the shell you're running QEMU in:
 
 ```
-shell1$ ./scripts/run-zircon-x86-64 -- -s -S
+shell1$ ./scripts/run-zircon-x64 -- -s -S
 [... some QEMU start up text ...]
 ```
 
@@ -138,7 +138,7 @@ If you want to run QEMU without GDB, but be able to attach with GDB later
 then start QEMU without "-S" in the above example:
 
 ```
-shell1$ ./scripts/run-zircon-x86-64 -- -s
+shell1$ ./scripts/run-zircon-x64 -- -s
 [... some QEMU start up text ...]
 ```
 
@@ -146,7 +146,7 @@ And then in the shell you're running GDB in:
 [Commands here are fully spelled out, but remember most can be abbreviated.]
 
 ```
-shell2$ gdb build-zircon-pc-x86-64/zircon.elf
+shell2$ gdb build-x86/zircon.elf
 (gdb) target extended-remote :1234
 Remote debugging using :1234
 0x000000000000fff0 in ?? ()

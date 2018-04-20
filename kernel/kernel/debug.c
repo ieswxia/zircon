@@ -25,6 +25,8 @@
 #include <platform.h>
 #include <stdio.h>
 #include <string.h>
+#include <vm/vm.h>
+#include <zircon/types.h>
 
 #if WITH_LIB_CONSOLE
 #include <lib/console.h>
@@ -36,7 +38,7 @@ static int cmd_kill(int argc, const cmd_args* argv, uint32_t flags);
 
 STATIC_COMMAND_START
 #if LK_DEBUGLEVEL > 1
-STATIC_COMMAND_MASKED("thread", "list kernel threads with options", &cmd_thread, CMD_AVAIL_ALWAYS)
+STATIC_COMMAND_MASKED("thread", "manipulate kernel threads", &cmd_thread, CMD_AVAIL_ALWAYS)
 #endif
 STATIC_COMMAND("threadstats", "thread level statistics", &cmd_threadstats)
 STATIC_COMMAND("threadload", "toggle thread load display", &cmd_threadload)
@@ -45,32 +47,68 @@ STATIC_COMMAND_END(kernel);
 
 #if LK_DEBUGLEVEL > 1
 static int cmd_thread(int argc, const cmd_args* argv, uint32_t flags) {
+
     if (argc < 2) {
+    notenoughargs:
         printf("not enough arguments\n");
     usage:
+        printf("%s bt <thread pointer or id>\n", argv[0].str);
+        printf("%s dump <thread pointer or id>\n", argv[0].str);
         printf("%s list\n", argv[0].str);
         printf("%s list_full\n", argv[0].str);
         return -1;
     }
 
-    if (!strcmp(argv[1].str, "list")) {
-        printf("thread list:\n");
-        dump_all_threads(false);
+    if (!strcmp(argv[1].str, "bt")) {
+        if (argc < 3)
+            goto notenoughargs;
 
-        /* reschedule to let debuglog potentially run */
-        if (!(flags & CMD_FLAG_PANIC))
-            thread_reschedule();
+        thread_t* t = NULL;
+        if (is_kernel_address(argv[2].u)) {
+            t = (thread_t *)argv[2].u;
+        } else {
+            t = thread_id_to_thread_slow(argv[2].u);
+        }
+        if (t) {
+            thread_print_backtrace(t);
+        }
+    } else if (!strcmp(argv[1].str, "dump")) {
+        if (argc < 3)
+            goto notenoughargs;
+
+        thread_t* t = NULL;
+        if (is_kernel_address(argv[2].u)) {
+            t = (thread_t *)argv[2].u;
+            dump_thread(t, true);
+        } else {
+            if (flags & CMD_FLAG_PANIC) {
+                dump_thread_user_tid_locked(argv[2].u, true);
+            } else {
+                dump_thread_user_tid(argv[2].u, true);
+            }
+        }
+    } else if (!strcmp(argv[1].str, "list")) {
+        printf("thread list:\n");
+        if (flags & CMD_FLAG_PANIC) {
+            dump_all_threads_locked(false);
+        } else {
+            dump_all_threads(false);
+        }
     } else if (!strcmp(argv[1].str, "list_full")) {
         printf("thread list:\n");
-        dump_all_threads(true);
-
-        /* reschedule to let debuglog potentially run */
-        if (!(flags & CMD_FLAG_PANIC))
-            thread_reschedule();
+        if (flags & CMD_FLAG_PANIC) {
+            dump_all_threads_locked(true);
+        } else {
+            dump_all_threads(true);
+        }
     } else {
         printf("invalid args\n");
         goto usage;
     }
+
+    /* reschedule to let debuglog potentially run */
+    if (!(flags & CMD_FLAG_PANIC))
+        thread_reschedule();
 
     return 0;
 }
@@ -90,7 +128,6 @@ static int cmd_threadstats(int argc, const cmd_args* argv, uint32_t flags) {
         printf("\tcontext_switches: %lu\n", percpu[i].stats.context_switches);
         printf("\tpreempts: %lu\n", percpu[i].stats.preempts);
         printf("\tyields: %lu\n", percpu[i].stats.yields);
-        printf("\tinterrupts: %lu\n", percpu[i].stats.interrupts);
         printf("\ttimer interrupts: %lu\n", percpu[i].stats.timer_ints);
         printf("\ttimers: %lu\n", percpu[i].stats.timers);
     }
@@ -98,14 +135,12 @@ static int cmd_threadstats(int argc, const cmd_args* argv, uint32_t flags) {
     return 0;
 }
 
-static enum handler_return threadload(struct timer* t, lk_time_t now, void* arg) {
+static void threadload(timer_t* t, zx_time_t now, void* arg) {
     static struct cpu_stats old_stats[SMP_MAX_CPUS];
-    static lk_time_t last_idle_time[SMP_MAX_CPUS];
+    static zx_duration_t last_idle_time[SMP_MAX_CPUS];
 
     printf("cpu    load"
            " sched (cs ylds pmpts irq_pmpts)"
-           " excep"
-           "    pf"
            "  sysc"
            " ints (hw  tmr tmr_cb)"
            " ipi (rs  gen)\n");
@@ -114,7 +149,7 @@ static enum handler_return threadload(struct timer* t, lk_time_t now, void* arg)
         if (!mp_is_cpu_active(i))
             continue;
 
-        lk_time_t idle_time = percpu[i].stats.idle_time;
+        zx_duration_t idle_time = percpu[i].stats.idle_time;
 
         /* if the cpu is currently idle, add the time since it went idle up until now to the idle counter */
         bool is_idle = !!mp_is_cpu_idle(i);
@@ -122,15 +157,13 @@ static enum handler_return threadload(struct timer* t, lk_time_t now, void* arg)
             idle_time += current_time() - percpu[i].idle_thread.last_started_running;
         }
 
-        lk_time_t delta_time = idle_time - last_idle_time[i];
-        lk_time_t busy_time = LK_SEC(1) - (delta_time > LK_SEC(1) ? LK_SEC(1) : delta_time);
-        uint busypercent = (busy_time * 10000) / LK_SEC(1);
+        zx_duration_t delta_time = idle_time - last_idle_time[i];
+        zx_duration_t busy_time = ZX_SEC(1) - (delta_time > ZX_SEC(1) ? ZX_SEC(1) : delta_time);
+        uint busypercent = (busy_time * 10000) / ZX_SEC(1);
 
         printf("%3u"
                " %3u.%02u%%"
                " %9lu %4lu %5lu %9lu"
-               " %6lu"
-               " %5lu"
                " %5lu"
                " %8lu %4lu %6lu"
                " %8lu %4lu"
@@ -141,8 +174,6 @@ static enum handler_return threadload(struct timer* t, lk_time_t now, void* arg)
                percpu[i].stats.yields - old_stats[i].yields,
                percpu[i].stats.preempts - old_stats[i].preempts,
                percpu[i].stats.irq_preempts - old_stats[i].irq_preempts,
-               percpu[i].stats.exceptions - old_stats[i].exceptions,
-               percpu[i].stats.page_faults - old_stats[i].page_faults,
                percpu[i].stats.syscalls - old_stats[i].syscalls,
                percpu[i].stats.interrupts - old_stats[i].interrupts,
                percpu[i].stats.timer_ints - old_stats[i].timer_ints,
@@ -154,10 +185,10 @@ static enum handler_return threadload(struct timer* t, lk_time_t now, void* arg)
         last_idle_time[i] = idle_time;
     }
 
-    timer_set(t, now + LK_SEC(1), TIMER_SLACK_CENTER, LK_MSEC(10), &threadload, NULL);
+    timer_set(t, now + ZX_SEC(1), TIMER_SLACK_CENTER, ZX_MSEC(10), &threadload, NULL);
 
     /* reschedule here to allow the debuglog a chance to run */
-    return INT_RESCHEDULE;
+    thread_preempt_set_pending();
 }
 
 static int cmd_threadload(int argc, const cmd_args* argv, uint32_t flags) {
@@ -167,8 +198,8 @@ static int cmd_threadload(int argc, const cmd_args* argv, uint32_t flags) {
     if (showthreadload == false) {
         // start the display
         timer_init(&tltimer);
-        timer_set(&tltimer, current_time() + LK_SEC(1),
-                  TIMER_SLACK_CENTER, LK_MSEC(10), &threadload, NULL);
+        timer_set(&tltimer, current_time() + ZX_SEC(1),
+                  TIMER_SLACK_CENTER, ZX_MSEC(10), &threadload, NULL);
         showthreadload = true;
     } else {
         timer_cancel(&tltimer);
@@ -184,10 +215,7 @@ static int cmd_kill(int argc, const cmd_args* argv, uint32_t flags) {
         return -1;
     }
 
-    bool wait = true;
-    if (argc >= 3 && !strcmp(argv[2].str, "nowait"))
-        wait = false;
-    thread_kill(argv[1].p, wait);
+    thread_kill(argv[1].p);
 
     return 0;
 }

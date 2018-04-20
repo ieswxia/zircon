@@ -8,7 +8,7 @@
 
 function HELP {
     echo "help:"
-    echo "-a <arch>            : arm64, or x86-64"
+    echo "-a <arch>            : arm64, or x64"
     echo "-b                   : build first"
     echo "-c <text>            : add item to kernel commandline"
     echo "-C                   : use Clang build"
@@ -18,7 +18,9 @@ function HELP {
     echo "-d                   : run with emulated disk"
     echo "-D <disk file|device>: specify disk file or device path on host, default is blk.bin"
     echo "--disktype[=<type>]  : should be one of (ahci, virtio, nvme), default is ahci"
+    echo "--diskfmt[=<format>] : disk format (raw, qcow2, etc), default is raw"
     echo "-g                   : use graphical console"
+    echo "-G <version>         : use GIC v2 or v3"
     echo "-I <interface name>  : network interface name, default is qemu."
     echo "-k                   : use KVM"
     echo "-m <memory in MB>    : memory size, default is ${MEMSIZE_DEFAULT}MB"
@@ -33,6 +35,9 @@ function HELP {
     echo "-x <bootdata>        : use specified bootdata"
     echo "--audio[=<host_drv>] : use Intel HD Audio"
     echo "                     : <host_drv> should be one of (alsa, pa, wav, none)"
+    echo "--build-debug        : build an image for use with gdb (equivalent to -d to build-zircon)"
+    echo "--debugger           : Enable gdb stub and wait for connection"
+    echo "--no-serial          : Disable writing out to the guest's serial port"
     echo "--vnc=<display>      : use vnc based display"
     echo "--wavfile=<file>     : When audio host_drv == wav, output to the specified WAV file"
     echo "-h for help"
@@ -48,10 +53,14 @@ AUDIO=
 AUDIO_WAVFILE="/tmp/qemu.wav"
 BUILD=0
 CLANG=0
+DEBUGGER=0
+BUILD_DEBUG=0
 DISK=0
 DISKFILE="blk.bin"
 DISKTYPE=
+DISKFMT="raw"
 BUILDDIR=
+GIC=3
 GRAPHICS=0
 DO_KVM=0
 LTO=0
@@ -64,6 +73,7 @@ RELEASE=0
 UPSCRIPT=no
 VNC=
 VIRTIO=0
+SERIAL=1
 SMP=4
 INITRD=
 CMDLINE=""
@@ -74,7 +84,7 @@ else
   IFNAME="qemu"
 fi
 
-while getopts "Aa:bc:CdD:gI:kLlm:nNo:q:rs:u:Vx:h-:" FLAG; do
+while getopts "Aa:bc:CdD:gG:I:kLlm:nNo:q:rs:u:Vx:h-:" FLAG; do
     case $FLAG in
         A) ASAN=1;;
         a) ARCH=$OPTARG;;
@@ -84,6 +94,7 @@ while getopts "Aa:bc:CdD:gI:kLlm:nNo:q:rs:u:Vx:h-:" FLAG; do
         d) DISK=1;;
         D) DISKFILE=$OPTARG;;
         g) GRAPHICS=1;;
+        G) GIC=$OPTARG;;
         I) IFNAME=$OPTARG;;
         k) DO_KVM=1;;
         L) LTO=1;;
@@ -108,7 +119,11 @@ while getopts "Aa:bc:CdD:gI:kLlm:nNo:q:rs:u:Vx:h-:" FLAG; do
             audio) AUDIO=none;;
             audio=*) AUDIO=${OPTARG#*=};;
             wavfile=*) AUDIO_WAVFILE=${OPTARG#*=};;
+            build-debug) BUILD_DEBUG=1;;
+            debugger) DEBUGGER=1;;
             disktype=*) DISKTYPE=${OPTARG#*=};;
+            diskfmt=*) DISKFMT=${OPTARG#*=};;
+            no-serial) SERIAL=0;;
             vnc=*) VNC=${OPTARG#*=};;
             *)
                 echo unrecognized long option
@@ -126,37 +141,39 @@ if [[ -z $ARCH ]]; then
     HELP
 fi
 
-if [[ "$ARCH" == "x86-64" ]]; then
-    PROJECT=zircon-pc-x86-64
-else
-    PROJECT=zircon-qemu-$ARCH
-fi
+PROJECT="$ARCH"
 
 BUILDDIR_SUFFIX=
 BUILD_ARGS=
 
 if (( $ASAN )); then
     BUILDDIR_SUFFIX+=-asan
-    BUILD_ARGS+=' USE_ASAN=true'
+    BUILD_ARGS+=' -A'
 elif (( $LTO )); then
     BUILDDIR_SUFFIX+=-lto
-    BUILD_ARGS+=' USE_LTO=true'
+    BUILD_ARGS+=' -L'
 elif (( $THINLTO )); then
     BUILDDIR_SUFFIX+=-thinlto
-    BUILD_ARGS+=' USE_THINLTO=true'
+    BUILD_ARGS+=' -l'
 elif (( $CLANG )); then
     BUILDDIR_SUFFIX+=-clang
-    BUILD_ARGS+=' USE_CLANG=true'
+    BUILD_ARGS+=' -C'
 fi
 
 if (( $RELEASE )); then
     BUILDDIR_SUFFIX+=-release
-    BUILD_ARGS+=' DEBUG=0'
+    BUILD_ARGS+=' -r'
+fi
+
+if (( $BUILD_DEBUG )); then
+    BUILD=1
+    BUILD_ARGS+=' -d'
 fi
 
 # build the project if asked for
 if (( $BUILD )); then
-    $DIR/make-parallel $PROJECT $BUILD_ARGS || exit 1
+    # DIR is zircon/scripts, we need to make inside zircon.
+    $DIR/build-zircon -a $ARCH $BUILD_ARGS -- -C "$DIR/.." || exit 1
 fi
 
 # by default use the qemu binary located in the fuchsia buildtools
@@ -189,7 +206,7 @@ if (( !$GRAPHICS  )); then
     ARGS+=" -nographic"
 else
     ARGS+=" -serial stdio"
-    if [[ "$ARCH" == "x86-64" && $VIRTIO == 0 ]]; then
+    if [[ "$ARCH" == "x64" && $VIRTIO == 0 ]]; then
         # Enable Bochs VBE device, which Zircon has a device for
         ARGS+=" -vga std"
     else
@@ -209,7 +226,7 @@ if (( $DISK )); then
         fi
     fi
 
-    ARGS+=" -drive file=${DISKFILE},format=raw,if=none,id=mydisk"
+    ARGS+=" -drive file=${DISKFILE},format=${DISKFMT},if=none,id=mydisk"
     if [[ "$DISKTYPE" == "virtio" ]]; then
         ARGS+=" -device virtio-blk-pci,drive=mydisk"
     elif [[ "$DISKTYPE" == "ahci" ]]; then
@@ -265,7 +282,7 @@ if (( $NET )); then
         SUFFIX=$(for i in {0..2}; do echo -n :${HASH:$(( 2 * $i )):2}; done)
         MAC=",mac=52:54:00$SUFFIX"
     fi
-    if [[ "$ARCH" == "x86-64" ]] && [[ $VIRTIO == 0 ]]; then
+    if [[ "$ARCH" == "x64" ]] && [[ $VIRTIO == 0 ]]; then
         ARGS+=" -device e1000,netdev=net0${MAC}"
     else
         ARGS+=" -device virtio-net-pci,netdev=net0${MAC}"
@@ -295,7 +312,7 @@ fi
 
 if [[ $SMP != 1 ]]; then
     ARGS+=" -smp $SMP"
-    if [[ "$ARCH" == "x86-64" ]]; then
+    if [[ "$ARCH" == "x64" ]]; then
         ARGS+=",threads=2"
     fi
 fi
@@ -308,24 +325,47 @@ if (( $VIRTIO )); then
     ARGS+=" -device virtio-keyboard-pci"
 fi
 
+if (( $DEBUGGER )); then
+    ARGS+=" -s -S"
+fi
+
 case $ARCH in
     arm64)
         QEMU=${QEMUDIR}qemu-system-aarch64
-        ARGS+=" -machine virt -kernel $BUILDDIR/zircon.elf"
+        ARGS+=" -kernel $BUILDDIR/qemu-zircon.bin"
         if (( $DO_KVM )); then
           ARGS+=" -enable-kvm -cpu host"
+          GIC=host
         else
-          ARGS+=" -cpu cortex-a53"
+          ARGS+=" -machine virtualization=true -cpu cortex-a53"
         fi
+        ARGS+=" -machine virt"
+        # append a gic version to the machine specifier
+        if [[ $GIC != 0 ]]; then
+            ARGS+=",gic_version=${GIC}"
+        fi
+
+        if (( !$SERIAL )); then
+          CMDLINE+="kernel.serial=none "
+        fi
+        BOOTDATA="$BUILDDIR/bootdata.bin"
         ;;
-    x86-64)
+    x64)
         QEMU=${QEMUDIR}qemu-system-x86_64
         ARGS+=" -machine q35 -kernel $BUILDDIR/zircon.bin"
+        ARGS+=" -device isa-debug-exit,iobase=0xf4,iosize=0x04"
         if (( $DO_KVM )); then
           ARGS+=" -enable-kvm -cpu host,migratable=no"
         else
-          ARGS+=" -cpu Haswell,+smap,-check"
+          ARGS+=" -cpu Haswell,+smap,-check,-fsgsbase"
         fi
+
+        if (( $SERIAL )); then
+          CMDLINE+="kernel.serial=legacy "
+        else
+          CMDLINE+="kernel.serial=none "
+        fi
+        BOOTDATA="$BUILDDIR/bootdata.bin"
         ;;
     *)
         echo unsupported arch
@@ -336,8 +376,8 @@ esac
 # ramdisk image
 if [[ -n $INITRD ]]; then
     ARGS+=" -initrd $INITRD"
-elif [[ -f "$BUILDDIR/bootdata.bin" ]]; then
-    ARGS+=" -initrd $BUILDDIR/bootdata.bin"
+elif [[ -f "$BOOTDATA" ]]; then
+    ARGS+=" -initrd $BOOTDATA"
 fi
 
 # Propagate our TERM environment variable as a kernel command line

@@ -25,7 +25,7 @@
 //
 // :: Examples ::
 //
-// // A driver that communicates with a ZX_PROTOCOL_ETHERMAC device as a ethmac_ifc_t
+// // A driver that communicates with a ZX_PROTOCOL_ETHERNET_IMPL device as a ethmac_ifc_t
 // class EthDevice;
 // using EthDeviceType = ddk::Device<EthDevice, /* ddk mixins */>;
 //
@@ -38,7 +38,7 @@
 //
 //     zx_status_t Bind() {
 //         ethmac_protocol_t* ops;
-//         auto status = get_device_protocol(parent_, ZX_PROTOCOL_ETHERMAC,
+//         auto status = get_device_protocol(parent_, ZX_PROTOCOL_ETHERNET_IMPL,
 //                                           reinterpret_cast<void**>(&ops));
 //         if (status != ZX_OK) {
 //             return status;
@@ -69,7 +69,7 @@
 // };
 //
 //
-// // A driver that implements a ZX_PROTOCOL_ETHERMAC device
+// // A driver that implements a ZX_PROTOCOL_ETHERNET_IMPL device
 // class EthmacDevice;
 // using EthmacDeviceType = ddk::Device<EthmacDevice, /* ddk mixins */>;
 //
@@ -103,8 +103,14 @@
 //         return ZX_OK;
 //     }
 //
-//     void EthmacSend(uint32_t options, void* data, size_t length) {
+//     zx_status_t EthmacQueueTx(uint32_t options, ethmac_netbuf_t* netbuf) {
 //         // Send the data
+//         return ZX_OK;
+//     }
+//
+//     zx_status_t EthmacSetParam(uint32_t param, int32_t value, void* data) {
+//         // Set the parameter
+//         return ZX_OK;
 //     }
 //
 //   private:
@@ -121,6 +127,7 @@ class EthmacIfc {
         internal::CheckEthmacIfc<D>();
         ifc_.status = Status;
         ifc_.recv = Recv;
+        ifc_.complete_tx = CompleteTx;
     }
 
     ethmac_ifc_t* ethmac_ifc() { return &ifc_; }
@@ -132,6 +139,10 @@ class EthmacIfc {
 
     static void Recv(void* cookie, void* data, size_t length, uint32_t flags) {
         static_cast<D*>(cookie)->EthmacRecv(data, length, flags);
+    }
+
+    static void CompleteTx(void* cookie, ethmac_netbuf_t* netbuf, zx_status_t status) {
+        static_cast<D*>(cookie)->EthmacCompleteTx(netbuf, status);
     }
 
     ethmac_ifc_t ifc_ = {};
@@ -150,6 +161,10 @@ class EthmacIfcProxy {
         ifc_->recv(cookie_, data, length, flags);
     }
 
+    void CompleteTx(ethmac_netbuf_t* netbuf, zx_status_t status) {
+        ifc_->complete_tx(cookie_, netbuf, status);
+    }
+
   private:
     ethmac_ifc_t* ifc_;
     void* cookie_;
@@ -163,11 +178,13 @@ class EthmacProtocol : public internal::base_protocol {
         ops_.query = Query;
         ops_.stop = Stop;
         ops_.start = Start;
-        ops_.send = Send;
+        ops_.queue_tx = QueueTx;
+        ops_.set_param = SetParam;
+        ops_.get_bti = GetBti;
 
         // Can only inherit from one base_protocol implemenation
-        ZX_ASSERT(ddk_proto_ops_ == nullptr);
-        ddk_proto_id_ = ZX_PROTOCOL_ETHERMAC;
+        ZX_ASSERT(ddk_proto_id_ == 0);
+        ddk_proto_id_ = ZX_PROTOCOL_ETHERNET_IMPL;
         ddk_proto_ops_ = &ops_;
     }
 
@@ -185,8 +202,16 @@ class EthmacProtocol : public internal::base_protocol {
         return static_cast<D*>(ctx)->EthmacStart(fbl::move(ifc_proxy));
     }
 
-    static void Send(void* ctx, uint32_t options, void* data, size_t length) {
-        static_cast<D*>(ctx)->EthmacSend(options, data, length);
+    static zx_status_t QueueTx(void* ctx, uint32_t options, ethmac_netbuf_t* netbuf) {
+        return static_cast<D*>(ctx)->EthmacQueueTx(options, netbuf);
+    }
+
+    static zx_status_t SetParam(void* ctx, uint32_t param, int32_t value, void* data) {
+        return static_cast<D*>(ctx)->EthmacSetParam(param, value, data);
+    }
+
+    static zx_handle_t GetBti(void* ctx) {
+        return static_cast<D*>(ctx)->EthmacGetBti();
     }
 
     ethmac_protocol_ops_t ops_ = {};
@@ -212,8 +237,12 @@ class EthmacProtocolProxy {
         ops_->stop(ctx_);
     }
 
-    void Send(uint32_t options, void* data, size_t length) {
-        ops_->send(ctx_, options, data, length);
+    zx_status_t QueueTx(uint32_t options, ethmac_netbuf_t* netbuf) {
+        return ops_->queue_tx(ctx_, options, netbuf);
+    }
+
+    zx_status_t SetParam(uint32_t param, int32_t value, void* data) {
+        return ops_->set_param(ctx_, param, value, data);
     }
 
   private:

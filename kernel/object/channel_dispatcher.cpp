@@ -12,6 +12,7 @@
 #include <err.h>
 #include <trace.h>
 
+#include <lib/counters.h>
 #include <kernel/event.h>
 #include <platform.h>
 #include <object/handle.h>
@@ -19,25 +20,38 @@
 #include <object/process_dispatcher.h>
 #include <object/thread_dispatcher.h>
 
-#include <zircon/rights.h>
 #include <fbl/alloc_checker.h>
 #include <fbl/auto_lock.h>
 #include <fbl/type_support.h>
+#include <zircon/rights.h>
+#include <zircon/types.h>
 
 using fbl::AutoLock;
 
 #define LOCAL_TRACE 0
+
+KCOUNTER(channel_packet_depth_1, "kernel.channel.depth.1");
+KCOUNTER(channel_packet_depth_4, "kernel.channel.depth.4");
+KCOUNTER(channel_packet_depth_16, "kernel.channel.depth.16");
+KCOUNTER(channel_packet_depth_64, "kernel.channel.depth.64");
+KCOUNTER(channel_packet_depth_256, "kernel.channel.depth.256");
+KCOUNTER(channel_packet_depth_unbounded, "kernel.channel.depth.unbounded");
 
 // static
 zx_status_t ChannelDispatcher::Create(fbl::RefPtr<Dispatcher>* dispatcher0,
                                       fbl::RefPtr<Dispatcher>* dispatcher1,
                                       zx_rights_t* rights) {
     fbl::AllocChecker ac;
-    auto ch0 = fbl::AdoptRef(new (&ac) ChannelDispatcher());
+    auto holder0 = fbl::AdoptRef(new (&ac) PeerHolder<ChannelDispatcher>());
+    if (!ac.check())
+        return ZX_ERR_NO_MEMORY;
+    auto holder1 = holder0;
+
+    auto ch0 = fbl::AdoptRef(new (&ac) ChannelDispatcher(fbl::move(holder0)));
     if (!ac.check())
         return ZX_ERR_NO_MEMORY;
 
-    auto ch1 = fbl::AdoptRef(new (&ac) ChannelDispatcher());
+    auto ch1 = fbl::AdoptRef(new (&ac) ChannelDispatcher(fbl::move(holder1)));
     if (!ac.check())
         return ZX_ERR_NO_MEMORY;
 
@@ -50,15 +64,15 @@ zx_status_t ChannelDispatcher::Create(fbl::RefPtr<Dispatcher>* dispatcher0,
     return ZX_OK;
 }
 
-ChannelDispatcher::ChannelDispatcher()
-    : state_tracker_(ZX_CHANNEL_WRITABLE) {
+ChannelDispatcher::ChannelDispatcher(fbl::RefPtr<PeerHolder<ChannelDispatcher>> holder)
+    : PeeredDispatcher(fbl::move(holder), ZX_CHANNEL_WRITABLE) {
 }
 
 // This is called before either ChannelDispatcher is accessible from threads other than the one
 // initializing the channel, so it does not need locking.
 void ChannelDispatcher::Init(fbl::RefPtr<ChannelDispatcher> other) TA_NO_THREAD_SAFETY_ANALYSIS {
-    other_ = fbl::move(other);
-    other_koid_ = other_->get_koid();
+    peer_ = fbl::move(other);
+    peer_koid_ = peer_->get_koid();
 }
 
 ChannelDispatcher::~ChannelDispatcher() {
@@ -69,20 +83,42 @@ ChannelDispatcher::~ChannelDispatcher() {
     // It's not possible to do this safely in on_zero_handles()
 
     messages_.clear();
+    message_count_ = 0;
+
+    switch (max_message_count_) {
+    case 0 ... 1:
+        kcounter_add(channel_packet_depth_1, 1u);
+        break;
+    case 2 ... 4:
+        kcounter_add(channel_packet_depth_4, 1u);
+        break;
+    case 5 ... 16:
+        kcounter_add(channel_packet_depth_16, 1u);
+        break;
+    case 17 ... 64:
+        kcounter_add(channel_packet_depth_64, 1u);
+        break;
+    case 65 ... 256:
+        kcounter_add(channel_packet_depth_256, 1u);
+        break;
+    default:
+        kcounter_add(channel_packet_depth_unbounded, 1u);
+        break;
+    }
 }
 
 zx_status_t ChannelDispatcher::add_observer(StateObserver* observer) {
     canary_.Assert();
 
-    AutoLock lock(&lock_);
+    AutoLock lock(get_lock());
     StateObserver::CountInfo cinfo =
-        {{{messages_.size_slow(), ZX_CHANNEL_READABLE}, {0u, 0u}}};
-    state_tracker_.AddObserver(observer, &cinfo);
+        {{{message_count_, ZX_CHANNEL_READABLE}, {0u, 0u}}};
+    AddObserverLocked(observer, &cinfo);
     return ZX_OK;
 }
 
 void ChannelDispatcher::RemoveWaiter(MessageWaiter* waiter) {
-    AutoLock lock(&lock_);
+    AutoLock lock(get_lock());
     if (!waiter->InContainer()) {
         return;
     }
@@ -92,33 +128,34 @@ void ChannelDispatcher::RemoveWaiter(MessageWaiter* waiter) {
 void ChannelDispatcher::on_zero_handles() {
     canary_.Assert();
 
+    AutoLock lock(get_lock());
     // Detach other endpoint
-    fbl::RefPtr<ChannelDispatcher> other;
-    {
-        AutoLock lock(&lock_);
-        other = fbl::move(other_);
 
-        // (3A) Abort any waiting Call operations
-        // because we've been canceled by reason
-        // of our local handle going away.
-        // Remove waiter from list.
-        while (!waiters_.is_empty()) {
-            auto waiter = waiters_.pop_front();
-            waiter->Cancel(ZX_ERR_CANCELED);
-        }
+    fbl::RefPtr<ChannelDispatcher> other = fbl::move(peer_);
+
+    // (3A) Abort any waiting Call operations
+    // because we've been canceled by reason
+    // of our local handle going away.
+    // Remove waiter from list.
+    while (!waiters_.is_empty()) {
+        auto waiter = waiters_.pop_front();
+        waiter->Cancel(ZX_ERR_CANCELED);
     }
 
     // Ensure other endpoint detaches us
     if (other)
-        other->OnPeerZeroHandles();
+        other->OnPeerZeroHandlesLocked();
 }
 
-void ChannelDispatcher::OnPeerZeroHandles() {
+// This requires holding the shared channel lock. The thread analysis
+// can reason about repeated calls to get_lock() on the shared object,
+// but cannot reason about the aliasing between left->get_lock() and
+// right->get_lock(), which occurs above in on_zero_handles.
+void ChannelDispatcher::OnPeerZeroHandlesLocked() TA_NO_THREAD_SAFETY_ANALYSIS {
     canary_.Assert();
 
-    AutoLock lock(&lock_);
-    other_.reset();
-    state_tracker_.UpdateState(ZX_CHANNEL_WRITABLE, ZX_CHANNEL_PEER_CLOSED);
+    peer_.reset();
+    UpdateStateLocked(ZX_CHANNEL_WRITABLE, ZX_CHANNEL_PEER_CLOSED);
     // (3B) Abort any waiting Call operations
     // because we've been canceled by reason
     // of the opposing endpoint going away.
@@ -138,10 +175,10 @@ zx_status_t ChannelDispatcher::Read(uint32_t* msg_size,
     auto max_size = *msg_size;
     auto max_handle_count = *msg_handle_count;
 
-    AutoLock lock(&lock_);
+    AutoLock lock(get_lock());
 
     if (messages_.is_empty())
-        return other_ ? ZX_ERR_SHOULD_WAIT : ZX_ERR_PEER_CLOSED;
+        return peer_ ? ZX_ERR_SHOULD_WAIT : ZX_ERR_PEER_CLOSED;
 
     *msg_size = messages_.front().data_size();
     *msg_handle_count = messages_.front().num_handles();
@@ -153,9 +190,10 @@ zx_status_t ChannelDispatcher::Read(uint32_t* msg_size,
     }
 
     *msg = messages_.pop_front();
+    message_count_--;
 
     if (messages_.is_empty())
-        state_tracker_.UpdateState(ZX_CHANNEL_READABLE, 0u);
+        UpdateStateLocked(ZX_CHANNEL_READABLE, 0u);
 
     return rv;
 }
@@ -163,19 +201,15 @@ zx_status_t ChannelDispatcher::Read(uint32_t* msg_size,
 zx_status_t ChannelDispatcher::Write(fbl::unique_ptr<MessagePacket> msg) {
     canary_.Assert();
 
-    fbl::RefPtr<ChannelDispatcher> other;
-    {
-        AutoLock lock(&lock_);
-        if (!other_) {
-            // |msg| will be destroyed but we want to keep the handles alive since
-            // the caller should put them back into the process table.
-            msg->set_owns_handles(false);
-            return ZX_ERR_PEER_CLOSED;
-        }
-        other = other_;
+    AutoLock lock(get_lock());
+    if (!peer_) {
+        // |msg| will be destroyed but we want to keep the handles alive since
+        // the caller should put them back into the process table.
+        msg->set_owns_handles(false);
+        return ZX_ERR_PEER_CLOSED;
     }
 
-    if (other->WriteSelf(fbl::move(msg)) > 0)
+    if (peer_->WriteSelf(fbl::move(msg)) > 0)
         thread_reschedule();
 
     return ZX_OK;
@@ -195,10 +229,10 @@ zx_status_t ChannelDispatcher::Call(fbl::unique_ptr<MessagePacket> msg,
         return ZX_ERR_BAD_STATE;
     }
 
-    fbl::RefPtr<ChannelDispatcher> other;
     {
-        AutoLock lock(&lock_);
-        if (!other_) {
+        AutoLock lock(get_lock());
+
+        if (!peer_) {
             // |msg| will be destroyed but we want to keep the handles alive since
             // the caller should put them back into the process table.
             msg->set_owns_handles(false);
@@ -206,15 +240,14 @@ zx_status_t ChannelDispatcher::Call(fbl::unique_ptr<MessagePacket> msg,
             waiter->EndWait(reply);
             return ZX_ERR_PEER_CLOSED;
         }
-        other = other_;
 
         // (0) Before writing the outbound message and waiting, add our
         // waiter to the list.
         waiters_.push_back(waiter);
-    }
 
-    // (1) Write outbound message to opposing endpoint.
-    other->WriteSelf(fbl::move(msg));
+        // (1) Write outbound message to opposing endpoint.
+        peer_->WriteSelf(fbl::move(msg));
+    }
 
     // Reuse the code from the half-call used for retrying a Call after thread
     // suspend.
@@ -242,7 +275,7 @@ zx_status_t ChannelDispatcher::ResumeInterruptedCall(MessageWaiter* waiter,
     // from the list *but* another thread could still
     // cause (3A), (3B), or (3C) before the lock below.
     {
-        AutoLock lock(&lock_);
+        AutoLock lock(get_lock());
 
         // (4) If any of (3A), (3B), or (3C) have occurred,
         // we were removed from the waiters list already
@@ -256,10 +289,12 @@ zx_status_t ChannelDispatcher::ResumeInterruptedCall(MessageWaiter* waiter,
     return status;
 }
 
+size_t ChannelDispatcher::TxMessageMax() const {
+    return SIZE_MAX;
+}
+
 int ChannelDispatcher::WriteSelf(fbl::unique_ptr<MessagePacket> msg) {
     canary_.Assert();
-
-    AutoLock lock(&lock_);
 
     if (!waiters_.is_empty()) {
         // If the far side is waiting for replies to messages
@@ -277,36 +312,18 @@ int ChannelDispatcher::WriteSelf(fbl::unique_ptr<MessagePacket> msg) {
         }
     }
     messages_.push_back(fbl::move(msg));
+    message_count_++;
+    if (message_count_ > max_message_count_) {
+        max_message_count_ = message_count_;
+    }
 
-    state_tracker_.UpdateState(0u, ZX_CHANNEL_READABLE);
+    UpdateStateLocked(0u, ZX_CHANNEL_READABLE);
     return 0;
-}
-
-zx_status_t ChannelDispatcher::user_signal(uint32_t clear_mask, uint32_t set_mask, bool peer) {
-    canary_.Assert();
-
-    if ((set_mask & ~ZX_USER_SIGNAL_ALL) || (clear_mask & ~ZX_USER_SIGNAL_ALL))
-        return ZX_ERR_INVALID_ARGS;
-
-    if (!peer) {
-        state_tracker_.UpdateState(clear_mask, set_mask);
-        return ZX_OK;
-    }
-
-    fbl::RefPtr<ChannelDispatcher> other;
-    {
-        AutoLock lock(&lock_);
-        if (!other_)
-            return ZX_ERR_PEER_CLOSED;
-        other = other_;
-    }
-
-    return other->UserSignalSelf(clear_mask, set_mask);
 }
 
 zx_status_t ChannelDispatcher::UserSignalSelf(uint32_t clear_mask, uint32_t set_mask) {
     canary_.Assert();
-    state_tracker_.UpdateState(clear_mask, set_mask);
+    UpdateStateLocked(clear_mask, set_mask);
     return ZX_OK;
 }
 
@@ -346,7 +363,7 @@ int ChannelDispatcher::MessageWaiter::Cancel(zx_status_t status) {
     return event_.Signal(status);
 }
 
-zx_status_t ChannelDispatcher::MessageWaiter::Wait(lk_time_t deadline) {
+zx_status_t ChannelDispatcher::MessageWaiter::Wait(zx_time_t deadline) {
     if (unlikely(!channel_)) {
         return ZX_ERR_BAD_STATE;
     }

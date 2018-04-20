@@ -47,11 +47,12 @@ struct udisplay_info {
     void* framebuffer_virt;
     size_t framebuffer_size;
     struct display_info info;
+    fbl::RefPtr<VmMapping> framebuffer_vmo_mapping;
 };
 
-static struct udisplay_info g_udisplay;
+static struct udisplay_info g_udisplay = {};
 
-status_t udisplay_init(void) {
+zx_status_t udisplay_init(void) {
     return ZX_OK;
 }
 
@@ -98,11 +99,11 @@ void dlog_bluescreen_halt(void) {
 
 }
 
-status_t udisplay_set_framebuffer(paddr_t fb_phys, size_t fb_size) {
+zx_status_t udisplay_set_framebuffer(paddr_t fb_phys, size_t fb_size) {
     g_udisplay.framebuffer_size = fb_size;
 
     // map the framebuffer
-    status_t result = VmAspace::kernel_aspace()->AllocPhysical(
+    zx_status_t result = VmAspace::kernel_aspace()->AllocPhysical(
         "udisplay_fb",
         g_udisplay.framebuffer_size,
         &g_udisplay.framebuffer_virt,
@@ -117,13 +118,21 @@ status_t udisplay_set_framebuffer(paddr_t fb_phys, size_t fb_size) {
     return ZX_OK;
 }
 
-status_t udisplay_set_framebuffer_vmo(fbl::RefPtr<VmObject> vmo) {
-    g_udisplay.framebuffer_size = 0;
-    g_udisplay.framebuffer_virt = 0;
+void udisplay_clear_framebuffer_vmo() {
+    if (g_udisplay.framebuffer_vmo_mapping) {
+        g_udisplay.framebuffer_size = 0;
+        g_udisplay.framebuffer_virt = 0;
+        g_udisplay.framebuffer_vmo_mapping->Destroy();
+        g_udisplay.framebuffer_vmo_mapping = nullptr;
+    }
+}
+
+zx_status_t udisplay_set_framebuffer_vmo(fbl::RefPtr<VmObject> vmo) {
+    udisplay_clear_framebuffer_vmo();
 
     const size_t size = vmo->size();
     fbl::RefPtr<VmMapping> mapping;
-    status_t status = VmAspace::kernel_aspace()->RootVmar()->CreateVmMapping(
+    zx_status_t status = VmAspace::kernel_aspace()->RootVmar()->CreateVmMapping(
             0 /* ignored */, size, 0 /* align pow2 */, 0 /* vmar flags */,
             fbl::move(vmo), 0, kFramebufferArchMmuFlags, "framebuffer_vmo", &mapping);
     if (status != ZX_OK)
@@ -137,15 +146,16 @@ status_t udisplay_set_framebuffer_vmo(fbl::RefPtr<VmObject> vmo) {
 
     g_udisplay.framebuffer_virt = reinterpret_cast<void*>(mapping->base());
     g_udisplay.framebuffer_size = size;
+    g_udisplay.framebuffer_vmo_mapping = mapping;
     return ZX_OK;
 }
 
-status_t udisplay_set_display_info(struct display_info* display) {
+zx_status_t udisplay_set_display_info(struct display_info* display) {
     memcpy(&g_udisplay.info, display, sizeof(struct display_info));
     return ZX_OK;
 }
 
-status_t udisplay_bind_gfxconsole(void) {
+zx_status_t udisplay_bind_gfxconsole(void) {
     if (g_udisplay.framebuffer_virt == 0)
         return ZX_ERR_NOT_FOUND;
 

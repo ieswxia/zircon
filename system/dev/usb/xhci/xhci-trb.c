@@ -2,16 +2,21 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#include <assert.h>
+#include <hw/arch_ops.h>
+
 #include "xhci.h"
 
-zx_status_t xhci_transfer_ring_init(xhci_transfer_ring_t* ring, int count) {
-    zx_status_t status = io_buffer_init(&ring->buffer, count * sizeof(xhci_trb_t),
-                                        IO_BUFFER_RW | IO_BUFFER_CONTIG);
+zx_status_t xhci_transfer_ring_init(xhci_transfer_ring_t* ring, zx_handle_t bti_handle, int count) {
+    zx_status_t status = io_buffer_init(&ring->buffer, bti_handle,
+                                        count * sizeof(xhci_trb_t),
+                                        IO_BUFFER_RW | IO_BUFFER_CONTIG | XHCI_IO_BUFFER_UNCACHED);
     if (status != ZX_OK) return status;
 
     ring->start = io_buffer_virt(&ring->buffer);
     ring->current = ring->start;
     ring->dequeue_ptr = ring->start;
+    ring->full = false;
     ring->size = count - 1;    // subtract 1 for LINK TRB at the end
     ring->pcs = TRB_C;
 
@@ -29,6 +34,12 @@ void xhci_transfer_ring_free(xhci_transfer_ring_t* ring) {
 size_t xhci_transfer_ring_free_trbs(xhci_transfer_ring_t* ring) {
     xhci_trb_t* current = ring->current;
     xhci_trb_t* dequeue_ptr = ring->dequeue_ptr;
+
+    if (ring->full) {
+        assert(current == dequeue_ptr);
+        return 0;
+    }
+
     int size = ring->size;
 
     if (current < dequeue_ptr) {
@@ -39,15 +50,15 @@ size_t xhci_transfer_ring_free_trbs(xhci_transfer_ring_t* ring) {
     return size - busy_count;
 }
 
-zx_status_t xhci_event_ring_init(xhci_t* xhci, int interrupter, int count) {
-    xhci_event_ring_t* ring = &xhci->event_rings[interrupter];
-    // allocate buffer for TRBs
-    zx_status_t status = io_buffer_init(&ring->buffer, count * sizeof(xhci_trb_t),
-                                        IO_BUFFER_RW | IO_BUFFER_CONTIG);
+zx_status_t xhci_event_ring_init(xhci_event_ring_t* ring, zx_handle_t bti_handle,
+                                 erst_entry_t* erst_array, int count) {
+    // allocate a read-only buffer for TRBs
+    zx_status_t status = io_buffer_init(&ring->buffer, bti_handle,
+                                        count * sizeof(xhci_trb_t),
+                                        IO_BUFFER_RO | IO_BUFFER_CONTIG | XHCI_IO_BUFFER_UNCACHED);
     if (status != ZX_OK) return status;
 
     ring->start = io_buffer_virt(&ring->buffer);
-    erst_entry_t* erst_array = xhci->erst_arrays[interrupter];
     XHCI_WRITE64(&erst_array[0].ptr, io_buffer_phys(&ring->buffer));
     XHCI_WRITE32(&erst_array[0].size, count);
 
@@ -57,8 +68,7 @@ zx_status_t xhci_event_ring_init(xhci_t* xhci, int interrupter, int count) {
     return ZX_OK;
 }
 
-void xhci_event_ring_free(xhci_t* xhci, int interrupter) {
-    xhci_event_ring_t* ring = &xhci->event_rings[interrupter];
+void xhci_event_ring_free(xhci_event_ring_t* ring) {
     io_buffer_release(&ring->buffer);
 }
 
@@ -105,4 +115,15 @@ void xhci_increment_ring(xhci_transfer_ring_t* ring) {
         }
         ring->current = xhci_read_trb_ptr(ring, trb);
     }
+
+    if (ring->current == ring->dequeue_ptr) {
+        // We've just enqueued something, so if the pointers are equal,
+        // the ring must be full.
+        ring->full = true;
+    }
+}
+
+void xhci_set_dequeue_ptr(xhci_transfer_ring_t* ring, xhci_trb_t* new_ptr) {
+    ring->dequeue_ptr = new_ptr;
+    ring->full = false;
 }

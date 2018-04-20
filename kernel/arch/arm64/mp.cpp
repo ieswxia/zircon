@@ -7,20 +7,21 @@
 
 #include <arch/mp.h>
 
-#include <assert.h>
-#include <trace.h>
-#include <err.h>
-#include <dev/interrupt.h>
 #include <arch/ops.h>
+#include <assert.h>
+#include <dev/interrupt.h>
+#include <err.h>
+#include <trace.h>
+#include <zircon/types.h>
 
 #define LOCAL_TRACE 0
 
 // map of cluster/cpu to cpu_id
-uint arm64_cpu_map[SMP_CPU_MAX_CLUSTERS][SMP_CPU_MAX_CLUSTER_CPUS] = { { 0 } };
+uint arm64_cpu_map[SMP_CPU_MAX_CLUSTERS][SMP_CPU_MAX_CLUSTER_CPUS] = {{0}};
 
 // cpu id to cluster and id within cluster map
-uint arm64_cpu_cluster_ids[SMP_MAX_CPUS] = { 0 };
-uint arm64_cpu_cpu_ids[SMP_MAX_CPUS] = { 0 };
+uint arm64_cpu_cluster_ids[SMP_MAX_CPUS] = {0};
+uint arm64_cpu_cpu_ids[SMP_MAX_CPUS] = {0};
 
 // total number of detected cpus
 uint arm_num_cpus = 1;
@@ -64,15 +65,27 @@ static uint arch_curr_cpu_num_slow() {
     return arm64_cpu_map[cluster][cpu];
 }
 
-status_t arch_mp_send_ipi(mp_ipi_target_t target, mp_cpu_mask_t mask, mp_ipi_t ipi) {
+void arch_prepare_current_cpu_idle_state(bool idle) {
+    // no-op
+}
+
+zx_status_t arch_mp_reschedule(cpu_mask_t mask) {
+    return arch_mp_send_ipi(MP_IPI_TARGET_MASK, mask, MP_IPI_RESCHEDULE);
+}
+
+zx_status_t arch_mp_send_ipi(mp_ipi_target_t target, cpu_mask_t mask, mp_ipi_t ipi) {
     LTRACEF("target %d mask %#x, ipi %d\n", target, mask, ipi);
 
     // translate the high level target + mask mechanism into just a mask
-    if (target == MP_IPI_TARGET_ALL) {
+    switch (target) {
+    case MP_IPI_TARGET_ALL:
         mask = (1ul << SMP_MAX_CPUS) - 1;
-    } else if (target == MP_IPI_TARGET_ALL) {
+        break;
+    case MP_IPI_TARGET_ALL_BUT_LOCAL:
         mask = (1ul << SMP_MAX_CPUS) - 1;
-        mask &= ~(1u << arch_curr_cpu_num());
+        mask &= ~cpu_num_to_mask(arch_curr_cpu_num());
+        break;
+    case MP_IPI_TARGET_MASK:;
     }
 
     return interrupt_send_ipi(mask, ipi);
@@ -89,6 +102,6 @@ void arch_mp_init_percpu(void) {
     interrupt_init_percpu();
 }
 
-void arch_flush_state_and_halt(event_t *flush_done) {
+void arch_flush_state_and_halt(event_t* flush_done) {
     PANIC_UNIMPLEMENTED;
 }

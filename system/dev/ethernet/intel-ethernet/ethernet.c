@@ -10,6 +10,7 @@
 #include <ddk/protocol/pci.h>
 #include <hw/pci.h>
 
+#include <zircon/assert.h>
 #include <zircon/device/ethernet.h>
 #include <zircon/syscalls.h>
 #include <zircon/types.h>
@@ -21,15 +22,22 @@
 typedef zx_status_t status_t;
 #include "ie.h"
 
+typedef enum {
+    ETH_RUNNING = 0,
+    ETH_SUSPENDING,
+    ETH_SUSPENDED,
+} eth_state;
+
 typedef struct ethernet_device {
     ethdev_t eth;
     mtx_t lock;
+    eth_state state;
     zx_device_t* zxdev;
     pci_protocol_t pci;
     zx_handle_t ioh;
     zx_handle_t irqh;
-    bool edge_triggered_irq;
     thrd_t thread;
+    zx_handle_t btih;
     io_buffer_t buffer;
     bool online;
 
@@ -42,14 +50,11 @@ static int irq_thread(void* arg) {
     ethernet_device_t* edev = arg;
     for (;;) {
         zx_status_t r;
-        if ((r = zx_interrupt_wait(edev->irqh)) < 0) {
+        uint64_t slots;
+        if ((r = zx_interrupt_wait(edev->irqh, &slots)) < 0) {
             printf("eth: irq wait failed? %d\n", r);
-            zx_interrupt_complete(edev->irqh);
             break;
         }
-
-        if (edev->edge_triggered_irq)
-            zx_interrupt_complete(edev->irqh);
 
         mtx_lock(&edev->lock);
         unsigned irq = eth_handle_irq(&edev->eth);
@@ -58,7 +63,7 @@ static int irq_thread(void* arg) {
             size_t len;
 
             while (eth_rx(&edev->eth, &data, &len) == ZX_OK) {
-                if (edev->ifc) {
+                if (edev->ifc && (edev->state == ETH_RUNNING)) {
                     edev->ifc->recv(edev->cookie, data, len, 0);
                 }
                 eth_rx_ack(&edev->eth);
@@ -73,12 +78,8 @@ static int irq_thread(void* arg) {
                     edev->ifc->status(edev->cookie, online ? ETH_STATUS_ONLINE : 0);
                 }
             }
-
         }
         mtx_unlock(&edev->lock);
-
-        if (!edev->edge_triggered_irq)
-            zx_interrupt_complete(edev->irqh);
     }
     return 0;
 }
@@ -91,7 +92,8 @@ static zx_status_t eth_query(void* ctx, uint32_t options, ethmac_info_t* info) {
     }
 
     memset(info, 0, sizeof(*info));
-    info->mtu = ETH_RXBUF_SIZE; //TODO: not actually the mtu!
+    ZX_DEBUG_ASSERT(ETH_TXBUF_SIZE >= ETH_MTU);
+    info->mtu = ETH_MTU;
     memcpy(info->mac, edev->eth.mac, sizeof(edev->eth.mac));
 
     return ZX_OK;
@@ -121,22 +123,94 @@ static zx_status_t eth_start(void* ctx, ethmac_ifc_t* ifc, void* cookie) {
     return status;
 }
 
-static void eth_send(void* ctx, uint32_t options, void* data, size_t length) {
+static zx_status_t eth_queue_tx(void* ctx, uint32_t options, ethmac_netbuf_t* netbuf) {
     ethernet_device_t* edev = ctx;
-    eth_tx(&edev->eth, data, length);
+    if (edev->state != ETH_RUNNING) {
+        return ZX_ERR_BAD_STATE;
+    }
+    // TODO: Add support for DMA directly from netbuf
+    return eth_tx(&edev->eth, netbuf->data, netbuf->len);
+}
+
+static zx_status_t eth_set_param(void *ctx, uint32_t param, int32_t value, void* data) {
+    ethernet_device_t* edev = ctx;
+    zx_status_t status = ZX_OK;
+
+    mtx_lock(&edev->lock);
+
+    switch (param) {
+    case ETHMAC_SETPARAM_PROMISC:
+        if ((bool)value) {
+            eth_start_promisc(&edev->eth);
+        } else {
+            eth_stop_promisc(&edev->eth);
+        }
+        status = ZX_OK;
+        break;
+    default:
+        status = ZX_ERR_NOT_SUPPORTED;
+    }
+    mtx_unlock(&edev->lock);
+
+    return status;
 }
 
 static ethmac_protocol_ops_t ethmac_ops = {
     .query = eth_query,
     .stop = eth_stop,
     .start = eth_start,
-    .send = eth_send,
+    .queue_tx = eth_queue_tx,
+    .set_param = eth_set_param,
 };
+
+static zx_status_t eth_suspend(void* ctx, uint32_t flags) {
+    ethernet_device_t* edev = ctx;
+    mtx_lock(&edev->lock);
+    edev->state = ETH_SUSPENDING;
+
+    // Immediately disable the rx queue
+    eth_disable_rx(&edev->eth);
+
+    // Wait for queued tx packets to complete
+    int iterations = 0;
+    do {
+        if (!eth_tx_queued(&edev->eth)) {
+            goto tx_done;
+        }
+        mtx_unlock(&edev->lock);
+        zx_nanosleep(zx_deadline_after(ZX_MSEC(1)));
+        iterations++;
+        mtx_lock(&edev->lock);
+    } while (iterations < 10);
+    printf("intel-eth: timed out waiting for tx queue to drain when suspending\n");
+
+tx_done:
+    eth_disable_tx(&edev->eth);
+    eth_disable_phy(&edev->eth);
+    edev->state = ETH_SUSPENDED;
+    mtx_unlock(&edev->lock);
+    return ZX_OK;
+}
+
+static zx_status_t eth_resume(void* ctx, uint32_t flags) {
+    ethernet_device_t* edev = ctx;
+    mtx_lock(&edev->lock);
+    eth_enable_phy(&edev->eth);
+    eth_enable_rx(&edev->eth);
+    eth_enable_tx(&edev->eth);
+    edev->state = ETH_RUNNING;
+    mtx_unlock(&edev->lock);
+    return ZX_OK;
+}
 
 static void eth_release(void* ctx) {
     ethernet_device_t* edev = ctx;
     eth_reset_hw(&edev->eth);
-    pci_enable_bus_master(&edev->pci, true);
+    pci_enable_bus_master(&edev->pci, false);
+
+    io_buffer_release(&edev->buffer);
+
+    zx_handle_close(edev->btih);
     zx_handle_close(edev->irqh);
     zx_handle_close(edev->ioh);
     free(edev);
@@ -144,10 +218,12 @@ static void eth_release(void* ctx) {
 
 static zx_protocol_device_t device_ops = {
     .version = DEVICE_OPS_VERSION,
+    .suspend = eth_suspend,
+    .resume = eth_resume,
     .release = eth_release,
 };
 
-static zx_status_t eth_bind(void* ctx, zx_device_t* dev, void** cookie) {
+static zx_status_t eth_bind(void* ctx, zx_device_t* dev) {
     ethernet_device_t* edev;
     if ((edev = calloc(1, sizeof(ethernet_device_t))) == NULL) {
         return ZX_ERR_NO_MEMORY;
@@ -160,15 +236,18 @@ static zx_status_t eth_bind(void* ctx, zx_device_t* dev, void** cookie) {
         goto fail;
     }
 
+    zx_status_t status = pci_get_bti(&edev->pci, 0, &edev->btih);
+    if (status != ZX_OK) {
+        goto fail;
+    }
+
     // Query whether we have MSI or Legacy interrupts.
     uint32_t irq_cnt = 0;
-    if ((pci_query_irq_mode_caps(&edev->pci, ZX_PCIE_IRQ_MODE_MSI, &irq_cnt) == ZX_OK) &&
+    if ((pci_query_irq_mode(&edev->pci, ZX_PCIE_IRQ_MODE_MSI, &irq_cnt) == ZX_OK) &&
         (pci_set_irq_mode(&edev->pci, ZX_PCIE_IRQ_MODE_MSI, 1) == ZX_OK)) {
-        edev->edge_triggered_irq = true;
         printf("eth: using MSI mode\n");
-    } else if ((pci_query_irq_mode_caps(&edev->pci, ZX_PCIE_IRQ_MODE_LEGACY, &irq_cnt) == ZX_OK) &&
+    } else if ((pci_query_irq_mode(&edev->pci, ZX_PCIE_IRQ_MODE_LEGACY, &irq_cnt) == ZX_OK) &&
                (pci_set_irq_mode(&edev->pci, ZX_PCIE_IRQ_MODE_LEGACY, 1) == ZX_OK)) {
-        edev->edge_triggered_irq = false;
         printf("eth: using legacy irq mode\n");
     } else {
         printf("eth: failed to configure irqs\n");
@@ -185,7 +264,7 @@ static zx_status_t eth_bind(void* ctx, zx_device_t* dev, void** cookie) {
     uint64_t sz;
     zx_handle_t h;
     void* io;
-    r = pci_map_resource(&edev->pci, PCI_RESOURCE_BAR_0, ZX_CACHE_POLICY_UNCACHED_DEVICE, &io, &sz, &h);
+    r = pci_map_bar(&edev->pci, 0u, ZX_CACHE_POLICY_UNCACHED_DEVICE, &io, &sz, &h);
     if (r != ZX_OK) {
         printf("eth: cannot map io %d\n", h);
         goto fail;
@@ -198,11 +277,15 @@ static zx_status_t eth_bind(void* ctx, zx_device_t* dev, void** cookie) {
         goto fail;
     }
 
+    if (eth_enable_phy(&edev->eth) != ZX_OK) {
+        goto fail;
+    }
+
     if (eth_reset_hw(&edev->eth)) {
         goto fail;
     }
 
-    r = io_buffer_init(&edev->buffer, ETH_ALLOC, IO_BUFFER_RW | IO_BUFFER_CONTIG);
+    r = io_buffer_init(&edev->buffer, edev->btih, ETH_ALLOC, IO_BUFFER_RW | IO_BUFFER_CONTIG);
     if (r < 0) {
         printf("eth: cannot alloc io-buffer %d\n", r);
         goto fail;
@@ -216,7 +299,7 @@ static zx_status_t eth_bind(void* ctx, zx_device_t* dev, void** cookie) {
         .name = "intel-ethernet",
         .ctx = edev,
         .ops = &device_ops,
-        .proto_id = ZX_PROTOCOL_ETHERMAC,
+        .proto_id = ZX_PROTOCOL_ETHERNET_IMPL,
         .proto_ops = &ethmac_ops,
     };
 
@@ -233,8 +316,11 @@ static zx_status_t eth_bind(void* ctx, zx_device_t* dev, void** cookie) {
 
 fail:
     io_buffer_release(&edev->buffer);
+    if (edev->btih) {
+        zx_handle_close(edev->btih);
+    }
     if (edev->ioh) {
-        pci_enable_bus_master(&edev->pci, true);
+        pci_enable_bus_master(&edev->pci, false);
         zx_handle_close(edev->irqh);
         zx_handle_close(edev->ioh);
     }
@@ -248,14 +334,16 @@ static zx_driver_ops_t intel_ethernet_driver_ops = {
 };
 
 // clang-format off
-ZIRCON_DRIVER_BEGIN(intel_ethernet, intel_ethernet_driver_ops, "zircon", "0.1", 9)
+ZIRCON_DRIVER_BEGIN(intel_ethernet, intel_ethernet_driver_ops, "zircon", "0.1", 11)
     BI_ABORT_IF(NE, BIND_PROTOCOL, ZX_PROTOCOL_PCI),
     BI_ABORT_IF(NE, BIND_PCI_VID, 0x8086),
     BI_MATCH_IF(EQ, BIND_PCI_DID, 0x100E), // Qemu
     BI_MATCH_IF(EQ, BIND_PCI_DID, 0x15A3), // Broadwell
     BI_MATCH_IF(EQ, BIND_PCI_DID, 0x1570), // Skylake
     BI_MATCH_IF(EQ, BIND_PCI_DID, 0x1533), // I210 standalone
+    BI_MATCH_IF(EQ, BIND_PCI_DID, 0x1539), // I211-AT
+    BI_MATCH_IF(EQ, BIND_PCI_DID, 0x156f), // I219-LM (Dawson Canyon NUC)
     BI_MATCH_IF(EQ, BIND_PCI_DID, 0x15b7), // Skull Canyon NUC
-    BI_MATCH_IF(EQ, BIND_PCI_DID, 0x15b8), // I219
+    BI_MATCH_IF(EQ, BIND_PCI_DID, 0x15b8), // I219-V
     BI_MATCH_IF(EQ, BIND_PCI_DID, 0x15d8), // Kaby Lake NUC
 ZIRCON_DRIVER_END(intel_ethernet)

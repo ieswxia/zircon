@@ -5,11 +5,11 @@
 // license that can be found in the LICENSE file or at
 // https://opensource.org/licenses/MIT
 
-
 #pragma once
 
 #include <arch/defines.h>
 
+// clang-format off
 #define IFTE(c,t,e) (!!(c) * (t) | !(c) * (e))
 #define NBITS01(n)      IFTE(n, 1, 0)
 #define NBITS02(n)      IFTE((n) >>  1,  1 + NBITS01((n) >>  1), NBITS01(n))
@@ -21,10 +21,6 @@
 
 #ifndef MMU_KERNEL_SIZE_SHIFT
 #define KERNEL_ASPACE_BITS (NBITS(0xffffffffffffffff-KERNEL_ASPACE_BASE))
-#define KERNEL_BASE_BITS (NBITS(0xffffffffffffffff-KERNEL_BASE))
-#if KERNEL_BASE_BITS > KERNEL_ASPACE_BITS
-#define KERNEL_ASPACE_BITS KERNEL_BASE_BITS /* KERNEL_BASE should not be below KERNEL_ASPACE_BASE */
-#endif
 
 #if KERNEL_ASPACE_BITS < 25
 #define MMU_KERNEL_SIZE_SHIFT (25)
@@ -41,10 +37,16 @@
 #define MMU_IDENT_SIZE_SHIFT 42 /* Max size supported by block mappings */
 #endif
 
+// See ARM DDI 0487B.b, Table D4-25 for the maximum IPA range that can be used.
+// This size is based on a 4KB granule and a starting level of 1. We chose this
+// size due to the 40-bit physical address range on Cortex-A53.
+#define MMU_GUEST_SIZE_SHIFT 36
+
 #define MMU_MAX_PAGE_SIZE_SHIFT 48
 
 #define MMU_KERNEL_PAGE_SIZE_SHIFT      (PAGE_SIZE_SHIFT)
 #define MMU_USER_PAGE_SIZE_SHIFT        (USER_PAGE_SIZE_SHIFT)
+#define MMU_GUEST_PAGE_SIZE_SHIFT       (USER_PAGE_SIZE_SHIFT)
 
 #if MMU_IDENT_SIZE_SHIFT < 25
 #error MMU_IDENT_SIZE_SHIFT too small
@@ -90,6 +92,7 @@
 #error User address space size must be larger than page size
 #endif
 #define MMU_USER_PAGE_TABLE_ENTRIES_TOP (0x1 << (MMU_USER_SIZE_SHIFT - MMU_USER_TOP_SHIFT))
+#define MMU_USER_PAGE_TABLE_ENTRIES (0x1 << (MMU_USER_PAGE_SIZE_SHIFT - 3))
 
 #if MMU_KERNEL_SIZE_SHIFT > MMU_LX_X(MMU_KERNEL_PAGE_SIZE_SHIFT, 0)
 #define MMU_KERNEL_TOP_SHIFT MMU_LX_X(MMU_KERNEL_PAGE_SIZE_SHIFT, 0)
@@ -103,6 +106,7 @@
 #error Kernel address space size must be larger than page size
 #endif
 #define MMU_KERNEL_PAGE_TABLE_ENTRIES_TOP (0x1 << (MMU_KERNEL_SIZE_SHIFT - MMU_KERNEL_TOP_SHIFT))
+#define MMU_KERNEL_PAGE_TABLE_ENTRIES (0x1 << (MMU_KERNEL_PAGE_SIZE_SHIFT - 3))
 
 #if MMU_IDENT_SIZE_SHIFT > MMU_LX_X(MMU_IDENT_PAGE_SIZE_SHIFT, 0)
 #define MMU_IDENT_TOP_SHIFT MMU_LX_X(MMU_IDENT_PAGE_SIZE_SHIFT, 0)
@@ -118,9 +122,23 @@
 #define MMU_PAGE_TABLE_ENTRIES_IDENT_SHIFT (MMU_IDENT_SIZE_SHIFT - MMU_IDENT_TOP_SHIFT)
 #define MMU_PAGE_TABLE_ENTRIES_IDENT (0x1 << MMU_PAGE_TABLE_ENTRIES_IDENT_SHIFT)
 
+#if MMU_GUEST_SIZE_SHIFT > MMU_LX_X(MMU_GUEST_PAGE_SIZE_SHIFT, 0)
+#define MMU_GUEST_TOP_SHIFT MMU_LX_X(MMU_GUEST_PAGE_SIZE_SHIFT, 0)
+#elif MMU_GUEST_SIZE_SHIFT > MMU_LX_X(MMU_GUEST_PAGE_SIZE_SHIFT, 1)
+#define MMU_GUEST_TOP_SHIFT MMU_LX_X(MMU_GUEST_PAGE_SIZE_SHIFT, 1)
+#elif MMU_GUEST_SIZE_SHIFT > MMU_LX_X(MMU_GUEST_PAGE_SIZE_SHIFT, 2)
+#define MMU_GUEST_TOP_SHIFT MMU_LX_X(MMU_GUEST_PAGE_SIZE_SHIFT, 2)
+#elif MMU_GUEST_SIZE_SHIFT > MMU_LX_X(MMU_GUEST_PAGE_SIZE_SHIFT, 3)
+#define MMU_GUEST_TOP_SHIFT MMU_LX_X(MMU_GUEST_PAGE_SIZE_SHIFT, 3)
+#else
+#error Guest physical address space size must be larger than page size
+#endif
+#define MMU_GUEST_PAGE_TABLE_ENTRIES_TOP (0x1 << (MMU_GUEST_SIZE_SHIFT - MMU_GUEST_TOP_SHIFT))
+#define MMU_GUEST_PAGE_TABLE_ENTRIES (0x1 << (MMU_GUEST_PAGE_SIZE_SHIFT - 3))
+
 #define MMU_PTE_DESCRIPTOR_BLOCK_MAX_SHIFT      (30)
 
-#ifndef ASSEMBLY
+#ifndef __ASSEMBLER__
 #define BM(base, count, val) (((val) & ((1UL << (count)) - 1)) << (base))
 #else
 #define BM(base, count, val) (((val) & ((0x1 << (count)) - 1)) << (base))
@@ -152,6 +170,11 @@
 #define MMU_TCR_IRGN0(cache_flags)              BM( 8, 2, (cache_flags))
 #define MMU_TCR_EPD0                            BM( 7, 1, 1)
 #define MMU_TCR_T0SZ(size)                      BM( 0, 6, (size))
+
+#define MMU_TCR_EL2_RES1                        (BM(31, 1, 1) | BM(23, 1, 1))
+
+#define MMU_VTCR_EL2_RES1                       BM(31, 1, 1)
+#define MMU_VTCR_EL2_SL0(starting_level)        BM( 6, 2, (starting_level))
 
 #define MMU_MAIR_ATTR(index, attr)              BM(index * 8, 8, (attr))
 
@@ -201,9 +224,21 @@
 #define MMU_PTE_ATTR_ATTR_INDEX(attrindex)      BM(2, 3, attrindex)
 #define MMU_PTE_ATTR_ATTR_INDEX_MASK            MMU_PTE_ATTR_ATTR_INDEX(7)
 
-#define MMU_PTE_PERMISSION_MASK (MMU_PTE_ATTR_AP_MASK | \
-                                 MMU_PTE_ATTR_UXN | \
-                                 MMU_PTE_ATTR_PXN)
+#define MMU_PTE_PERMISSION_MASK                 (MMU_PTE_ATTR_AP_MASK | \
+                                                 MMU_PTE_ATTR_UXN | \
+                                                 MMU_PTE_ATTR_PXN)
+
+#define MMU_S2_PTE_ATTR_XN                      BM(53, 2, 2)
+
+#define MMU_S2_PTE_ATTR_S2AP_RO                 BM(6, 2, 1)
+#define MMU_S2_PTE_ATTR_S2AP_RW                 BM(6, 2, 3)
+
+/* Normal, Outer Write-Back Cacheable, Inner Write-Back Cacheable. */
+#define MMU_S2_PTE_ATTR_NORMAL_MEMORY           BM(2, 4, 0xf)
+/* Device, Device-nGnRnE memory. */
+#define MMU_S2_PTE_ATTR_STRONGLY_ORDERED        BM(2, 4, 0x0)
+/* Device, Device-nGnRE memory. */
+#define MMU_S2_PTE_ATTR_DEVICE                  BM(2, 4, 0x1)
 
 /* Default configuration for main kernel page table:
  *    - do cached translation walks
@@ -223,7 +258,10 @@
 #define MMU_MAIR_ATTR2                  MMU_MAIR_ATTR(2, 0xff)
 #define MMU_PTE_ATTR_NORMAL_MEMORY      MMU_PTE_ATTR_ATTR_INDEX(2)
 
-#define MMU_MAIR_ATTR3                  (0)
+/* Normal Memory, Inner/Outer uncached, Write Combined */
+#define MMU_MAIR_ATTR3                  MMU_MAIR_ATTR(3, 0x44)
+#define MMU_PTE_ATTR_NORMAL_UNCACHED    MMU_PTE_ATTR_ATTR_INDEX(3)
+
 #define MMU_MAIR_ATTR4                  (0)
 #define MMU_MAIR_ATTR5                  (0)
 #define MMU_MAIR_ATTR6                  (0)
@@ -269,15 +307,25 @@
                             MMU_TCR_FLAGS0 | \
                             MMU_TCR_AS)
 
+#define MMU_VTCR_FLAGS_GUEST \
+                       (MMU_TCR_TG0(MMU_TG0(MMU_GUEST_PAGE_SIZE_SHIFT)) | \
+                        MMU_TCR_SH0(MMU_SH_INNER_SHAREABLE) | \
+                        MMU_TCR_ORGN0(MMU_RGN_WRITE_BACK_ALLOCATE) | \
+                        MMU_TCR_IRGN0(MMU_RGN_WRITE_BACK_ALLOCATE) | \
+                        MMU_TCR_T0SZ(64 - MMU_GUEST_SIZE_SHIFT))
 
-#if MMU_IDENT_SIZE_SHIFT > MMU_LX_X(MMU_IDENT_PAGE_SIZE_SHIFT, 2)
-#define MMU_PTE_IDENT_DESCRIPTOR MMU_PTE_L012_DESCRIPTOR_BLOCK
-#else
-#define MMU_PTE_IDENT_DESCRIPTOR MMU_PTE_L3_DESCRIPTOR_PAGE
-#endif
-#define MMU_PTE_IDENT_FLAGS \
-    (MMU_PTE_IDENT_DESCRIPTOR | \
-     MMU_PTE_ATTR_AF | \
+#define MMU_TCR_EL2_FLAGS (MMU_TCR_EL2_RES1 | MMU_TCR_FLAGS0)
+
+// See ARM DDI 0487B.b, Table D4-7 for details on how to configure SL0. We chose
+// a starting level of 1, due to our use of a 4KB granule and a 40-bit PARange.
+#define MMU_VTCR_EL2_SL0_DEFAULT MMU_VTCR_EL2_SL0(1)
+
+// NOTE(abdulla): VTCR_EL2.PS still must be set, based upon ID_AA64MMFR0_EL1.
+// Furthermore, this only covers what's required by ARMv8.0.
+#define MMU_VTCR_EL2_FLAGS (MMU_VTCR_EL2_RES1 | MMU_VTCR_EL2_SL0_DEFAULT | MMU_VTCR_FLAGS_GUEST)
+
+#define MMU_PTE_KERNEL_RWX_FLAGS \
+    (MMU_PTE_ATTR_AF | \
      MMU_PTE_ATTR_SH_INNER_SHAREABLE | \
      MMU_PTE_ATTR_NORMAL_MEMORY | \
      MMU_PTE_ATTR_AP_P_RW_U_NA)
@@ -311,7 +359,17 @@
      MMU_PTE_ATTR_DEVICE | \
      MMU_PTE_ATTR_AP_P_RW_U_NA)
 
-#ifndef ASSEMBLY
+#if MMU_IDENT_SIZE_SHIFT > MMU_LX_X(MMU_IDENT_PAGE_SIZE_SHIFT, 2)
+#define MMU_PTE_IDENT_DESCRIPTOR MMU_PTE_L012_DESCRIPTOR_BLOCK
+#else
+#define MMU_PTE_IDENT_DESCRIPTOR MMU_PTE_L3_DESCRIPTOR_PAGE
+#endif
+#define MMU_PTE_IDENT_FLAGS \
+    (MMU_PTE_IDENT_DESCRIPTOR | \
+     MMU_PTE_KERNEL_RWX_FLAGS)
+// clang-format on
+
+#ifndef __ASSEMBLER__
 
 #include <sys/types.h>
 #include <assert.h>
@@ -322,23 +380,34 @@ typedef uint64_t pte_t;
 
 __BEGIN_CDECLS
 
-#define ARM64_TLBI_NOADDR(op) \
-({ \
-    __asm__ volatile("tlbi " #op::); \
-    ISB; \
-})
+#define ARM64_TLBI_NOADDR(op)            \
+    ({                                   \
+        __asm__ volatile("tlbi " #op::); \
+        ISB;                             \
+    })
 
-#define ARM64_TLBI(op, val) \
-({ \
-    __asm__ volatile("tlbi " #op ", %0" :: "r" ((uint64_t)(val))); \
-    ISB; \
-})
+#define ARM64_TLBI(op, val)                                          \
+    ({                                                               \
+        __asm__ volatile("tlbi " #op ", %0" ::"r"((uint64_t)(val))); \
+        ISB;                                                         \
+    })
 
-#define MMU_ARM64_GLOBAL_ASID (~0U)
-#define MMU_ARM64_USER_ASID (0U)
+const size_t MMU_ARM64_ASID_BITS = 16;
+const uint16_t MMU_ARM64_GLOBAL_ASID = (1u << MMU_ARM64_ASID_BITS) - 1;
+const uint16_t MMU_ARM64_UNUSED_ASID = 0;
+const uint16_t MMU_ARM64_FIRST_USER_ASID = 1;
+const uint16_t MMU_ARM64_MAX_USER_ASID = MMU_ARM64_GLOBAL_ASID - 1;
 
-#define MMU_ARM64_ASID_BITS     (16U)
+pte_t* arm64_get_kernel_ptable();
 
+zx_status_t arm64_boot_map_v(const vaddr_t vaddr,
+                             const paddr_t paddr,
+                             const size_t len,
+                             const pte_t flags);
+
+// use built-in virtual to physical translation instructions to query
+// the physical address of a virtual address
+zx_status_t arm64_mmu_translate(vaddr_t va, paddr_t* pa, bool user, bool write);
 
 __END_CDECLS
-#endif /* ASSEMBLY */
+#endif /* __ASSEMBLER__ */

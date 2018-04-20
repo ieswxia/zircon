@@ -14,22 +14,27 @@
  * @defgroup thread Threads
  * @{
  */
+#include <kernel/thread.h>
+
 #include <arch/exception.h>
 #include <assert.h>
 #include <debug.h>
 #include <err.h>
 #include <inttypes.h>
+
 #include <kernel/atomic.h>
+#include <kernel/dpc.h>
 #include <kernel/mp.h>
 #include <kernel/percpu.h>
 #include <kernel/sched.h>
 #include <kernel/stats.h>
 #include <kernel/thread.h>
 #include <kernel/timer.h>
-#include <kernel/vm.h>
-#include <lib/dpc.h>
+
+#include <lib/counters.h>
 #include <lib/heap.h>
 #include <lib/ktrace.h>
+
 #include <list.h>
 #include <malloc.h>
 #include <object/c_user_thread.h>
@@ -37,6 +42,20 @@
 #include <printf.h>
 #include <string.h>
 #include <target.h>
+#include <vm/vm.h>
+#include <zircon/types.h>
+
+// kernel counters. TODO(cpu): remove LK-era counters
+// The counters below never decrease.
+//
+// counts the number of thread_t succesfully created.
+KCOUNTER(thread_create_count, "kernel.thread.create");
+// counts the number of thread_t joined. Never decreases.
+KCOUNTER(thread_join_count, "kernel.thread.join");
+// counts the number of calls to suspend() that succeeded.
+KCOUNTER(thread_suspend_count, "kernel.thread.suspend");
+// counts the number of calls to resume() that succeeded.
+KCOUNTER(thread_resume_count, "kernel.thread.resume");
 
 /* global thread list */
 static struct list_node thread_list = LIST_INITIAL_VALUE(thread_list);
@@ -45,19 +64,17 @@ static struct list_node thread_list = LIST_INITIAL_VALUE(thread_list);
 spin_lock_t thread_lock = SPIN_LOCK_INITIAL_VALUE;
 
 /* local routines */
-static int idle_thread_routine(void*) __NO_RETURN;
 static void thread_exit_locked(thread_t* current_thread, int retcode) __NO_RETURN;
 static void thread_do_suspend(void);
 
 static void init_thread_struct(thread_t* t, const char* name) {
     memset(t, 0, sizeof(thread_t));
     t->magic = THREAD_MAGIC;
-    thread_set_pinned_cpu(t, -1);
     strlcpy(t->name, name, sizeof(t->name));
     wait_queue_init(&t->retcode_wait_queue);
 }
 
-static void initial_thread_func(void) __NO_RETURN;
+static void initial_thread_func(void) TA_REQ(thread_lock) __NO_RETURN;
 static void initial_thread_func(void) {
     int ret;
 
@@ -70,6 +87,7 @@ static void initial_thread_func(void) {
 
     thread_exit(ret);
 }
+
 
 /**
  * @brief  Create a new thread
@@ -120,24 +138,26 @@ thread_t* thread_create_etc(
 
     t->entry = entry;
     t->arg = arg;
-    t->base_priority = priority;
-    t->priority_boost = 0;
     t->state = THREAD_INITIAL;
     t->signals = 0;
     t->blocking_wait_queue = NULL;
     t->blocked_status = ZX_OK;
     t->interruptable = false;
-    thread_set_last_cpu(t, 0);
+    t->curr_cpu = INVALID_CPU;
+    t->last_cpu = INVALID_CPU;
+    t->cpu_affinity = CPU_MASK_ALL;
 
     t->retcode = 0;
     wait_queue_init(&t->retcode_wait_queue);
 
+    sched_init_thread(t, priority);
+
     /* create the stack */
     if (!stack) {
-#if THREAD_STACK_BOUNDS_CHECK
-        stack_size += THREAD_STACK_PADDING_SIZE;
-        flags |= THREAD_FLAG_DEBUG_STACK_BOUNDS_CHECK;
-#endif
+        if (THREAD_STACK_BOUNDS_CHECK) {
+            stack_size += THREAD_STACK_PADDING_SIZE;
+            flags |= THREAD_FLAG_DEBUG_STACK_BOUNDS_CHECK;
+        }
         t->stack = malloc(stack_size);
         if (!t->stack) {
             if (flags & THREAD_FLAG_FREE_STRUCT)
@@ -145,9 +165,9 @@ thread_t* thread_create_etc(
             return NULL;
         }
         flags |= THREAD_FLAG_FREE_STACK;
-#if THREAD_STACK_BOUNDS_CHECK
-        memset(t->stack, STACK_DEBUG_BYTE, THREAD_STACK_PADDING_SIZE);
-#endif
+        if (THREAD_STACK_BOUNDS_CHECK) {
+            memset(t->stack, STACK_DEBUG_BYTE, THREAD_STACK_PADDING_SIZE);
+        }
     } else {
         t->stack = stack;
     }
@@ -163,9 +183,9 @@ thread_t* thread_create_etc(
                 free(t);
             return NULL;
         }
-#if THREAD_STACK_BOUNDS_CHECK
-        memset(t->unsafe_stack, STACK_DEBUG_BYTE, THREAD_STACK_PADDING_SIZE);
-#endif
+        if (THREAD_STACK_BOUNDS_CHECK) {
+            memset(t->unsafe_stack, STACK_DEBUG_BYTE, THREAD_STACK_PADDING_SIZE);
+        }
     } else {
         DEBUG_ASSERT(stack);
         t->unsafe_stack = unsafe_stack;
@@ -191,6 +211,7 @@ thread_t* thread_create_etc(
     list_add_head(&thread_list, &t->thread_list_node);
     THREAD_UNLOCK(state);
 
+    kcounter_add(thread_create_count, 1u);
     return t;
 }
 
@@ -210,6 +231,13 @@ static void free_thread_resources(thread_t* t) {
 #endif
     }
 
+    /* call the tls callback for each slot as long there is one */
+    for (uint ix = 0; ix != THREAD_MAX_TLS_ENTRY; ++ix) {
+        if (t->tls_callback[ix]) {
+            t->tls_callback[ix](t->tls[ix]);
+        }
+    }
+
     t->magic = 0;
     if (t->flags & THREAD_FLAG_FREE_STRUCT)
         free(t);
@@ -222,7 +250,7 @@ static void free_thread_resources(thread_t* t) {
  *
  * @return ZX_OK on success
  */
-status_t thread_set_real_time(thread_t* t) {
+zx_status_t thread_set_real_time(thread_t* t) {
     if (!t)
         return ZX_ERR_INVALID_ARGS;
 
@@ -244,13 +272,11 @@ status_t thread_set_real_time(thread_t* t) {
  *
  * This function is called to start a thread which has just been
  * created with thread_create() or which has been suspended with
- * thread_suspend().
+ * thread_suspend(). It can not fail.
  *
  * @param t  Thread to resume
- *
- * @return ZX_OK on success.
  */
-status_t thread_resume(thread_t* t) {
+void thread_resume(thread_t* t) {
     DEBUG_ASSERT(t->magic == THREAD_MAGIC);
 
     bool ints_disabled = arch_ints_disabled();
@@ -263,29 +289,32 @@ status_t thread_resume(thread_t* t) {
     if (t->state == THREAD_DEATH) {
         THREAD_UNLOCK(state);
         // The thread is dead, resuming it is a no-op.
-        return ZX_OK;
+        return;
     }
 
     /* Clear the suspend signal in case there is a pending suspend */
     t->signals &= ~THREAD_SIGNAL_SUSPEND;
 
     if (t->state == THREAD_INITIAL || t->state == THREAD_SUSPENDED) {
-        sched_unblock(t);
-        if (resched)
+        /* wake up the new thread, putting it in a run queue on a cpu. reschedule if the local */
+        /* cpu run queue was modified */
+        bool local_resched = sched_unblock(t);
+        if (resched && local_resched)
             sched_reschedule();
     }
 
     THREAD_UNLOCK(state);
 
-    return ZX_OK;
+    kcounter_add(thread_resume_count, 1u);
 }
 
-status_t thread_detach_and_resume(thread_t* t) {
-    status_t err;
+zx_status_t thread_detach_and_resume(thread_t* t) {
+    zx_status_t err;
     err = thread_detach(t);
     if (err < 0)
         return err;
-    return thread_resume(t);
+    thread_resume(t);
+    return ZX_OK;
 }
 
 /**
@@ -295,17 +324,26 @@ status_t thread_detach_and_resume(thread_t* t) {
  *
  * @return ZX_OK on success.
  */
-status_t thread_suspend(thread_t* t) {
+zx_status_t thread_suspend(thread_t* t) {
     DEBUG_ASSERT(t->magic == THREAD_MAGIC);
     DEBUG_ASSERT(!thread_is_idle(t));
 
     THREAD_LOCK(state);
 
+    if (t->state == THREAD_INITIAL || t->state == THREAD_DEATH) {
+        THREAD_UNLOCK(state);
+        return ZX_ERR_BAD_STATE;
+    }
+
+    t->signals |= THREAD_SIGNAL_SUSPEND;
+
+    bool local_resched = false;
     switch (t->state) {
     case THREAD_INITIAL:
     case THREAD_DEATH:
-        THREAD_UNLOCK(state);
-        return ZX_ERR_BAD_STATE;
+        /* This should be unreachable because these two states were handled
+         * above. */
+        panic("Unexpected thread state");
     case THREAD_READY:
         /* thread is ready to run and not blocked or suspended.
              * will wake up and deal with the signal soon. */
@@ -315,7 +353,7 @@ status_t thread_suspend(thread_t* t) {
         /* The following call is not essential.  It just makes the
              * thread suspension happen sooner rather than at the next
              * timer interrupt or syscall. */
-        mp_reschedule(MP_IPI_TARGET_MASK, 1u << thread_last_cpu(t), 0);
+        mp_reschedule(cpu_num_to_mask(t->curr_cpu), 0);
         break;
     case THREAD_SUSPENDED:
         /* thread is suspended already */
@@ -323,22 +361,25 @@ status_t thread_suspend(thread_t* t) {
     case THREAD_BLOCKED:
         /* thread is blocked on something and marked interruptable */
         if (t->interruptable)
-            thread_unblock_from_wait_queue(t, ZX_ERR_INTERNAL_INTR_RETRY);
+            wait_queue_unblock_thread(t, ZX_ERR_INTERNAL_INTR_RETRY);
         break;
     case THREAD_SLEEPING:
         /* thread is sleeping */
         if (t->interruptable) {
             t->blocked_status = ZX_ERR_INTERNAL_INTR_RETRY;
 
-            sched_unblock(t);
+            local_resched = sched_unblock(t);
         }
         break;
     }
 
-    t->signals |= THREAD_SIGNAL_SUSPEND;
+    /* reschedule if the local cpu run queue was modified */
+    if (local_resched)
+        sched_reschedule();
 
     THREAD_UNLOCK(state);
 
+    kcounter_add(thread_suspend_count, 1u);
     return ZX_OK;
 }
 
@@ -355,7 +396,7 @@ void thread_signal_policy_exception(void) {
     THREAD_UNLOCK(state);
 }
 
-status_t thread_join(thread_t* t, int* retcode, lk_time_t deadline) {
+zx_status_t thread_join(thread_t* t, int* retcode, zx_time_t deadline) {
     DEBUG_ASSERT(t->magic == THREAD_MAGIC);
 
     THREAD_LOCK(state);
@@ -368,7 +409,7 @@ status_t thread_join(thread_t* t, int* retcode, lk_time_t deadline) {
 
     /* wait for the thread to die */
     if (t->state != THREAD_DEATH) {
-        status_t err = wait_queue_block(&t->retcode_wait_queue, deadline);
+        zx_status_t err = wait_queue_block(&t->retcode_wait_queue, deadline);
         if (err < 0) {
             THREAD_UNLOCK(state);
             return err;
@@ -394,10 +435,12 @@ status_t thread_join(thread_t* t, int* retcode, lk_time_t deadline) {
 
     free_thread_resources(t);
 
+    kcounter_add(thread_join_count, 1u);
+
     return ZX_OK;
 }
 
-status_t thread_detach(thread_t* t) {
+zx_status_t thread_detach(thread_t* t) {
     DEBUG_ASSERT(t->magic == THREAD_MAGIC);
 
     THREAD_LOCK(state);
@@ -520,8 +563,8 @@ void thread_exit(int retcode) {
     thread_exit_locked(current_thread, retcode);
 }
 
-/* kill a thread, optionally waiting for it to die */
-void thread_kill(thread_t* t, bool block) {
+/* kill a thread */
+void thread_kill(thread_t* t) {
     DEBUG_ASSERT(t->magic == THREAD_MAGIC);
 
     THREAD_LOCK(state);
@@ -540,6 +583,7 @@ void thread_kill(thread_t* t, bool block) {
 
     /* general logic is to wake up the thread so it notices it had a signal delivered to it */
 
+    bool local_resched = false;
     switch (t->state) {
     case THREAD_INITIAL:
         /* thread hasn't been started yet.
@@ -558,23 +602,23 @@ void thread_kill(thread_t* t, bool block) {
         /* The following call is not essential.  It just makes the
              * thread termination happen sooner rather than at the next
              * timer interrupt or syscall. */
-        mp_reschedule(MP_IPI_TARGET_MASK, 1u << thread_last_cpu(t), 0);
+        mp_reschedule(cpu_num_to_mask(t->curr_cpu), 0);
         break;
     case THREAD_SUSPENDED:
         /* thread is suspended, resume it so it can get the kill signal */
-        sched_unblock(t);
+        local_resched = sched_unblock(t);
         break;
     case THREAD_BLOCKED:
         /* thread is blocked on something and marked interruptable */
         if (t->interruptable)
-            thread_unblock_from_wait_queue(t, ZX_ERR_INTERNAL_INTR_KILLED);
+            wait_queue_unblock_thread(t, ZX_ERR_INTERNAL_INTR_KILLED);
         break;
     case THREAD_SLEEPING:
         /* thread is sleeping */
         if (t->interruptable) {
             t->blocked_status = ZX_ERR_INTERNAL_INTR_KILLED;
 
-            sched_unblock(t);
+            local_resched = sched_unblock(t);
         }
         break;
     case THREAD_DEATH:
@@ -582,34 +626,42 @@ void thread_kill(thread_t* t, bool block) {
         goto done;
     }
 
-    /* wait for the thread to exit */
-    if (block && !(t->flags & THREAD_FLAG_DETACHED)) {
-        wait_queue_block(&t->retcode_wait_queue, INFINITE_TIME);
+    if (local_resched) {
+        /* reschedule if the local cpu run queue was modified */
+        sched_reschedule();
     }
 
 done:
     THREAD_UNLOCK(state);
 }
 
-/* Migrates the current thread to the CPU identified by target_cpuid. */
-void thread_migrate_cpu(const uint target_cpuid) {
-    thread_t* self = get_current_thread();
-    thread_set_pinned_cpu(self, target_cpuid);
+// Sets the cpu affinity mask of a thread to the passed in mask and migrate
+// the thread if active.
+void thread_set_cpu_affinity(thread_t* t, cpu_mask_t affinity) {
+    DEBUG_ASSERT(t->magic == THREAD_MAGIC);
 
-    mp_reschedule(MP_IPI_TARGET_MASK, 1u << target_cpuid, 0);
+    THREAD_LOCK(state);
 
-    // When we return from this call, we should have migrated to the target cpu
-    thread_yield();
+    // make sure the passed in mask is valid and at least one cpu can run the thread
+    if (affinity & mp_get_active_mask()) {
+        // set the affinity mask
+        t->cpu_affinity = affinity;
 
-    // Make sure that we have actually migrated.
-    const uint current_cpu_id = thread_last_cpu(self);
-    DEBUG_ASSERT(current_cpu_id == target_cpuid);
+        // let the scheduler deal with it
+        sched_migrate(t);
+    }
+
+    THREAD_UNLOCK(state);
+}
+
+void thread_migrate_to_cpu(const cpu_num_t target_cpu) {
+    thread_set_cpu_affinity(get_current_thread(), cpu_num_to_mask(target_cpu));
 }
 
 // thread_lock must be held when calling this function.  This function will
 // not return if it decides to kill the thread.
 static void check_kill_signal(thread_t* current_thread,
-                              spin_lock_saved_state_t state) {
+                              spin_lock_saved_state_t state) TA_REQ(thread_lock) {
     DEBUG_ASSERT(arch_ints_disabled());
     DEBUG_ASSERT(spin_lock_held(&thread_lock));
 
@@ -696,11 +748,6 @@ void thread_process_pending_signals(void) {
     }
 }
 
-__NO_RETURN static int idle_thread_routine(void* arg) {
-    for (;;)
-        arch_idle();
-}
-
 /**
  * @brief Yield the cpu to another thread
  *
@@ -772,8 +819,28 @@ void thread_reschedule(void) {
     THREAD_UNLOCK(state);
 }
 
+void thread_check_preempt_pending(void) {
+    thread_t* current_thread = get_current_thread();
+
+    // First check preempt_pending without the expense of taking the lock.
+    // At this point, interrupts could be enabled, so an interrupt handler
+    // might preempt us and set preempt_pending to false after we read it.
+    if (unlikely(current_thread->preempt_pending)) {
+        THREAD_LOCK(state);
+        // Recheck preempt_pending just in case it got set to false after
+        // our earlier check.  Its value now cannot change because
+        // interrupts are now disabled.
+        if (likely(current_thread->preempt_pending)) {
+            // This will set preempt_pending = false for us.
+            sched_reschedule();
+        }
+        THREAD_UNLOCK(state);
+    }
+}
+
 /* timer callback to wake up a sleeping thread */
-static enum handler_return thread_sleep_handler(timer_t* timer, lk_time_t now, void* arg) {
+static void thread_sleep_handler(timer_t* timer, zx_time_t now,
+                                 void* arg) TA_NO_THREAD_SAFETY_ANALYSIS {
     thread_t* t = (thread_t*)arg;
 
     DEBUG_ASSERT(t->magic == THREAD_MAGIC);
@@ -783,31 +850,31 @@ static enum handler_return thread_sleep_handler(timer_t* timer, lk_time_t now, v
      * thread_lock.
      */
     if (timer_trylock_or_cancel(timer, &thread_lock))
-        return INT_NO_RESCHEDULE;
+        return;
 
     if (t->state != THREAD_SLEEPING) {
         spin_unlock(&thread_lock);
-        return INT_NO_RESCHEDULE;
+        return;
     }
 
     t->blocked_status = ZX_OK;
 
-    sched_unblock(t);
+    /* unblock the thread */
+    if (sched_unblock(t))
+        sched_reschedule();
 
     spin_unlock(&thread_lock);
-
-    return INT_RESCHEDULE;
 }
 
-#define MIN_SLEEP_SLACK LK_USEC(1)
-#define MAX_SLEEP_SLACK LK_SEC(1)
+#define MIN_SLEEP_SLACK ZX_USEC(1)
+#define MAX_SLEEP_SLACK ZX_SEC(1)
 #define DIV_SLEEP_SLACK 10u
 
 /* computes the amount of slack the thread_sleep timer will use */
-static uint64_t sleep_slack(lk_time_t deadline, lk_time_t now) {
+static uint64_t sleep_slack(zx_time_t deadline, zx_time_t now) {
     if (deadline < now)
         return MIN_SLEEP_SLACK;
-    lk_time_t slack = (deadline - now) / DIV_SLEEP_SLACK;
+    zx_duration_t slack = (deadline - now) / DIV_SLEEP_SLACK;
     return MAX(MIN_SLEEP_SLACK, MIN(slack, MAX_SLEEP_SLACK));
 }
 
@@ -824,15 +891,20 @@ static uint64_t sleep_slack(lk_time_t deadline, lk_time_t now) {
  * interruptable argument allows this routine to return early if the thread was signaled
  * for something.
  */
-status_t thread_sleep_etc(lk_time_t deadline, bool interruptable) {
+zx_status_t thread_sleep_etc(zx_time_t deadline, bool interruptable) {
     thread_t* current_thread = get_current_thread();
-    lk_time_t now = current_time();
-    status_t blocked_status;
+    zx_time_t now = current_time();
+    zx_status_t blocked_status;
 
     DEBUG_ASSERT(current_thread->magic == THREAD_MAGIC);
     DEBUG_ASSERT(current_thread->state == THREAD_RUNNING);
     DEBUG_ASSERT(!thread_is_idle(current_thread));
     DEBUG_ASSERT(!arch_in_int_handler());
+
+    // Skip all of the work if the deadline has already passed.
+    if (deadline <= now) {
+        return ZX_OK;
+    }
 
     timer_t timer;
     timer_init(&timer);
@@ -871,8 +943,8 @@ out:
     return blocked_status;
 }
 
-status_t thread_sleep_relative(lk_time_t delay) {
-    if (delay != INFINITE_TIME) {
+zx_status_t thread_sleep_relative(zx_duration_t delay) {
+    if (delay != ZX_TIME_INFINITE) {
         delay += current_time();
     }
     return thread_sleep(delay);
@@ -884,10 +956,10 @@ status_t thread_sleep_relative(lk_time_t delay) {
  * This takes the thread_lock to ensure there are no races while calculating the
  * runtime of the thread.
  */
-lk_time_t thread_runtime(const thread_t* t) {
+zx_duration_t thread_runtime(const thread_t* t) {
     THREAD_LOCK(state);
 
-    lk_time_t runtime = t->runtime_ns;
+    zx_duration_t runtime = t->runtime_ns;
     if (t->state == THREAD_RUNNING) {
         runtime += current_time() - t->last_started_running;
     }
@@ -906,9 +978,8 @@ lk_time_t thread_runtime(const thread_t* t) {
  */
 void thread_construct_first(thread_t* t, const char* name) {
     DEBUG_ASSERT(arch_ints_disabled());
-    /* Due to somethings below being macros, this might be unused on
-     * non-SMP builds */
-    __UNUSED uint cpu = arch_curr_cpu_num();
+
+    cpu_num_t cpu = arch_curr_cpu_num();
 
     init_thread_struct(t, name);
     t->base_priority = HIGHEST_PRIORITY;
@@ -916,8 +987,9 @@ void thread_construct_first(thread_t* t, const char* name) {
     t->state = THREAD_RUNNING;
     t->flags = THREAD_FLAG_DETACHED;
     t->signals = 0;
-    thread_set_last_cpu(t, cpu);
-    thread_set_pinned_cpu(t, cpu);
+    t->curr_cpu = cpu;
+    t->last_cpu = cpu;
+    t->cpu_affinity = cpu_num_to_mask(cpu);
 
     arch_thread_construct_first(t);
 
@@ -1012,7 +1084,10 @@ void thread_become_idle(void) {
     t->base_priority = IDLE_PRIORITY;
     t->priority_boost = 0;
     t->flags |= THREAD_FLAG_IDLE;
-    thread_set_pinned_cpu(t, arch_curr_cpu_num());
+    cpu_num_t curr_cpu = arch_curr_cpu_num();
+    t->last_cpu = curr_cpu;
+    t->curr_cpu = curr_cpu;
+    t->cpu_affinity = cpu_num_to_mask(curr_cpu);
 
     mp_set_curr_cpu_active(true);
     mp_set_cpu_idle(arch_curr_cpu_num());
@@ -1021,7 +1096,7 @@ void thread_become_idle(void) {
     arch_enable_ints();
     thread_reschedule();
 
-    idle_thread_routine(NULL);
+    arch_idle_thread_routine(NULL);
 }
 
 /**
@@ -1040,6 +1115,8 @@ void thread_secondary_cpu_entry(void) {
     mp_set_curr_cpu_active(true);
     mp_set_cpu_idle(cpu);
 
+    dpc_init_for_cpu();
+
     /* Exit from our bootstrap thread, and enter the scheduler on this cpu */
     thread_exit(0);
 }
@@ -1047,7 +1124,7 @@ void thread_secondary_cpu_entry(void) {
 /**
  * @brief Create an idle thread for a secondary CPU
  */
-thread_t* thread_create_idle_thread(uint cpu_num) {
+thread_t* thread_create_idle_thread(cpu_num_t cpu_num) {
     DEBUG_ASSERT(cpu_num != 0 && cpu_num < SMP_MAX_CPUS);
 
     /* Shouldn't be initialized yet */
@@ -1058,15 +1135,20 @@ thread_t* thread_create_idle_thread(uint cpu_num) {
 
     thread_t* t = thread_create_etc(
         &percpu[cpu_num].idle_thread, name,
-        idle_thread_routine, NULL,
+        arch_idle_thread_routine, NULL,
         IDLE_PRIORITY,
         NULL, NULL, DEFAULT_STACK_SIZE,
         NULL);
     if (t == NULL) {
         return t;
     }
-    t->flags |= THREAD_FLAG_IDLE;
-    thread_set_pinned_cpu(t, cpu_num);
+    t->flags |= THREAD_FLAG_IDLE | THREAD_FLAG_DETACHED;
+    t->cpu_affinity = cpu_num_to_mask(cpu_num);
+
+    THREAD_LOCK(state);
+    sched_unblock_idle(t);
+    THREAD_UNLOCK(state);
+
     return t;
 }
 
@@ -1113,7 +1195,7 @@ void dump_thread(thread_t* t, bool full_dump) {
         dprintf(INFO, "dump_thread WARNING: thread at %p has bad magic\n", t);
     }
 
-    lk_time_t runtime = t->runtime_ns;
+    zx_duration_t runtime = t->runtime_ns;
     if (t->state == THREAD_RUNNING) {
         runtime += current_time() - t->last_started_running;
     }
@@ -1123,10 +1205,11 @@ void dump_thread(thread_t* t, bool full_dump) {
 
     if (full_dump) {
         dprintf(INFO, "dump_thread: t %p (%s:%s)\n", t, oname, t->name);
-        dprintf(INFO, "\tstate %s, last_cpu %u, pinned_cpu %d, priority %d:%d, "
+        dprintf(INFO, "\tstate %s, curr/last cpu %d/%d, cpu_affinity %#x, priority %d [%d:%d,%d], "
                       "remaining time slice %" PRIu64 "\n",
-                thread_state_to_str(t->state), t->last_cpu, t->pinned_cpu, t->base_priority,
-                t->priority_boost, t->remaining_time_slice);
+                thread_state_to_str(t->state), (int)t->curr_cpu, (int)t->last_cpu, t->cpu_affinity,
+                t->effec_priority, t->base_priority,
+                t->priority_boost, t->inherited_priority, t->remaining_time_slice);
         dprintf(INFO, "\truntime_ns %" PRIu64 ", runtime_s %" PRIu64 "\n",
                 runtime, runtime / 1000000000);
         dprintf(INFO, "\tstack %p, stack_size %zu\n", t->stack, t->stack_size);
@@ -1137,15 +1220,16 @@ void dump_thread(thread_t* t, bool full_dump) {
                 (t->flags & THREAD_FLAG_REAL_TIME) ? "Rt" : "",
                 (t->flags & THREAD_FLAG_IDLE) ? "Id" : "",
                 (t->flags & THREAD_FLAG_DEBUG_STACK_BOUNDS_CHECK) ? "Sc" : "");
-        dprintf(INFO, "\twait queue %p, blocked_status %d, interruptable %d\n",
-                t->blocking_wait_queue, t->blocked_status, t->interruptable);
+        dprintf(INFO, "\twait queue %p, blocked_status %d, interruptable %d, mutexes held %d\n",
+                t->blocking_wait_queue, t->blocked_status, t->interruptable, t->mutexes_held);
         dprintf(INFO, "\taspace %p\n", t->aspace);
         dprintf(INFO, "\tuser_thread %p, pid %" PRIu64 ", tid %" PRIu64 "\n",
                 t->user_thread, t->user_pid, t->user_tid);
         arch_dump_thread(t);
     } else {
-        printf("thr %p st %4s pri %2d:%d pid %" PRIu64 " tid %" PRIu64 " (%s:%s)\n",
-               t, thread_state_to_str(t->state), t->base_priority, t->priority_boost, t->user_pid,
+        printf("thr %p st %4s m %d pri %2d [%d:%d,%d] pid %" PRIu64 " tid %" PRIu64 " (%s:%s)\n",
+               t, thread_state_to_str(t->state), t->mutexes_held, t->effec_priority, t->base_priority,
+               t->priority_boost, t->inherited_priority, t->user_pid,
                t->user_tid, oname, t->name);
     }
 }
@@ -1154,9 +1238,14 @@ void dump_thread(thread_t* t, bool full_dump) {
  * @brief  Dump debugging info about all threads
  */
 void dump_all_threads(bool full) {
+    THREAD_LOCK(state);
+    dump_all_threads_locked(full);
+    THREAD_UNLOCK(state);
+}
+
+void dump_all_threads_locked(bool full) {
     thread_t* t;
 
-    THREAD_LOCK(state);
     list_for_every_entry (&thread_list, t, thread_t, thread_list_node) {
         if (t->magic != THREAD_MAGIC) {
             dprintf(INFO, "bad magic on thread struct %p, aborting.\n", t);
@@ -1165,7 +1254,40 @@ void dump_all_threads(bool full) {
         }
         dump_thread(t, full);
     }
+}
+
+void dump_thread_user_tid(uint64_t tid, bool full) {
+    THREAD_LOCK(state);
+    dump_thread_user_tid_locked(tid, full);
     THREAD_UNLOCK(state);
+}
+
+void dump_thread_user_tid_locked(uint64_t tid, bool full) {
+    thread_t* t;
+
+    list_for_every_entry (&thread_list, t, thread_t, thread_list_node) {
+        if (t->user_tid != tid) {
+            continue;
+        }
+
+        if (t->magic != THREAD_MAGIC) {
+            dprintf(INFO, "bad magic on thread struct %p, aborting.\n", t);
+            hexdump(t, sizeof(thread_t));
+            break;
+        }
+        dump_thread(t, full);
+    }
+}
+
+thread_t* thread_id_to_thread_slow(uint64_t tid) {
+    thread_t* t;
+    list_for_every_entry (&thread_list, t, thread_t, thread_list_node) {
+        if (t->user_tid == tid) {
+            return t;
+        }
+    }
+
+    return NULL;
 }
 
 /** @} */
@@ -1189,267 +1311,12 @@ void ktrace_report_live_threads(void) {
 }
 #endif
 
-/**
- * @defgroup  wait  Wait Queue
- * @{
- */
-void wait_queue_init(wait_queue_t* wait) {
-    *wait = (wait_queue_t)WAIT_QUEUE_INITIAL_VALUE(*wait);
-}
+#define THREAD_BACKTRACE_DEPTH 16
+typedef struct thread_backtrace {
+    void* pc[THREAD_BACKTRACE_DEPTH];
+} thread_backtrace_t;
 
-static enum handler_return wait_queue_timeout_handler(timer_t* timer, lk_time_t now, void* arg) {
-    thread_t* thread = (thread_t*)arg;
-
-    DEBUG_ASSERT(thread->magic == THREAD_MAGIC);
-
-    /* spin trylocking on the thread lock since the routine that set up the callback,
-     * wait_queue_block, may be trying to simultaneously cancel this timer while holding the
-     * thread_lock.
-     */
-    if (timer_trylock_or_cancel(timer, &thread_lock))
-        return INT_NO_RESCHEDULE;
-
-    enum handler_return ret = INT_NO_RESCHEDULE;
-    if (thread_unblock_from_wait_queue(thread, ZX_ERR_TIMED_OUT) >= ZX_OK) {
-        ret = INT_RESCHEDULE;
-    }
-
-    spin_unlock(&thread_lock);
-
-    return ret;
-}
-
-/**
- * @brief  Block until a wait queue is notified.
- *
- * This function puts the current thread at the end of a wait
- * queue and then blocks until some other thread wakes the queue
- * up again.
- *
- * @param  wait     The wait queue to enter
- * @param  deadline The time at which to abort the wait
- *
- * If the deadline is zero, this function returns immediately with
- * ZX_ERR_TIMED_OUT.  If the deadline is INFINITE_TIME, this function
- * waits indefinitely.  Otherwise, this function returns with
- * ZX_ERR_TIMED_OUT when the deadline occurs.
- *
- * @return ZX_ERR_TIMED_OUT on timeout, else returns the return
- * value specified when the queue was woken by wait_queue_wake_one().
- */
-status_t wait_queue_block(wait_queue_t* wait, lk_time_t deadline) {
-    timer_t timer;
-
-    thread_t* current_thread = get_current_thread();
-
-    DEBUG_ASSERT(wait->magic == WAIT_QUEUE_MAGIC);
-    DEBUG_ASSERT(current_thread->state == THREAD_RUNNING);
-    DEBUG_ASSERT(arch_ints_disabled());
-    DEBUG_ASSERT(spin_lock_held(&thread_lock));
-
-    if (deadline <= current_time())
-        return ZX_ERR_TIMED_OUT;
-
-    if (current_thread->interruptable && unlikely(current_thread->signals)) {
-        if (current_thread->signals & THREAD_SIGNAL_KILL) {
-            return ZX_ERR_INTERNAL_INTR_KILLED;
-        } else if (current_thread->signals & THREAD_SIGNAL_SUSPEND) {
-            return ZX_ERR_INTERNAL_INTR_RETRY;
-        }
-    }
-
-    list_add_tail(&wait->list, &current_thread->queue_node);
-    wait->count++;
-    current_thread->state = THREAD_BLOCKED;
-    current_thread->blocking_wait_queue = wait;
-    current_thread->blocked_status = ZX_OK;
-
-    /* if the deadline is nonzero or noninfinite, set a callback to yank us out of the queue */
-    if (deadline != INFINITE_TIME) {
-        timer_init(&timer);
-        timer_set_oneshot(&timer, deadline, wait_queue_timeout_handler, (void*)current_thread);
-    }
-
-    sched_block();
-
-    /* we don't really know if the timer fired or not, so it's better safe to try to cancel it */
-    if (deadline != INFINITE_TIME) {
-        timer_cancel(&timer);
-    }
-
-    return current_thread->blocked_status;
-}
-
-/**
- * @brief  Wake up one thread sleeping on a wait queue
- *
- * This function removes one thread (if any) from the head of the wait queue and
- * makes it executable.  The new thread will be placed at the head of the
- * run queue.
- *
- * @param wait  The wait queue to wake
- * @param reschedule  If true, the newly-woken thread will run immediately.
- * @param wait_queue_error  The return value which the new thread will receive
- * from wait_queue_block().
- *
- * @return  The number of threads woken (zero or one)
- */
-int wait_queue_wake_one(wait_queue_t* wait, bool reschedule, status_t wait_queue_error) {
-    thread_t* t;
-    int ret = 0;
-
-    DEBUG_ASSERT(wait->magic == WAIT_QUEUE_MAGIC);
-    DEBUG_ASSERT(arch_ints_disabled());
-    DEBUG_ASSERT(spin_lock_held(&thread_lock));
-
-    t = list_remove_head_type(&wait->list, thread_t, queue_node);
-    if (t) {
-        wait->count--;
-        DEBUG_ASSERT(t->state == THREAD_BLOCKED);
-        t->blocked_status = wait_queue_error;
-        t->blocking_wait_queue = NULL;
-
-        sched_unblock(t);
-        if (reschedule)
-            sched_reschedule();
-
-        ret = 1;
-    }
-
-    return ret;
-}
-
-thread_t* wait_queue_dequeue_one(wait_queue_t* wait, status_t wait_queue_error) {
-    thread_t* t;
-
-    DEBUG_ASSERT(wait->magic == WAIT_QUEUE_MAGIC);
-    DEBUG_ASSERT(arch_ints_disabled());
-    DEBUG_ASSERT(spin_lock_held(&thread_lock));
-
-    t = list_remove_head_type(&wait->list, thread_t, queue_node);
-    if (t) {
-        wait->count--;
-        DEBUG_ASSERT(t->state == THREAD_BLOCKED);
-        t->blocked_status = wait_queue_error;
-        t->blocking_wait_queue = NULL;
-    }
-
-    return t;
-}
-
-/**
- * @brief  Wake all threads sleeping on a wait queue
- *
- * This function removes all threads (if any) from the wait queue and
- * makes them executable.  The new threads will be placed at the head of the
- * run queue.
- *
- * @param wait  The wait queue to wake
- * @param reschedule  If true, the newly-woken threads will run immediately.
- * @param wait_queue_error  The return value which the new thread will receive
- * from wait_queue_block().
- *
- * @return  The number of threads woken
- */
-int wait_queue_wake_all(wait_queue_t* wait, bool reschedule, status_t wait_queue_error) {
-    thread_t* t;
-    int ret = 0;
-
-    DEBUG_ASSERT(wait->magic == WAIT_QUEUE_MAGIC);
-    DEBUG_ASSERT(arch_ints_disabled());
-    DEBUG_ASSERT(spin_lock_held(&thread_lock));
-
-    if (wait->count == 0)
-        return 0;
-
-    struct list_node list = LIST_INITIAL_VALUE(list);
-
-    /* pop all the threads off the wait queue into the run queue */
-    while ((t = list_remove_head_type(&wait->list, thread_t, queue_node))) {
-        wait->count--;
-
-        DEBUG_ASSERT(t->state == THREAD_BLOCKED);
-        t->blocked_status = wait_queue_error;
-        t->blocking_wait_queue = NULL;
-
-        list_add_tail(&list, &t->queue_node);
-
-        ret++;
-    }
-
-    DEBUG_ASSERT(ret > 0);
-    DEBUG_ASSERT(wait->count == 0);
-
-    sched_unblock_list(&list);
-    if (reschedule)
-        sched_reschedule();
-
-    return ret;
-}
-
-bool wait_queue_is_empty(wait_queue_t* wait) {
-    DEBUG_ASSERT(wait->magic == WAIT_QUEUE_MAGIC);
-    DEBUG_ASSERT(arch_ints_disabled());
-    DEBUG_ASSERT(spin_lock_held(&thread_lock));
-
-    return list_is_empty(&wait->list);
-}
-
-/**
- * @brief  Tear down a wait queue
- *
- * This panics if any threads were waiting on this queue, because that
- * would indicate a race condition for most uses of wait queues.  If a
- * thread is currently waiting, it could have been scheduled later, in
- * which case it would have called wait_queue_block() on an invalid wait
- * queue.
- */
-void wait_queue_destroy(wait_queue_t* wait) {
-    DEBUG_ASSERT(wait->magic == WAIT_QUEUE_MAGIC);
-
-    if (!list_is_empty(&wait->list)) {
-        panic("wait_queue_destroy() called on non-empty wait_queue_t\n");
-    }
-
-    wait->magic = 0;
-}
-
-/**
- * @brief  Wake a specific thread in a wait queue
- *
- * This function extracts a specific thread from a wait queue, wakes it, and
- * puts it at the head of the run queue.
- *
- * @param t  The thread to wake
- * @param wait_queue_error  The return value which the new thread will receive
- *   from wait_queue_block().
- *
- * @return ZX_ERR_BAD_STATE if thread was not in any wait queue.
- */
-status_t thread_unblock_from_wait_queue(thread_t* t, status_t wait_queue_error) {
-    DEBUG_ASSERT(t->magic == THREAD_MAGIC);
-    DEBUG_ASSERT(arch_ints_disabled());
-    DEBUG_ASSERT(spin_lock_held(&thread_lock));
-
-    if (t->state != THREAD_BLOCKED)
-        return ZX_ERR_BAD_STATE;
-
-    DEBUG_ASSERT(t->blocking_wait_queue != NULL);
-    DEBUG_ASSERT(t->blocking_wait_queue->magic == WAIT_QUEUE_MAGIC);
-    DEBUG_ASSERT(list_in_list(&t->queue_node));
-
-    list_delete(&t->queue_node);
-    t->blocking_wait_queue->count--;
-    t->blocking_wait_queue = NULL;
-    t->blocked_status = wait_queue_error;
-
-    sched_unblock(t);
-
-    return ZX_OK;
-}
-
-#if WITH_PANIC_BACKTRACE
-static status_t thread_read_stack(thread_t* t, void* ptr, void* out, size_t sz) {
+static zx_status_t thread_read_stack(thread_t* t, void* ptr, void* out, size_t sz) {
     if (!is_kernel_address((uintptr_t)ptr) ||
         (ptr < t->stack) ||
         (ptr > (t->stack + t->stack_size - sizeof(void*)))) {
@@ -1459,12 +1326,17 @@ static status_t thread_read_stack(thread_t* t, void* ptr, void* out, size_t sz) 
     return ZX_OK;
 }
 
-int thread_get_backtrace(thread_t* t, void* fp, thread_backtrace_t* tb) {
+static size_t thread_get_backtrace(thread_t* t, void* fp, thread_backtrace_t* tb) {
+    // without frame pointers, dont even try
+    // the compiler should optimize out the body of all the callers if it's not present
+    if (!WITH_FRAME_POINTERS)
+        return 0;
+
     void* pc;
     if (t == NULL) {
-        return -1;
+        return 0;
     }
-    int n = 0;
+    size_t n = 0;
     for (; n < THREAD_BACKTRACE_DEPTH; n++) {
         if (thread_read_stack(t, fp + 8, &pc, sizeof(void*))) {
             break;
@@ -1477,16 +1349,45 @@ int thread_get_backtrace(thread_t* t, void* fp, thread_backtrace_t* tb) {
     return n;
 }
 
-void thread_print_backtrace(thread_t* t, void* fp) {
-    thread_backtrace_t tb;
-    int count = thread_get_backtrace(t, fp, &tb);
-    if (count < 0) {
-        return;
+static zx_status_t _thread_print_backtrace(thread_t* t, void *fp) {
+    if (!t || !fp) {
+        return ZX_ERR_BAD_STATE;
     }
 
-    for (int n = 0; n < count; n++) {
-        printf("bt#%02d: %p\n", n, tb.pc[n]);
+    thread_backtrace_t tb;
+    size_t count = thread_get_backtrace(t, fp, &tb);
+    if (count == 0) {
+        return ZX_ERR_BAD_STATE;
     }
-    printf("bt#%02d: end\n", count);
+
+    for (size_t n = 0; n < count; n++) {
+        printf("bt#%02zu: %p\n", n, tb.pc[n]);
+    }
+    printf("bt#%02zu: end\n", count);
+
+    return ZX_OK;
 }
-#endif
+
+// print the backtrace of the current thread, at the current spot
+void thread_print_current_backtrace(void) {
+    _thread_print_backtrace(get_current_thread(), __GET_FRAME(0));
+}
+
+// print the backtrace of a passed in thread, if possible
+zx_status_t thread_print_backtrace(thread_t* t) {
+    // get the starting point if it's in a usable state
+    void *fp = NULL;
+    switch (t->state) {
+        case THREAD_BLOCKED:
+        case THREAD_SLEEPING:
+        case THREAD_SUSPENDED:
+            // thread is blocked, so ask the arch code to get us a starting point
+            fp = arch_thread_get_blocked_fp(t);
+            break;
+        // we can't deal with every other state
+        default:
+            return ZX_ERR_BAD_STATE;
+    }
+
+    return _thread_print_backtrace(t, fp);
+}

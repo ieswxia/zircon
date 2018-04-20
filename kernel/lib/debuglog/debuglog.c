@@ -15,6 +15,8 @@
 #include <lk/init.h>
 #include <platform.h>
 #include <string.h>
+#include <vm/vm.h>
+#include <zircon/types.h>
 
 #define DLOG_SIZE (128u * 1024u)
 #define DLOG_MASK (DLOG_SIZE - 1u)
@@ -129,15 +131,27 @@ zx_status_t dlog_write(uint32_t flags, const void* ptr, size_t len) {
     }
     log->head += wiresize;
 
+    // Need to check this before re-releasing the log lock, since we may
+    // re-enable interrupts while doing that.  If interrupts are enabled when we
+    // make this check, we could see the following sequence of events between
+    // two CPUs and incorrectly conclude we are holding the thread lock:
+    // C2: Acquire thread_lock
+    // C1: Running this thread, evaluate spin_lock_holder_cpu(&thread_lock) -> C2
+    // C1: Context switch away
+    // C2: Release thread_lock
+    // C2: Context switch to this thread
+    // C2: Running this thread, evaluate arch_curr_cpu_num() -> C2
+    bool holding_thread_lock = spin_lock_holder_cpu(&thread_lock) == arch_curr_cpu_num();
+
+    spin_unlock_irqrestore(&log->lock, state);
+
     // if we happen to be called from within the global thread lock, use a
     // special version of event signal
-    if (spin_lock_holder_cpu(&thread_lock) == arch_curr_cpu_num()) {
+    if (holding_thread_lock) {
         event_signal_thread_locked(&log->event);
     } else {
         event_signal(&log->event, false);
     }
-
-    spin_unlock_irqrestore(&log->lock, state);
 
     return ZX_OK;
 }
@@ -251,6 +265,23 @@ static int debuglog_notifier(void* arg) {
     return ZX_OK;
 }
 
+// Common bottleneck between sys_debug_write() and debuglog_dumper()
+// to reduce interleaved messages between the serial console and the
+// debuglog drainer.
+void dlog_serial_write(const char* data, size_t len) {
+#if ENABLE_KERNEL_LL_DEBUG
+    // If LL DEBUG is enabled we take this path which uses a spinlock
+    // and prevents the direct writes from the kernel from interleaving
+    // with our output
+    __kernel_serial_write(data, len);
+#else
+    // Otherwise we can use a mutex and avoid time under spinlock
+    static mutex_t lock = MUTEX_INITIAL_VALUE(lock);
+    mutex_acquire(&lock);
+    platform_dputs_thread(data, len);
+    mutex_release(&lock);
+#endif
+}
 
 // The debuglog dumper thread creates a reader to observe
 // debuglog writes and dump them to the kernel consoles
@@ -287,20 +318,19 @@ static int debuglog_dumper(void *arg) {
             }
             int n;
             n = snprintf(tmp, sizeof(tmp), "[%05d.%03d] %05" PRIu64 ".%05" PRIu64 "> %s\n",
-                         (int) (rec.hdr.timestamp / LK_SEC(1)),
-                         (int) ((rec.hdr.timestamp / LK_MSEC(1)) % 1000ULL),
+                         (int) (rec.hdr.timestamp / ZX_SEC(1)),
+                         (int) ((rec.hdr.timestamp / ZX_MSEC(1)) % 1000ULL),
                          rec.hdr.pid, rec.hdr.tid, rec.data);
             if (n > (int)sizeof(tmp)) {
                 n = sizeof(tmp);
             }
             __kernel_console_write(tmp, n);
-            __kernel_serial_write(tmp, n);
+            dlog_serial_write(tmp, n);
         }
     }
 
     return 0;
 }
-
 
 void dlog_bluescreen_init(void) {
     // if we're panicing, stop processing log writes
@@ -312,14 +342,13 @@ void dlog_bluescreen_init(void) {
     // replay debug log?
 
     dprintf(INFO, "\nZIRCON KERNEL PANIC\n\nUPTIME: %" PRIu64 "ms\n",
-            current_time() / LK_MSEC(1));
+            current_time() / ZX_MSEC(1));
     dprintf(INFO, "BUILDID %s\n\n", version.buildid);
 
     // Log the ELF build ID in the format the symbolizer scripts understand.
     if (version.elf_build_id[0] != '\0') {
-        vaddr_t base = KERNEL_BASE + KERNEL_LOAD_OFFSET;
         dprintf(INFO, "dso: id=%s base=%#lx name=zircon.elf\n",
-                version.elf_build_id, base);
+                version.elf_build_id, (uintptr_t)__code_start);
     }
 }
 
@@ -330,9 +359,12 @@ static void dlog_init_hook(uint level) {
                                  HIGH_PRIORITY - 1, DEFAULT_STACK_SIZE)) != NULL) {
         thread_resume(rthread);
     }
-    if ((rthread = thread_create("debuglog-dumper", debuglog_dumper, NULL,
-                                 HIGH_PRIORITY - 2, DEFAULT_STACK_SIZE)) != NULL) {
-        thread_resume(rthread);
+
+    if (platform_serial_enabled()) {
+        if ((rthread = thread_create("debuglog-dumper", debuglog_dumper, NULL,
+                                     HIGH_PRIORITY - 2, DEFAULT_STACK_SIZE)) != NULL) {
+            thread_resume(rthread);
+        }
     }
 }
 

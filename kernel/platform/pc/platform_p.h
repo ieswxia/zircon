@@ -7,10 +7,11 @@
 
 #pragma once
 
-#include <sys/types.h>
 #include <dev/pcie_platform.h>
 #include <lib/cbuf.h>
+#include <sys/types.h>
 #include <zircon/compiler.h>
+#include <zircon/types.h>
 
 extern cbuf_t console_input_buf;
 
@@ -26,22 +27,26 @@ extern size_t pcie_mem_lo_size;
 extern uint16_t pcie_pio_base;
 extern uint16_t pcie_pio_size;
 
-void platform_init_debug_early(void);
-void platform_init_debug(void);
-void platform_init_timer_percpu(void);
-void platform_mem_init(void);
+void pc_init_debug_default_early(void);
+void pc_init_debug_early(void);
+void pc_init_debug(void);
+void pc_init_timer_percpu(void);
+void pc_mem_init(void);
 
-status_t x86_alloc_msi_block(uint requested_irqs, bool can_target_64bit,
-                             bool is_msix, pcie_msi_block_t* out_block);
+void pc_prep_suspend_timer(void);
+void pc_resume_timer(void);
+void pc_resume_debug(void);
+void pc_suspend_debug(void);
+
+zx_status_t x86_alloc_msi_block(uint requested_irqs, bool can_target_64bit,
+                                bool is_msix, pcie_msi_block_t* out_block);
 void x86_free_msi_block(pcie_msi_block_t* block);
 void x86_register_msi_handler(const pcie_msi_block_t* block,
                               uint msi_id,
                               int_handler handler,
                               void* ctx);
 
-status_t platform_configure_watchdog(uint32_t frequency);
-
 typedef void (*enumerate_e820_callback)(uint64_t base, uint64_t size, bool is_mem, void* ctx);
-status_t enumerate_e820(enumerate_e820_callback callback, void* ctx);
+zx_status_t enumerate_e820(enumerate_e820_callback callback, void* ctx);
 
 __END_CDECLS

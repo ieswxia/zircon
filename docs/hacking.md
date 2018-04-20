@@ -18,8 +18,8 @@ From the zircon shell run `k ut all` to execute all kernel tests, and
 ## Syscall generation
 
 Syscall support is generated from
-system/public/zircon/syscalls.sysgen.  A host tool called
-[sysgen](../system/host/sysgen) consumes that file and produces output
+system/public/zircon/syscalls.abigen.  A host tool called
+[abigen](../system/host/abigen) consumes that file and produces output
 for both the kernel and userspace in a variety of languages. This
 output includes C or C++ headers for both the kernel and userspace,
 syscall entry points, other language bindings, and so on.
@@ -53,12 +53,16 @@ It is not "sticky" -- if you reboot cleanly, it will be gone, and if you crash
 again it will be replaced.
 
 To disable reboot-on-panic, pass the kernel commandline argument
-[`kernel.halt_on_panic=true`](kernel_cmdline.md#kernel_halt_on_panic_bool).
+[`kernel.halt-on-panic=true`](kernel_cmdline.md#kernel_halt_on_panic_bool).
 
 ## Low level kernel development
 
 For kernel development it's not uncommon to need to monitor or break things
 before the gfxconsole comes up.
+
+To force-enable log output to the legacy serial console on an x64 machine, pass
+"kernel.serial=legacy".  For other serial configurations, see the kernel.serial
+docs in [kernel_cmdline.md](kernel_cmdline.md).
 
 To enable the early console before the graphical console comes up use the
 ``gfxconsole.early`` cmdline option. More information can be found in
@@ -70,7 +74,7 @@ name>.disable``.
 On a skylake system, all these options together would look something like:
 
 ```
-$ tools/build-zircon-x86_64/bootserver build-zircon-x86_64/zircon.bin -- gfxconsole.early driver.intel-i915-display.disable
+$ tools/build-x86/bootserver build-x86/zircon.bin -- gfxconsole.early driver.intel-i915-display.disable
 ```
 
 To directly output to the console rather than buffering it (useful in the event

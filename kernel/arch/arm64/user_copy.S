@@ -7,57 +7,55 @@
 #include <asm.h>
 #include <err.h>
 
-# status_t _arm64_copy_from_user(void *dst, const void *src, size_t len, void **fault_return)
-FUNCTION(_arm64_copy_from_user)
-    # Setup data fault return
-    adr x4, .Lfault_from_user
-    str x4, [x3]
+lr .req x30
+dst .req x0
+src .req x1
+len .req x2
+fault_return_ptr .req x3
+temp .req x15
 
-    # Perform the memcpy
-    cbz x2, 0f
-.Lcopy_byte_from_user:
-    ldtrb w4, [x1]
-    strb w4, [x0]
-    add x0, x0, #1
-    add x1, x1, #1
-    sub x2, x2, #1
-    cbnz x2, .Lcopy_byte_from_user
-0:
+// NOTE! We know here that the memcpy code doesn't touch these registers,
+// so we can use them to save values.  But they are call-clobbered in the
+// C ABI, so we don't need a stack frame.
+saved_fault_return_ptr .req x16
+saved_lr .req x17
 
+// zx_status_t _arm64_user_copy(void *dst, const void *src, size_t len, void **fault_return)
+.section .text._arm64_user_copy,"ax"
+.balign 64 // Align to cache line.  This code fits in one cache line.
+FUNCTION(_arm64_user_copy)
+
+    adr temp, .Lfault_from_user
+
+    mov saved_fault_return_ptr, fault_return_ptr
+    .cfi_register fault_return_ptr, saved_fault_return_ptr
+    mov saved_lr, lr
+    .cfi_register lr, saved_lr
+
+    // Just call our normal memcpy.  The caller has ensured that the
+    // address range is in the user portion of the address space.
+    // While fault_return_ptr is set, userspace data faults will be
+    // redirected to .Lfault_from_user, below.
+    //
+    // NOTE! We make important assumptions here about what the memcpy
+    // code does: it never moves the stack pointer, and it never touches
+    // the registers we're using for saved_fault_return_ptr and saved_lr.
+    str temp, [fault_return_ptr]
+    bl memcpy
     mov x0, #ZX_OK
-    b .Lcleanup_from_user
+
+.Luser_copy_return:
+    str xzr, [saved_fault_return_ptr]
+    mov lr, saved_lr
+    .cfi_same_value lr
+    ret
+END_FUNCTION(_arm64_user_copy)
+
+.section .text.cold._arm64_user_copy,"ax"
 .Lfault_from_user:
+    .cfi_startproc
+    .cfi_register fault_return_ptr, saved_fault_return_ptr
+    .cfi_register lr, saved_lr
     mov x0, #ZX_ERR_INVALID_ARGS
-.Lcleanup_from_user:
-    # Reset data fault return
-    str xzr, [x3]
-    ret
-END_FUNCTION(_arm64_copy_from_user)
-
-# status_t _arm64_copy_to_user(void *dst, const void *src, size_t len, void **fault_return)
-FUNCTION(_arm64_copy_to_user)
-    # Setup data fault return
-    adr x4, .Lfault_to_user
-    str x4, [x3]
-
-    # Perform the memcpy
-    cbz x2, 0f
-.Lcopy_byte_to_user:
-    ldrb w4, [x1]
-    sttrb w4, [x0]
-    add x0, x0, #1
-    add x1, x1, #1
-    sub x2, x2, #1
-    cbnz x2, .Lcopy_byte_to_user
-0:
-
-    mov x0, #ZX_OK
-    b .Lcleanup_to_user
-.Lfault_to_user:
-    mov x0, #ZX_ERR_INVALID_ARGS
-.Lcleanup_to_user:
-    # Reset data fault return
-    str xzr, [x3]
-    ret
-END_FUNCTION(_arm64_copy_to_user)
-
+    b .Luser_copy_return
+    .cfi_endproc

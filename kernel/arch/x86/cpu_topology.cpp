@@ -7,32 +7,39 @@
 #include <arch/ops.h>
 #include <arch/x86/cpu_topology.h>
 #include <arch/x86/feature.h>
-#include <pow2.h>
 #include <bits.h>
+#include <pow2.h>
 #include <stdio.h>
 #include <string.h>
 #include <trace.h>
 
 #define LOCAL_TRACE 0
 
-static uint32_t smt_mask = 0;
-
-static uint32_t core_mask = 0;
-static uint32_t core_shift = 0;
+// Use various methods to decode the apic id to different levels of cpu topology.
+//
+// The heirarchy is currently
+// package (socket) : node (die within the socket) : core (within the die) : thread
 
 // Default to all bits, so that the topology system fails towards
 // distinguishing all CPUs
 static uint32_t package_mask = ~0;
 static uint32_t package_shift = 0;
 
-static int initialized;
+static uint32_t node_mask = 0;
+static uint32_t node_shift = 0;
 
-static void legacy_topology_init(void);
-static void modern_intel_topology_init(void);
-static void extended_amd_topology_init(void);
+static uint32_t core_mask = 0;
+static uint32_t core_shift = 0;
 
-void x86_cpu_topology_init(void)
-{
+static uint32_t smt_mask = 0;
+
+static void legacy_topology_init();
+static void modern_intel_topology_init();
+static void extended_amd_topology_init();
+
+void x86_cpu_topology_init() {
+    static int initialized;
+
     if (atomic_swap(&initialized, 1)) {
         return;
     }
@@ -46,8 +53,7 @@ void x86_cpu_topology_init(void)
     }
 }
 
-static void modern_intel_topology_init(void)
-{
+static void modern_intel_topology_init() {
     // This is based off of Intel 3A's Example 8-18 "Support Routine for
     // Identifying Package, Core, and Logical Processors from 32-bit x2APIC ID"
     struct x86_topology_level info;
@@ -70,10 +76,9 @@ static void modern_intel_topology_init(void)
     }
 }
 
-static void extended_amd_topology_init(void)
-{
+static void extended_amd_topology_init() {
     // Described in AMD CPUID Specification, version 2.34, section 3.2
-    const struct cpuid_leaf *leaf = x86_get_cpuid_leaf(X86_CPUID_ADDR_WIDTH);
+    const struct cpuid_leaf* leaf = x86_get_cpuid_leaf(X86_CPUID_ADDR_WIDTH);
     if (!leaf)
         return;
 
@@ -84,11 +89,13 @@ static void extended_amd_topology_init(void)
         return;
     }
 
-    core_shift = 0;
-    core_mask = (1u << apic_id_core_id_size) - 1;
+    // initial state of variables that are optionally set below
+    // smt_mask = 0;
+    // core_shift = 0;
+    // node_shift = 0;
+    // node_mask = 0;
 
-    package_shift = apic_id_core_id_size;
-    package_mask = ~core_mask;
+    uint32_t node_size = 0;
 
     // check to see if AMD topology extensions are enabled
     if (x86_feature_test(X86_FEATURE_AMD_TOPO)) {
@@ -107,19 +114,34 @@ static void extended_amd_topology_init(void)
             TRACEF("WARNING: cores per compute unit > 2 (%u), unhandled\n", cores_per_compute_unit);
         }
 
-        // TODO: handle multiple nodes per processor in 0x8000001e/ecx
+        uint32_t nodes_per_processor = BITS_SHIFT(leaf->c, 10, 8) + 1;
+        if (nodes_per_processor > 0 && ispow2(nodes_per_processor)) {
+            // a pow2 number of bits between the core number and package number refer to node
+            node_size = log2_uint_floor(nodes_per_processor);
+            node_shift = apic_id_core_id_size - node_size;
+            node_mask = (nodes_per_processor - 1) << node_shift;
+
+            // node number chews in to the core number, so subtract node_size off
+            // apic_id_core_id_size so that it computes the core mask properly
+            apic_id_core_id_size -= node_size;
+        }
     }
 
+    // core is the mask of the bottom half of the APIC id space
+    core_mask = (1u << apic_id_core_id_size) - 1;
+
+    // package soaks up all the high bits of APIC id space
+    package_shift = node_size + apic_id_core_id_size;
+    package_mask = UINT32_MAX << (node_size + apic_id_core_id_size);
 }
 
-static void legacy_topology_init(void)
-{
-    const struct cpuid_leaf *leaf = x86_get_cpuid_leaf(X86_CPUID_MODEL_FEATURES);
+static void legacy_topology_init() {
+    const struct cpuid_leaf* leaf = x86_get_cpuid_leaf(X86_CPUID_MODEL_FEATURES);
     if (!leaf) {
         return;
     }
 
-    bool pkg_size_valid = !!(leaf->d & (1<<28));
+    bool pkg_size_valid = !!(leaf->d & (1 << 28));
     if (!pkg_size_valid) {
         return;
     }
@@ -144,13 +166,16 @@ static void legacy_topology_init(void)
     core_mask = ~package_mask ^ smt_mask;
 }
 
-void x86_cpu_topology_decode(uint32_t apic_id, x86_cpu_topology_t *topo) {
-    memset(topo, 0, sizeof(*topo));
+void x86_cpu_topology_decode(uint32_t apic_id, x86_cpu_topology_t* topo) {
+    *topo = {};
 
-    LTRACEF("id 0x%x: package_shift %u package_mask 0x%x core_shift %u core_mask 0x%x smt_mask %u\n",
-        apic_id, package_shift, package_mask, core_shift, core_mask, smt_mask);
+    LTRACEF("id 0x%x: package shift/mask %u:%#x node shift/mask %u:%#x "
+            "core shift/mask %u:%#x smt mask %#x\n",
+            apic_id, package_shift, package_mask, node_shift, node_mask,
+            core_shift, core_mask, smt_mask);
 
     topo->package_id = (apic_id & package_mask) >> package_shift;
+    topo->node_id = (apic_id & node_mask) >> node_shift;
     topo->core_id = (apic_id & core_mask) >> core_shift;
     topo->smt_id = apic_id & smt_mask;
 }

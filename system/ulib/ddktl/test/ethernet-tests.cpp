@@ -36,12 +36,19 @@ class TestEthmacIfc : public ddk::Device<TestEthmacIfc>,
         recv_called_ = true;
     }
 
+    void EthmacCompleteTx(ethmac_netbuf_t* netbuf, zx_status_t status) {
+        complete_tx_this_ = get_this();
+        complete_tx_called_ = true;
+    }
+
     bool VerifyCalls() const {
         BEGIN_HELPER;
         EXPECT_EQ(this_, status_this_, "");
         EXPECT_EQ(this_, recv_this_, "");
+        EXPECT_EQ(this_, complete_tx_this_, "");
         EXPECT_TRUE(status_called_, "");
         EXPECT_TRUE(recv_called_, "");
+        EXPECT_TRUE(complete_tx_called_, "");
         END_HELPER;
     }
 
@@ -53,8 +60,10 @@ class TestEthmacIfc : public ddk::Device<TestEthmacIfc>,
     uintptr_t this_ = 0u;
     uintptr_t status_this_ = 0u;
     uintptr_t recv_this_ = 0u;
+    uintptr_t complete_tx_this_ = 0u;
     bool status_called_ = false;
     bool recv_called_ = false;
+    bool complete_tx_called_ = false;
 };
 
 class TestEthmacProtocol : public ddk::Device<TestEthmacProtocol, ddk::GetProtocolable>,
@@ -66,7 +75,7 @@ class TestEthmacProtocol : public ddk::Device<TestEthmacProtocol, ddk::GetProtoc
     }
 
     zx_status_t DdkGetProtocol(uint32_t proto_id, void* out) {
-        if (proto_id != ZX_PROTOCOL_ETHERMAC) return ZX_ERR_INVALID_ARGS;
+        if (proto_id != ZX_PROTOCOL_ETHERNET_IMPL) return ZX_ERR_INVALID_ARGS;
         ddk::AnyProtocol* proto = static_cast<ddk::AnyProtocol*>(out);
         proto->ops = ddk_proto_ops_;
         proto->ctx = this;
@@ -93,21 +102,32 @@ class TestEthmacProtocol : public ddk::Device<TestEthmacProtocol, ddk::GetProtoc
         return ZX_OK;
     }
 
-    void EthmacSend(uint32_t options, void* data, size_t length) {
-        send_this_ = get_this();
-        send_called_ = true;
+    zx_status_t EthmacQueueTx(uint32_t options, ethmac_netbuf_t* netbuf) {
+        queue_tx_this_ = get_this();
+        queue_tx_called_ = true;
+        return ZX_OK;
     }
+
+    zx_status_t EthmacSetParam(uint32_t param, int32_t value, void* data) {
+        set_param_this_ = get_this();
+        set_param_called_ = true;
+        return ZX_OK;
+    }
+    zx_handle_t EthmacGetBti() { return ZX_HANDLE_INVALID;}
+
 
     bool VerifyCalls() const {
         BEGIN_HELPER;
         EXPECT_EQ(this_, query_this_, "");
         EXPECT_EQ(this_, start_this_, "");
         EXPECT_EQ(this_, stop_this_, "");
-        EXPECT_EQ(this_, send_this_, "");
+        EXPECT_EQ(this_, queue_tx_this_, "");
+        EXPECT_EQ(this_, set_param_this_, "");
         EXPECT_TRUE(query_called_, "");
         EXPECT_TRUE(start_called_, "");
         EXPECT_TRUE(stop_called_, "");
-        EXPECT_TRUE(send_called_, "");
+        EXPECT_TRUE(queue_tx_called_, "");
+        EXPECT_TRUE(set_param_called_, "");
         END_HELPER;
     }
 
@@ -116,6 +136,7 @@ class TestEthmacProtocol : public ddk::Device<TestEthmacProtocol, ddk::GetProtoc
         // Use the provided proxy to test the ifc proxy.
         proxy_->Status(0);
         proxy_->Recv(nullptr, 0, 0);
+        proxy_->CompleteTx(nullptr, ZX_OK);
         return true;
     }
 
@@ -124,11 +145,13 @@ class TestEthmacProtocol : public ddk::Device<TestEthmacProtocol, ddk::GetProtoc
     uintptr_t query_this_ = 0u;
     uintptr_t stop_this_ = 0u;
     uintptr_t start_this_ = 0u;
-    uintptr_t send_this_ = 0u;
+    uintptr_t queue_tx_this_ = 0u;
+    uintptr_t set_param_this_ = 0u;
     bool query_called_ = false;
     bool stop_called_ = false;
     bool start_called_ = false;
-    bool send_called_ = false;
+    bool queue_tx_called_ = false;
+    bool set_param_called_ = false;
 
     fbl::unique_ptr<ddk::EthmacIfcProxy> proxy_;
 };
@@ -141,6 +164,7 @@ static bool test_ethmac_ifc() {
     auto ifc = dev.ethmac_ifc();
     ifc->status(&dev, 0);
     ifc->recv(&dev, nullptr, 0, 0);
+    ifc->complete_tx(&dev, nullptr, ZX_OK);
 
     EXPECT_TRUE(dev.VerifyCalls(), "");
 
@@ -155,6 +179,7 @@ static bool test_ethmac_ifc_proxy() {
 
     proxy.Status(0);
     proxy.Recv(nullptr, 0, 0);
+    proxy.CompleteTx(nullptr, ZX_OK);
 
     EXPECT_TRUE(dev.VerifyCalls(), "");
 
@@ -172,13 +197,15 @@ static bool test_ethmac_protocol() {
     auto status = dev.DdkGetProtocol(0, reinterpret_cast<void*>(&proto));
     EXPECT_EQ(ZX_ERR_INVALID_ARGS, status, "");
 
-    status = dev.DdkGetProtocol(ZX_PROTOCOL_ETHERMAC, reinterpret_cast<void*>(&proto));
+    status = dev.DdkGetProtocol(ZX_PROTOCOL_ETHERNET_IMPL, reinterpret_cast<void*>(&proto));
     EXPECT_EQ(ZX_OK, status, "");
 
     EXPECT_EQ(ZX_OK, proto.ops->query(proto.ctx, 0, nullptr), "");
     proto.ops->stop(proto.ctx);
     EXPECT_EQ(ZX_OK, proto.ops->start(proto.ctx, nullptr, nullptr), "");
-    proto.ops->send(proto.ctx, 0, nullptr, 0);
+    ethmac_netbuf_t netbuf = {};
+    EXPECT_EQ(ZX_OK, proto.ops->queue_tx(proto.ctx, 0, &netbuf), "");
+    EXPECT_EQ(ZX_OK, proto.ops->set_param(proto.ctx, 0, 0, nullptr), "");
 
     EXPECT_TRUE(dev.VerifyCalls(), "");
 
@@ -193,7 +220,7 @@ static bool test_ethmac_protocol_proxy() {
     TestEthmacProtocol protocol_dev;
 
     ethmac_protocol_t proto;
-    auto status = protocol_dev.DdkGetProtocol(ZX_PROTOCOL_ETHERMAC, reinterpret_cast<void*>(&proto));
+    auto status = protocol_dev.DdkGetProtocol(ZX_PROTOCOL_ETHERNET_IMPL, reinterpret_cast<void*>(&proto));
     EXPECT_EQ(ZX_OK, status, "");
     // The proxy device to wrap the ops + device that represent the parent
     // device.
@@ -204,7 +231,9 @@ static bool test_ethmac_protocol_proxy() {
     EXPECT_EQ(ZX_OK, proxy.Query(0, nullptr), "");
     proxy.Stop();
     EXPECT_EQ(ZX_OK, proxy.Start(&ifc_dev), "");
-    proxy.Send(0, nullptr, 0);
+    ethmac_netbuf_t netbuf = {};
+    EXPECT_EQ(ZX_OK, proxy.QueueTx(0, &netbuf), "");
+    EXPECT_EQ(ZX_OK, proxy.SetParam(0, 0, nullptr));
 
     EXPECT_TRUE(protocol_dev.VerifyCalls(), "");
 
@@ -220,7 +249,7 @@ static bool test_ethmac_protocol_ifc_proxy() {
     TestEthmacProtocol protocol_dev;
 
     ethmac_protocol_t proto;
-    auto status = protocol_dev.DdkGetProtocol(ZX_PROTOCOL_ETHERMAC, reinterpret_cast<void*>(&proto));
+    auto status = protocol_dev.DdkGetProtocol(ZX_PROTOCOL_ETHERNET_IMPL, reinterpret_cast<void*>(&proto));
     EXPECT_EQ(ZX_OK, status, "");
 
     ddk::EthmacProtocolProxy proxy(&proto);

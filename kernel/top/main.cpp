@@ -11,9 +11,9 @@
  */
 #include <lk/main.h>
 
-#include <app.h>
 #include <arch.h>
 #include <debug.h>
+#include <kernel/init.h>
 #include <kernel/mutex.h>
 #include <kernel/thread.h>
 #include <lib/heap.h>
@@ -21,6 +21,7 @@
 #include <platform.h>
 #include <string.h>
 #include <target.h>
+#include <vm/init.h>
 #include <zircon/compiler.h>
 
 extern void (*const __init_array_start[])();
@@ -32,14 +33,12 @@ static uint secondary_idle_thread_count;
 
 static int bootstrap2(void* arg);
 
-extern "C" void kernel_init();
-
 static void call_constructors() {
     for (void (*const* a)() = __init_array_start; a != __init_array_end; a++)
         (*a)();
 }
 
-/* called from arch code */
+// called from arch code
 void lk_main() {
     // get us into some sort of thread context
     thread_init_early();
@@ -59,15 +58,24 @@ void lk_main() {
     lk_primary_cpu_init_level(LK_INIT_LEVEL_PLATFORM_EARLY, LK_INIT_LEVEL_TARGET_EARLY - 1);
     target_early_init();
 
-    dprintf(INFO, "\nwelcome to lk/MP\n\n");
+    dprintf(INFO, "\nwelcome to Zircon\n\n");
+
+    lk_primary_cpu_init_level(LK_INIT_LEVEL_TARGET_EARLY, LK_INIT_LEVEL_VM_PREHEAP - 1);
+    dprintf(SPEW, "initializing vm pre-heap\n");
+    vm_init_preheap();
 
     // bring up the kernel heap
-    lk_primary_cpu_init_level(LK_INIT_LEVEL_TARGET_EARLY, LK_INIT_LEVEL_HEAP - 1);
+    lk_primary_cpu_init_level(LK_INIT_LEVEL_VM_PREHEAP, LK_INIT_LEVEL_HEAP - 1);
     dprintf(SPEW, "initializing heap\n");
     heap_init();
 
+    lk_primary_cpu_init_level(LK_INIT_LEVEL_HEAP, LK_INIT_LEVEL_VM - 1);
+    dprintf(SPEW, "initializing vm\n");
+    vm_init();
+
     // initialize the kernel
-    lk_primary_cpu_init_level(LK_INIT_LEVEL_HEAP, LK_INIT_LEVEL_KERNEL - 1);
+    lk_primary_cpu_init_level(LK_INIT_LEVEL_VM, LK_INIT_LEVEL_KERNEL - 1);
+    dprintf(SPEW, "initializing kernel\n");
     kernel_init();
 
     lk_primary_cpu_init_level(LK_INIT_LEVEL_KERNEL, LK_INIT_LEVEL_THREADING - 1);
@@ -75,7 +83,7 @@ void lk_main() {
     // create a thread to complete system initialization
     dprintf(SPEW, "creating bootstrap completion thread\n");
     thread_t* t = thread_create("bootstrap2", &bootstrap2, NULL, DEFAULT_PRIORITY, DEFAULT_STACK_SIZE);
-    thread_set_pinned_cpu(t, 0);
+    thread_set_cpu_affinity(t, cpu_num_to_mask(0));
     thread_detach(t);
     thread_resume(t);
 
@@ -99,11 +107,8 @@ static int bootstrap2(void*) {
     lk_primary_cpu_init_level(LK_INIT_LEVEL_PLATFORM, LK_INIT_LEVEL_TARGET - 1);
     target_init();
 
-    dprintf(SPEW, "calling apps_init()\n");
-    lk_primary_cpu_init_level(LK_INIT_LEVEL_TARGET, LK_INIT_LEVEL_APPS - 1);
-    apps_init();
-
-    lk_primary_cpu_init_level(LK_INIT_LEVEL_APPS, LK_INIT_LEVEL_LAST);
+    dprintf(SPEW, "moving to last init level\n");
+    lk_primary_cpu_init_level(LK_INIT_LEVEL_TARGET, LK_INIT_LEVEL_LAST);
 
     return 0;
 }
@@ -117,7 +122,7 @@ void lk_secondary_cpu_entry() {
         return;
     }
 
-    /* secondary cpu initialize from threading level up. 0 to threading was handled in arch */
+    // secondary cpu initialize from threading level up. 0 to threading was handled in arch
     lk_init_level(LK_INIT_FLAG_SECONDARY_CPUS, LK_INIT_LEVEL_THREADING, LK_INIT_LEVEL_LAST);
 
     dprintf(SPEW, "entering scheduler on cpu %u\n", cpu);
@@ -137,7 +142,6 @@ void lk_init_secondary_cpus(uint secondary_cpu_count) {
             secondary_idle_thread_count = i;
             break;
         }
-        thread_detach_and_resume(t);
     }
     secondary_idle_thread_count = secondary_cpu_count;
 }

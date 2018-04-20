@@ -9,16 +9,16 @@ futex_wait - Wait on a futex.
 ```
 #include <zircon/syscalls.h>
 
-zx_status_t zx_futex_wait(zx_futex_t* value_ptr, int current_value,
+zx_status_t zx_futex_wait(const zx_futex_t* value_ptr, int current_value,
                           zx_time_t deadline);
 ```
 
 ## DESCRIPTION
 
-Waiting on a futex (or acquiring it) causes a thread to sleep until
-the futex is made available by a call to `zx_futex_wake`. Optionally,
-the thread can also be woken up after the *deadline* (with respect
-to **ZX_CLOCK_MONOTONIC**) passes.
+**futex_wait**() atomically verifies that *value_ptr* still contains the value
+*current_value* and sleeps until the futex is made available by a call to
+`zx_futex_wake`. Optionally, the thread can also be woken up after the
+*deadline* (with respect to **ZX_CLOCK_MONOTONIC**) passes.
 
 ## RETURN VALUE
 

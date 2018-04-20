@@ -38,6 +38,7 @@ public:
     void Unplug() override;
 
     // UpstreamNode overrides
+    RegionAllocator& pf_mmio_regions() final { return pf_mmio_regions_; }
     RegionAllocator& mmio_lo_regions() final { return mmio_lo_regions_; }
     RegionAllocator& mmio_hi_regions() final { return mmio_hi_regions_; }
     RegionAllocator& pio_regions()     final { return pio_regions_; }
@@ -53,23 +54,28 @@ public:
     uint32_t io_limit()           const { return io_limit_; }
     bool     supports_32bit_pio() const { return supports_32bit_pio_; }
 
+    // print some info about the bridge
+    void Dump() const override;
+
 protected:
-    status_t AllocateBars() override;
-    status_t AllocateBridgeWindowsLocked();
-    void     Disable() override;
+    zx_status_t AllocateBars() override;
+    zx_status_t AllocateBridgeWindowsLocked();
+    void        Disable() override;
 
 private:
     friend class PcieBusDriver;
 
     PcieBridge(PcieBusDriver& bus_drv, uint bus_id, uint dev_id, uint func_id, uint mbus_id);
 
-    status_t ParseBusWindowsLocked();
-    status_t Init(PcieUpstreamNode& upstream);
+    zx_status_t ParseBusWindowsLocked();
+    zx_status_t Init(PcieUpstreamNode& upstream);
 
+    RegionAllocator pf_mmio_regions_;
     RegionAllocator mmio_lo_regions_;
     RegionAllocator mmio_hi_regions_;
     RegionAllocator pio_regions_;
 
+    RegionAllocator::Region::UPtr pf_mmio_window_;
     RegionAllocator::Region::UPtr mmio_window_;
     RegionAllocator::Region::UPtr pio_window_;
 

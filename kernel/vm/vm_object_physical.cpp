@@ -13,12 +13,11 @@
 #include <fbl/alloc_checker.h>
 #include <fbl/auto_lock.h>
 #include <inttypes.h>
-#include <kernel/vm.h>
 #include <lib/console.h>
-#include <safeint/safe_math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <trace.h>
+#include <vm/vm.h>
 #include <zircon/types.h>
 
 using fbl::AutoLock;
@@ -27,7 +26,9 @@ using fbl::AutoLock;
 
 VmObjectPhysical::VmObjectPhysical(paddr_t base, uint64_t size)
     : size_(size), base_(base) {
-    LTRACEF("%p\n", this);
+    LTRACEF("%p, size %#" PRIx64 "\n", this, size_);
+
+    DEBUG_ASSERT(IS_PAGE_ALIGNED(size_));
 }
 
 VmObjectPhysical::~VmObjectPhysical() {
@@ -40,10 +41,10 @@ zx_status_t VmObjectPhysical::Create(paddr_t base, uint64_t size, fbl::RefPtr<Vm
         return ZX_ERR_INVALID_ARGS;
 
     // check that base + size is a valid range
-    safeint::CheckedNumeric<paddr_t> safe_base = base;
-    safe_base += size - 1;
-    if (!safe_base.IsValid())
+    paddr_t safe_base;
+    if (add_overflow(base, size - 1, &safe_base)) {
         return ZX_ERR_INVALID_ARGS;
+    }
 
     fbl::AllocChecker ac;
     auto vmo = fbl::AdoptRef<VmObject>(new (&ac) VmObjectPhysical(base, size));
@@ -88,7 +89,7 @@ zx_status_t VmObjectPhysical::GetPageLocked(uint64_t offset, uint pf_flags, list
     return ZX_OK;
 }
 
-zx_status_t VmObjectPhysical::LookupUser(uint64_t offset, uint64_t len, user_ptr<paddr_t> buffer,
+zx_status_t VmObjectPhysical::LookupUser(uint64_t offset, uint64_t len, user_inout_ptr<paddr_t> buffer,
                                          size_t buffer_size) {
     canary_.Assert();
 
@@ -131,6 +132,30 @@ zx_status_t VmObjectPhysical::LookupUser(uint64_t offset, uint64_t len, user_ptr
     return ZX_OK;
 }
 
+zx_status_t VmObjectPhysical::Lookup(uint64_t offset, uint64_t len, uint pf_flags,
+                                     vmo_lookup_fn_t lookup_fn, void* context) {
+    canary_.Assert();
+
+    if (unlikely(len == 0))
+        return ZX_ERR_INVALID_ARGS;
+
+    AutoLock a(&lock_);
+    if (unlikely(!InRange(offset, len, size_)))
+        return ZX_ERR_OUT_OF_RANGE;
+
+    uint64_t cur_offset = ROUNDDOWN(offset, PAGE_SIZE);
+    uint64_t end = offset + len;
+    uint64_t end_page_offset = ROUNDUP(end, PAGE_SIZE);
+
+    for (size_t idx = 0; cur_offset < end_page_offset; cur_offset += PAGE_SIZE, ++idx) {
+        zx_status_t status = lookup_fn(context, cur_offset, idx, base_ + cur_offset);
+        if (status != ZX_OK) {
+            return status;
+        }
+    }
+    return ZX_OK;
+}
+
 zx_status_t VmObjectPhysical::GetMappingCachePolicy(uint32_t* cache_policy) {
     AutoLock l(&lock_);
 
@@ -143,12 +168,12 @@ zx_status_t VmObjectPhysical::GetMappingCachePolicy(uint32_t* cache_policy) {
 }
 
 zx_status_t VmObjectPhysical::SetMappingCachePolicy(const uint32_t cache_policy) {
-    AutoLock l(&lock_);
-
     // Is it a valid cache flag?
-    if (cache_policy & ~ARCH_MMU_FLAG_CACHE_MASK) {
+    if (cache_policy & ~ZX_CACHE_POLICY_MASK) {
         return ZX_ERR_INVALID_ARGS;
     }
+
+    AutoLock l(&lock_);
 
     // If the cache policy is already configured on this VMO and matches
     // the requested policy then this is a no-op. This is a common practice

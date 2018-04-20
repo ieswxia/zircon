@@ -6,11 +6,12 @@
 
 #include <string.h>
 
-#include <zircon/assert.h>
 #include <fbl/alloc_checker.h>
+#include <fbl/initializer_list.h>
 #include <fbl/macros.h>
 #include <fbl/new.h>
 #include <fbl/type_support.h>
+#include <zircon/assert.h>
 
 namespace fbl {
 
@@ -19,7 +20,7 @@ namespace internal {
 template <typename U>
 using remove_cv_ref = typename remove_cv<typename remove_reference<U>::type>::type;
 
-}  // namespace internal
+} // namespace internal
 
 struct DefaultAllocatorTraits {
     // Allocate receives a request for "size" contiguous bytes.
@@ -63,11 +64,27 @@ public:
     // move semantics only
     DISALLOW_COPY_AND_ASSIGN_ALLOW_MOVE(Vector);
 
-    constexpr Vector() : ptr_(nullptr), size_(0U), capacity_(0U) {}
+    constexpr Vector()
+        : ptr_(nullptr), size_(0U), capacity_(0U) {}
 
-    Vector(Vector&& other) : ptr_(nullptr), size_(other.size_), capacity_(other.capacity_) {
+    Vector(Vector&& other)
+        : ptr_(nullptr), size_(other.size_), capacity_(other.capacity_) {
         ptr_ = other.release();
     }
+
+#ifndef _KERNEL
+    Vector(fbl::initializer_list<T> init)
+        : ptr_(init.size() != 0u ? reinterpret_cast<T*>(AllocatorTraits::Allocate(
+                                       init.size() * sizeof(T)))
+                                 : nullptr),
+          size_(init.size()),
+          capacity_(size_) {
+        T* out = ptr_;
+        for (const T* in = init.begin(); in != init.end(); ++in, ++out) {
+            new (out) T(*in);
+        }
+    }
+#endif
 
     Vector& operator=(Vector&& o) {
         auto size = o.size_;
@@ -97,12 +114,14 @@ public:
         reallocate(capacity, ac);
     }
 
+#ifndef _KERNEL
     void reserve(size_t capacity) {
         if (capacity <= capacity_) {
             return;
         }
         reallocate(capacity);
     }
+#endif // _KERNEL
 
     void reset() {
         reset(nullptr, 0U, 0U);
@@ -130,6 +149,7 @@ public:
         push_back_internal(value, ac);
     }
 
+#ifndef _KERNEL
     void push_back(T&& value) {
         push_back_internal(fbl::move(value));
     }
@@ -137,6 +157,7 @@ public:
     void push_back(const T& value) {
         push_back_internal(value);
     }
+#endif // _KERNEL
 
     void insert(size_t index, T&& value, AllocChecker* ac) {
         insert_internal(index, fbl::move(value), ac);
@@ -146,6 +167,7 @@ public:
         insert_internal(index, value, ac);
     }
 
+#ifndef _KERNEL
     void insert(size_t index, T&& value) {
         insert_internal(index, fbl::move(value));
     }
@@ -153,6 +175,7 @@ public:
     void insert(size_t index, const T& value) {
         insert_internal(index, value);
     }
+#endif // _KERNEL
 
     // Remove an element from the |index| position in the vector, shifting
     // all subsequent elements one position to fill in the gap.
@@ -319,8 +342,9 @@ private:
     bool grow_for_new_element(AllocChecker* ac) {
         ZX_DEBUG_ASSERT(size_ <= capacity_);
         if (size_ == capacity_) {
-            size_t newCapacity = capacity_ < kCapacityMinimum ? kCapacityMinimum :
-                    capacity_ * kCapacityGrowthFactor;
+            size_t newCapacity = capacity_ < kCapacityMinimum
+                                     ? kCapacityMinimum
+                                     : capacity_ * kCapacityGrowthFactor;
             if (!reallocate(newCapacity, ac)) {
                 return false;
             }
@@ -333,8 +357,9 @@ private:
     void grow_for_new_element() {
         ZX_DEBUG_ASSERT(size_ <= capacity_);
         if (size_ == capacity_) {
-            size_t newCapacity = capacity_ < kCapacityMinimum ? kCapacityMinimum :
-                    capacity_ * kCapacityGrowthFactor;
+            size_t newCapacity = capacity_ < kCapacityMinimum
+                                     ? kCapacityMinimum
+                                     : capacity_ * kCapacityGrowthFactor;
             reallocate(newCapacity);
         }
     }
@@ -348,7 +373,12 @@ private:
             static_assert((kCapacityMinimum + 1) >= kCapacityShrinkFactor,
                           "Capacity heuristics risk reallocating to zero capacity");
             size_t newCapacity = capacity_ / kCapacityShrinkFactor;
-            reallocate(newCapacity);
+
+            // If the vector cannot be reallocated to a smaller size (reallocate fails) it will
+            // continue to use a larger capacity.
+            AllocChecker ac;
+            reallocate(newCapacity, &ac);
+            ac.check();
         }
     }
 
@@ -371,6 +401,7 @@ private:
         return true;
     }
 
+#ifndef _KERNEL
     void reallocate(size_t newCapacity) {
         ZX_DEBUG_ASSERT(newCapacity > 0);
         ZX_DEBUG_ASSERT(newCapacity >= size_);
@@ -380,6 +411,7 @@ private:
         capacity_ = newCapacity;
         ptr_ = newPtr;
     }
+#endif
 
     // Release returns the underlying storage of the vector,
     // while emptying out the vector itself (so it can be destroyed
@@ -413,4 +445,4 @@ private:
     static constexpr size_t kCapacityShrinkFactor = 4;
 };
 
-}  // namespace fbl
+} // namespace fbl

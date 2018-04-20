@@ -13,82 +13,45 @@
 #include <fbl/algorithm.h>
 #include <inttypes.h>
 #include <kernel/thread.h>
-#include <kernel/vm.h>
 #include <lib/console.h>
 #include <lib/crypto/global_prng.h>
-#include <lk/init.h>
 #include <string.h>
 #include <trace.h>
-#include <vm/initial_map.h>
+#include <vm/bootalloc.h>
+#include <vm/init.h>
+#include <vm/physmap.h>
 #include <vm/pmm.h>
+#include <vm/vm.h>
 #include <vm/vm_aspace.h>
 #include <zircon/types.h>
 
 #define LOCAL_TRACE MAX(VM_GLOBAL_TRACE, 0)
 
-extern int _start;
-extern int _end;
-
-extern int __code_start;
-extern int __code_end;
-extern int __rodata_start;
-extern int __rodata_end;
-extern int __data_start;
-extern int __data_end;
-extern int __bss_start;
-extern int __bss_end;
-
 // boot time allocated page full of zeros
 vm_page_t* zero_page;
 paddr_t zero_page_paddr;
 
+// set early in arch code to record the start address of the kernel
+paddr_t kernel_base_phys;
+
 namespace {
 
-// mark the physical pages backing a range of virtual as in use.
-// allocate the physical pages and throw them away
-void MarkPagesInUse(vaddr_t va, size_t len) {
-    LTRACEF("va %#" PRIxPTR ", len %#zx\n", va, len);
+// mark a range of physical pages as WIRED
+void MarkPagesInUsePhys(paddr_t pa, size_t len) {
+    LTRACEF("pa %#" PRIxPTR ", len %#zx\n", pa, len);
 
     // make sure we are inclusive of all of the pages in the address range
-    len = PAGE_ALIGN(len + (va & (PAGE_SIZE - 1)));
-    va = ROUNDDOWN(va, PAGE_SIZE);
+    len = PAGE_ALIGN(len + (pa & (PAGE_SIZE - 1)));
+    pa = ROUNDDOWN(pa, PAGE_SIZE);
 
-    LTRACEF("aligned va %#" PRIxPTR ", len 0x%zx\n", va, len);
+    LTRACEF("aligned pa %#" PRIxPTR ", len %#zx\n", pa, len);
 
     list_node list = LIST_INITIAL_VALUE(list);
 
-    paddr_t start_pa = ULONG_MAX;
-    paddr_t runlen = 0;
-    for (size_t offset = 0; offset < len; offset += PAGE_SIZE) {
-        uint flags;
-        paddr_t pa;
-
-        zx_status_t err = VmAspace::kernel_aspace()->arch_aspace().Query(va + offset, &pa, &flags);
-        if (err >= 0) {
-            LTRACEF("va %#" PRIxPTR ", pa %#" PRIxPTR ", flags %#x, err %d, start_pa %#" PRIxPTR
-                    " runlen %#" PRIxPTR "\n",
-                    va + offset, pa, flags, err, start_pa, runlen);
-
-            // see if we continue the run
-            if (pa == start_pa + runlen) {
-                runlen += PAGE_SIZE;
-            } else {
-                if (start_pa != ULONG_MAX) {
-                    // we just completed the run
-                    pmm_alloc_range(start_pa, runlen / PAGE_SIZE, &list);
-                }
-
-                // starting a new run
-                start_pa = pa;
-                runlen = PAGE_SIZE;
-            }
-        } else {
-            panic("Could not find pa for va %#" PRIxPTR "\n", va);
-        }
-    }
-
-    if (start_pa != ULONG_MAX && runlen > 0)
-        pmm_alloc_range(start_pa, runlen / PAGE_SIZE, &list);
+    auto allocated = pmm_alloc_range(pa, len / PAGE_SIZE, &list);
+    ASSERT_MSG(allocated == len / PAGE_SIZE,
+            "failed to reserve memory range [%#" PRIxPTR ", %#" PRIxPTR "]\n",
+            pa, pa + len - 1);
 
     // mark all of the pages we allocated as WIRED
     vm_page_t* p;
@@ -107,24 +70,20 @@ zx_status_t ProtectRegion(VmAspace* aspace, vaddr_t va, uint arch_mmu_flags) {
     return vm_mapping->Protect(vm_mapping->base(), vm_mapping->size(), arch_mmu_flags);
 }
 
-} // namespace {}
+} // namespace
 
-void vm_init_preheap(uint level) {
+void vm_init_preheap() {
     LTRACE_ENTRY;
 
     // allow the vmm a shot at initializing some of its data structures
     VmAspace::KernelAspaceInitPreHeap();
 
-    // mark all of the kernel pages in use
-    LTRACEF("marking all kernel pages as used\n");
-    MarkPagesInUse((vaddr_t)&_start, ((uintptr_t)&_end - (uintptr_t)&_start));
-
     // mark the physical pages used by the boot time allocator
     if (boot_alloc_end != boot_alloc_start) {
-        LTRACEF("marking boot alloc used from %#" PRIxPTR " to %#" PRIxPTR "\n", boot_alloc_start,
+        dprintf(INFO, "VM: marking boot alloc used range [%#" PRIxPTR ", %#" PRIxPTR ")\n", boot_alloc_start,
                 boot_alloc_end);
 
-        MarkPagesInUse(boot_alloc_start, boot_alloc_end - boot_alloc_start);
+        MarkPagesInUsePhys(boot_alloc_start, boot_alloc_end - boot_alloc_start);
     }
 
     // Reserve up to 15 pages as a random padding in the kernel physical mapping
@@ -141,13 +100,13 @@ void vm_init_preheap(uint level) {
     zero_page = pmm_alloc_page(0, &zero_page_paddr);
     DEBUG_ASSERT(zero_page);
 
-    void* ptr = paddr_to_kvaddr(zero_page_paddr);
+    void* ptr = paddr_to_physmap(zero_page_paddr);
     DEBUG_ASSERT(ptr);
 
     arch_zero_page(ptr);
 }
 
-void vm_init_postheap(uint level) {
+void vm_init() {
     LTRACE_ENTRY;
 
     VmAspace* aspace = VmAspace::kernel_aspace();
@@ -162,32 +121,26 @@ void vm_init_postheap(uint level) {
     } regions[] = {
         {
             .name = "kernel_code",
-            .base = (vaddr_t)&__code_start,
-            .size = ROUNDUP((size_t)&__code_end - (size_t)&__code_start, PAGE_SIZE),
+            .base = (vaddr_t)__code_start,
+            .size = ROUNDUP((uintptr_t)__code_end - (uintptr_t)__code_start, PAGE_SIZE),
             .arch_mmu_flags = ARCH_MMU_FLAG_PERM_READ | ARCH_MMU_FLAG_PERM_EXECUTE,
         },
         {
             .name = "kernel_rodata",
-            .base = (vaddr_t)&__rodata_start,
-            .size = ROUNDUP((size_t)&__rodata_end - (size_t)&__rodata_start, PAGE_SIZE),
+            .base = (vaddr_t)__rodata_start,
+            .size = ROUNDUP((uintptr_t)__rodata_end - (uintptr_t)__rodata_start, PAGE_SIZE),
             .arch_mmu_flags = ARCH_MMU_FLAG_PERM_READ,
         },
         {
             .name = "kernel_data",
-            .base = (vaddr_t)&__data_start,
-            .size = ROUNDUP((size_t)&__data_end - (size_t)&__data_start, PAGE_SIZE),
+            .base = (vaddr_t)__data_start,
+            .size = ROUNDUP((uintptr_t)__data_end - (uintptr_t)__data_start, PAGE_SIZE),
             .arch_mmu_flags = ARCH_MMU_FLAG_PERM_READ | ARCH_MMU_FLAG_PERM_WRITE,
         },
         {
             .name = "kernel_bss",
-            .base = (vaddr_t)&__bss_start,
-            .size = ROUNDUP((size_t)&__bss_end - (size_t)&__bss_start, PAGE_SIZE),
-            .arch_mmu_flags = ARCH_MMU_FLAG_PERM_READ | ARCH_MMU_FLAG_PERM_WRITE,
-        },
-        {
-            .name = "kernel_bootalloc",
-            .base = (vaddr_t)boot_alloc_start,
-            .size = ROUNDUP(boot_alloc_end - boot_alloc_start, PAGE_SIZE),
+            .base = (vaddr_t)__bss_start,
+            .size = ROUNDUP((uintptr_t)_end - (uintptr_t)__bss_start, PAGE_SIZE),
             .arch_mmu_flags = ARCH_MMU_FLAG_PERM_READ | ARCH_MMU_FLAG_PERM_WRITE,
         },
     };
@@ -196,7 +149,7 @@ void vm_init_postheap(uint level) {
         temp_region* region = &regions[i];
         ASSERT(IS_PAGE_ALIGNED(region->base));
 
-        dprintf(INFO, "VM: reserving kernel region [%016" PRIxPTR ", %016" PRIxPTR ") flags %#x name '%s'\n",
+        dprintf(INFO, "VM: reserving kernel region [%#" PRIxPTR ", %#" PRIxPTR ") flags %#x name '%s'\n",
                 region->base, region->base + region->size, region->arch_mmu_flags, region->name);
 
         zx_status_t status = aspace->ReserveSpace(region->name, region->size, region->base);
@@ -205,53 +158,8 @@ void vm_init_postheap(uint level) {
         ASSERT(status == ZX_OK);
     }
 
-    // mmu_initial_mappings should reflect where we are now, use it to construct the actual
-    // mappings.  We will carve out the kernel code/data from any mappings and
-    // unmap any temporary ones.
-    const struct mmu_initial_mapping* map = mmu_initial_mappings;
-    for (map = mmu_initial_mappings; map->size > 0; ++map) {
-        LTRACEF("looking at mapping %p (%s)\n", map, map->name);
-        // Unmap temporary mappings except where they intersect with the
-        // kernel code/data regions.
-        vaddr_t vaddr = map->virt;
-        LTRACEF("vaddr %#" PRIxPTR ", virt + size %#" PRIxPTR "\n", vaddr, map->virt + map->size);
-        while (vaddr != map->virt + map->size) {
-            vaddr_t next_kernel_region = map->virt + map->size;
-            vaddr_t next_kernel_region_end = map->virt + map->size;
-
-            // Find the kernel code/data region with the lowest start address
-            // that is within this mapping.
-            for (uint i = 0; i < fbl::count_of(regions); ++i) {
-                temp_region* region = &regions[i];
-
-                if (region->base >= vaddr && region->base < map->virt + map->size &&
-                    region->base < next_kernel_region) {
-
-                    next_kernel_region = region->base;
-                    next_kernel_region_end = region->base + region->size;
-                }
-            }
-
-            // If vaddr isn't the start of a kernel code/data region, then we should make
-            // a mapping between it and the next closest one.
-            if (next_kernel_region != vaddr) {
-                zx_status_t status = aspace->ReserveSpace(map->name, next_kernel_region - vaddr, vaddr);
-                ASSERT(status == ZX_OK);
-
-                if (map->flags & MMU_INITIAL_MAPPING_TEMPORARY) {
-                    // If the region is part of a temporary mapping, immediately unmap it
-                    dprintf(INFO, "VM: freeing region [%016" PRIxPTR ", %016" PRIxPTR ")\n", vaddr, next_kernel_region);
-                    status = aspace->FreeRegion(vaddr);
-                    ASSERT(status == ZX_OK);
-                } else {
-                    // Otherwise, mark it no-exec since it's not explicitly code
-                    status = ProtectRegion(aspace, vaddr, ARCH_MMU_FLAG_PERM_READ | ARCH_MMU_FLAG_PERM_WRITE);
-                    ASSERT(status == ZX_OK);
-                }
-            }
-            vaddr = next_kernel_region_end;
-        }
-    }
+    // reserve the kernel aspace where the physmap is
+    aspace->ReserveSpace("physmap", PHYSMAP_SIZE, PHYSMAP_BASE);
 
     // Reserve random padding of up to 64GB after first mapping. It will make
     // the adjacent memory mappings (kstack_vmar, arena:handles and others) at
@@ -260,28 +168,15 @@ void vm_init_postheap(uint level) {
     crypto::GlobalPRNG::GetInstance()->Draw(&entropy, sizeof(entropy));
 
     size_t random_size = PAGE_ALIGN(entropy % (64ULL * GB));
-    const struct mmu_initial_mapping* first_mapping = mmu_initial_mappings;
-    vaddr_t end_first_mapping = first_mapping->virt + first_mapping->size;
-
-    zx_status_t status = aspace->ReserveSpace("random_padding", random_size, end_first_mapping);
+    zx_status_t status = aspace->ReserveSpace("random_padding", random_size, PHYSMAP_BASE + PHYSMAP_SIZE);
     ASSERT(status == ZX_OK);
     LTRACEF("VM: aspace random padding size: %#" PRIxPTR "\n", random_size);
 }
 
-void* paddr_to_kvaddr(paddr_t pa) {
-    // slow path to do reverse lookup
-    struct mmu_initial_mapping* map = mmu_initial_mappings;
-    while (map->size > 0) {
-        if (!(map->flags & MMU_INITIAL_MAPPING_TEMPORARY) && pa >= map->phys &&
-            pa <= map->phys + map->size - 1) {
-            return (void*)(map->virt + (pa - map->phys));
-        }
-        map++;
-    }
-    return nullptr;
-}
-
 paddr_t vaddr_to_paddr(const void* ptr) {
+    if (is_physmap_addr(ptr))
+        return physmap_to_paddr(ptr);
+
     auto aspace = VmAspace::vaddr_to_aspace(reinterpret_cast<uintptr_t>(ptr));
     if (!aspace)
         return (paddr_t) nullptr;
@@ -311,8 +206,13 @@ static int cmd_vm(int argc, const cmd_args* argv, uint32_t flags) {
         if (argc < 3)
             goto notenoughargs;
 
-        void* ptr = paddr_to_kvaddr((paddr_t)argv[2].u);
-        printf("paddr_to_kvaddr returns %p\n", ptr);
+        if (!is_physmap_phys_addr(argv[2].u)) {
+            printf("address isn't in physmap\n");
+            return -1;
+        }
+
+        void* ptr = paddr_to_physmap((paddr_t)argv[2].u);
+        printf("paddr_to_physmap returns %p\n", ptr);
     } else if (!strcmp(argv[1].str, "virt2phys")) {
         if (argc < 3)
             goto notenoughargs;
@@ -342,7 +242,8 @@ static int cmd_vm(int argc, const cmd_args* argv, uint32_t flags) {
 
         size_t mapped;
         auto err =
-            aspace->arch_aspace().Map(argv[3].u, argv[2].u, (uint)argv[4].u, (uint)argv[5].u, &mapped);
+            aspace->arch_aspace().MapContiguous(argv[3].u, argv[2].u, (uint)argv[4].u,
+                                                (uint)argv[5].u, &mapped);
         printf("arch_mmu_map returns %d, mapped %zu\n", err, mapped);
     } else if (!strcmp(argv[1].str, "unmap")) {
         if (argc < 4)
@@ -370,6 +271,3 @@ STATIC_COMMAND_START
 STATIC_COMMAND("vm", "vm commands", &cmd_vm)
 #endif
 STATIC_COMMAND_END(vm);
-
-LK_INIT_HOOK(vm_preheap, &vm_init_preheap, LK_INIT_LEVEL_HEAP - 1);
-LK_INIT_HOOK(vm, &vm_init_postheap, LK_INIT_LEVEL_VM);

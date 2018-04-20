@@ -8,12 +8,16 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/types.h>
 #include <unistd.h>
+#include <threads.h>
 
 #include <zircon/process.h>
 #include <zircon/syscalls.h>
 #include <zircon/syscalls/object.h>
 #include <fbl/algorithm.h>
+#include <fbl/atomic.h>
+#include <fbl/function.h>
 #include <pretty/hexdump.h>
 #include <unittest/unittest.h>
 
@@ -43,7 +47,6 @@ bool vmo_read_write_test() {
     BEGIN_TEST;
 
     zx_status_t status;
-    size_t size;
     zx_handle_t vmo;
 
     // allocate an object and read/write from it
@@ -52,9 +55,8 @@ bool vmo_read_write_test() {
     EXPECT_EQ(status, ZX_OK, "vm_object_create");
 
     char buf[len];
-    status = zx_vmo_read(vmo, buf, 0, sizeof(buf), &size);
+    status = zx_vmo_read(vmo, buf, 0, sizeof(buf));
     EXPECT_EQ(status, ZX_OK, "vm_object_read");
-    EXPECT_EQ(sizeof(buf), size, "vm_object_read");
 
     // make sure it's full of zeros
     size_t count = 0;
@@ -67,9 +69,8 @@ bool vmo_read_write_test() {
     }
 
     memset(buf, 0x99, sizeof(buf));
-    status = zx_vmo_write(vmo, buf, 0, sizeof(buf), &size);
+    status = zx_vmo_write(vmo, buf, 0, sizeof(buf));
     EXPECT_EQ(status, ZX_OK, "vm_object_write");
-    EXPECT_EQ(sizeof(buf), size, "vm_object_write");
 
     // map it
     uintptr_t ptr;
@@ -83,6 +84,55 @@ bool vmo_read_write_test() {
 
     status = zx_vmar_unmap(zx_vmar_root_self(), ptr, len);
     EXPECT_EQ(ZX_OK, status, "vm_unmap");
+
+    // close the handle
+    status = zx_handle_close(vmo);
+    EXPECT_EQ(ZX_OK, status, "handle_close");
+
+    END_TEST;
+}
+
+bool vmo_read_write_range_test() {
+    BEGIN_TEST;
+
+    zx_status_t status;
+    zx_handle_t vmo;
+
+    // allocate an object
+    const size_t len = PAGE_SIZE * 4;
+    status = zx_vmo_create(len, 0, &vmo);
+    EXPECT_EQ(status, ZX_OK, "vm_object_create");
+
+    // fail to read past end
+    char buf[len * 2];
+    status = zx_vmo_read(vmo, buf, 0, sizeof(buf));
+    EXPECT_EQ(status, ZX_ERR_OUT_OF_RANGE, "vm_object_read past end");
+
+    // Successfully read 0 bytes at end
+    status = zx_vmo_read(vmo, buf, len, 0);
+    EXPECT_EQ(status, ZX_OK, "vm_object_read zero at end");
+
+    // Fail to read 0 bytes past end
+    status = zx_vmo_read(vmo, buf, len + 1, 0);
+    EXPECT_EQ(status, ZX_ERR_OUT_OF_RANGE, "vm_object_read zero past end");
+
+    // fail to write past end
+    status = zx_vmo_write(vmo, buf, 0, sizeof(buf));
+    EXPECT_EQ(status, ZX_ERR_OUT_OF_RANGE, "vm_object_write past end");
+
+    // Successfully write 0 bytes at end
+    status = zx_vmo_write(vmo, buf, len, 0);
+    EXPECT_EQ(status, ZX_OK, "vm_object_write zero at end");
+
+    // Fail to read 0 bytes past end
+    status = zx_vmo_write(vmo, buf, len + 1, 0);
+    EXPECT_EQ(status, ZX_ERR_OUT_OF_RANGE, "vm_object_write zero past end");
+
+    // Test for unsigned wraparound
+    status = zx_vmo_read(vmo, buf, UINT64_MAX - (len / 2), len);
+    EXPECT_EQ(status, ZX_ERR_OUT_OF_RANGE, "vm_object_read offset + len wraparound");
+    status = zx_vmo_write(vmo, buf, UINT64_MAX - (len / 2), len);
+    EXPECT_EQ(status, ZX_ERR_OUT_OF_RANGE, "vm_object_write offset + len wraparound");
 
     // close the handle
     status = zx_handle_close(vmo);
@@ -302,12 +352,23 @@ bool vmo_resize_test() {
     status = zx_vmo_set_size(vmo, UINT64_MAX);
     EXPECT_EQ(ZX_ERR_OUT_OF_RANGE, status, "vm_object_set_size too big");
 
+    // resize it to a non aligned size
+    status = zx_vmo_set_size(vmo, len + 1);
+    EXPECT_EQ(ZX_OK, status, "vm_object_set_size");
+
+    // size should be rounded up to the next page boundary
+    size = 0x99999999;
+    status = zx_vmo_get_size(vmo, &size);
+    EXPECT_EQ(ZX_OK, status, "vm_object_get_size");
+    EXPECT_EQ(fbl::round_up(len + 1u, static_cast<size_t>(PAGE_SIZE)), size, "vm_object_get_size");
+    len = fbl::round_up(len + 1u, static_cast<size_t>(PAGE_SIZE));
+
     // map it
     uintptr_t ptr;
     status = zx_vmar_map(zx_vmar_root_self(), 0, vmo, 0, len,
                          ZX_VM_FLAG_PERM_READ, &ptr);
     EXPECT_EQ(ZX_OK, status, "vm_map");
-    EXPECT_NONNULL(ptr, "vm_map");
+    EXPECT_NE(ptr, 0, "vm_map");
 
     // resize it with it mapped
     status = zx_vmo_set_size(vmo, size);
@@ -320,6 +381,83 @@ bool vmo_resize_test() {
     // close the handle
     status = zx_handle_close(vmo);
     EXPECT_EQ(ZX_OK, status, "handle_close");
+
+    END_TEST;
+}
+
+bool vmo_size_align_test() {
+    BEGIN_TEST;
+
+    for (uint64_t s = 0; s < PAGE_SIZE * 4; s++) {
+        zx_handle_t vmo;
+
+        // create a new object with nonstandard size
+        zx_status_t status = zx_vmo_create(s, 0, &vmo);
+        EXPECT_EQ(ZX_OK, status, "vm_object_create");
+
+        // should be the size rounded up to the nearest page boundary
+        uint64_t size = 0x99999999;
+        status = zx_vmo_get_size(vmo, &size);
+        EXPECT_EQ(ZX_OK, status, "vm_object_get_size");
+        EXPECT_EQ(fbl::round_up(s, static_cast<size_t>(PAGE_SIZE)), size, "vm_object_get_size");
+
+        // close the handle
+        EXPECT_EQ(ZX_OK, zx_handle_close(vmo), "handle_close");
+    }
+
+    END_TEST;
+}
+
+bool vmo_resize_align_test() {
+    BEGIN_TEST;
+
+    // resize a vmo with a particular size and test that the resulting size is aligned on a page boundary
+    zx_handle_t vmo;
+    zx_status_t status = zx_vmo_create(0, 0, &vmo);
+    EXPECT_EQ(ZX_OK, status, "vm_object_create");
+
+    for (uint64_t s = 0; s < PAGE_SIZE * 4; s++) {
+        // set the size of the object
+        zx_status_t status = zx_vmo_set_size(vmo, s);
+        EXPECT_EQ(ZX_OK, status, "vm_object_create");
+
+        // should be the size rounded up to the nearest page boundary
+        uint64_t size = 0x99999999;
+        status = zx_vmo_get_size(vmo, &size);
+        EXPECT_EQ(ZX_OK, status, "vm_object_get_size");
+        EXPECT_EQ(fbl::round_up(s, static_cast<size_t>(PAGE_SIZE)), size, "vm_object_get_size");
+    }
+
+    // close the handle
+    EXPECT_EQ(ZX_OK, zx_handle_close(vmo), "handle_close");
+
+    END_TEST;
+}
+
+bool vmo_clone_size_align_test() {
+    BEGIN_TEST;
+
+    zx_handle_t vmo;
+    zx_status_t status = zx_vmo_create(0, 0, &vmo);
+    EXPECT_EQ(ZX_OK, status, "vm_object_create");
+
+    // create clones with different sizes, make sure the created size is a multiple of a page size
+    for (uint64_t s = 0; s < PAGE_SIZE * 4; s++) {
+        zx_handle_t clone_vmo;
+        EXPECT_EQ(ZX_OK, zx_vmo_clone(vmo, ZX_VMO_CLONE_COPY_ON_WRITE, 0, s, &clone_vmo), "vm_clone");
+
+        // should be the size rounded up to the nearest page boundary
+        uint64_t size = 0x99999999;
+        zx_status_t status = zx_vmo_get_size(clone_vmo, &size);
+        EXPECT_EQ(ZX_OK, status, "vm_object_get_size");
+        EXPECT_EQ(fbl::round_up(s, static_cast<size_t>(PAGE_SIZE)), size, "vm_object_get_size");
+
+        // close the handle
+        EXPECT_EQ(ZX_OK, zx_handle_close(clone_vmo), "handle_close");
+    }
+
+    // close the handle
+    EXPECT_EQ(ZX_OK, zx_handle_close(vmo), "handle_close");
 
     END_TEST;
 }
@@ -358,7 +496,6 @@ bool vmo_rights_test() {
 
     char buf[4096];
     size_t len = PAGE_SIZE * 4;
-    size_t r;
     zx_status_t status;
     zx_handle_t vmo, vmo2;
 
@@ -371,6 +508,7 @@ bool vmo_rights_test() {
     static const zx_rights_t kExpectedRights =
         ZX_RIGHT_DUPLICATE |
         ZX_RIGHT_TRANSFER |
+        ZX_RIGHT_WAIT |
         ZX_RIGHT_READ |
         ZX_RIGHT_WRITE |
         ZX_RIGHT_EXECUTE |
@@ -380,32 +518,32 @@ bool vmo_rights_test() {
     EXPECT_EQ(kExpectedRights, kExpectedRights & get_handle_rights(vmo));
 
     // test that we can read/write it
-    status = zx_vmo_read(vmo, buf, 0, 0, &r);
+    status = zx_vmo_read(vmo, buf, 0, 0);
     EXPECT_EQ(0, status, "vmo_read");
-    status = zx_vmo_write(vmo, buf, 0, 0, &r);
+    status = zx_vmo_write(vmo, buf, 0, 0);
     EXPECT_EQ(0, status, "vmo_write");
 
     vmo2 = ZX_HANDLE_INVALID;
     zx_handle_duplicate(vmo, ZX_RIGHT_READ, &vmo2);
-    status = zx_vmo_read(vmo2, buf, 0, 0, &r);
+    status = zx_vmo_read(vmo2, buf, 0, 0);
     EXPECT_EQ(0, status, "vmo_read");
-    status = zx_vmo_write(vmo2, buf, 0, 0, &r);
+    status = zx_vmo_write(vmo2, buf, 0, 0);
     EXPECT_EQ(ZX_ERR_ACCESS_DENIED, status, "vmo_write");
     zx_handle_close(vmo2);
 
     vmo2 = ZX_HANDLE_INVALID;
     zx_handle_duplicate(vmo, ZX_RIGHT_WRITE, &vmo2);
-    status = zx_vmo_read(vmo2, buf, 0, 0, &r);
+    status = zx_vmo_read(vmo2, buf, 0, 0);
     EXPECT_EQ(ZX_ERR_ACCESS_DENIED, status, "vmo_read");
-    status = zx_vmo_write(vmo2, buf, 0, 0, &r);
+    status = zx_vmo_write(vmo2, buf, 0, 0);
     EXPECT_EQ(0, status, "vmo_write");
     zx_handle_close(vmo2);
 
     vmo2 = ZX_HANDLE_INVALID;
     zx_handle_duplicate(vmo, 0, &vmo2);
-    status = zx_vmo_read(vmo2, buf, 0, 0, &r);
+    status = zx_vmo_read(vmo2, buf, 0, 0);
     EXPECT_EQ(ZX_ERR_ACCESS_DENIED, status, "vmo_read");
-    status = zx_vmo_write(vmo2, buf, 0, 0, &r);
+    status = zx_vmo_write(vmo2, buf, 0, 0);
     EXPECT_EQ(ZX_ERR_ACCESS_DENIED, status, "vmo_write");
     zx_handle_close(vmo2);
 
@@ -485,64 +623,7 @@ bool vmo_rights_test() {
     char get_name[ZX_MAX_NAME_LEN];
     status = zx_object_get_property(vmo, ZX_PROP_NAME, get_name, sizeof(get_name));
     EXPECT_EQ(ZX_OK, status, "get_property");
-    EXPECT_STR_EQ(set_name, get_name, sizeof(set_name), "vmo name");
-
-    // close the handle
-    status = zx_handle_close(vmo);
-    EXPECT_EQ(ZX_OK, status, "handle_close");
-
-    END_TEST;
-}
-
-bool vmo_lookup_test() {
-    BEGIN_TEST;
-
-    zx_handle_t vmo;
-    zx_status_t status;
-
-    const size_t size = 16384;
-    zx_paddr_t buf[size / PAGE_SIZE];
-
-    status = zx_vmo_create(size, 0, &vmo);
-    EXPECT_EQ(0, status, "vm_object_create");
-
-    // do a lookup (this should fail becase the pages aren't committed)
-    status = zx_vmo_op_range(vmo, ZX_VMO_OP_LOOKUP, 0, size, buf, sizeof(buf));
-    EXPECT_EQ(ZX_ERR_NO_MEMORY, status, "lookup on uncommitted vmo");
-
-    // commit the memory
-    status = zx_vmo_op_range(vmo, ZX_VMO_OP_COMMIT, 0, size, buf, sizeof(buf));
-    EXPECT_EQ(ZX_OK, status, "committing memory");
-
-    // do a lookup (should succeed)
-    memset(buf, 0, sizeof(buf));
-    status = zx_vmo_op_range(vmo, ZX_VMO_OP_LOOKUP, 0, size, buf, sizeof(buf));
-    EXPECT_EQ(ZX_OK, status, "lookup on committed vmo");
-
-    for (auto addr: buf)
-        EXPECT_NE(0u, addr, "looked up address");
-
-    // do a lookup with an odd offset and an end pointer that ends up at an odd offset
-    memset(buf, 0, sizeof(buf));
-    status = zx_vmo_op_range(vmo, ZX_VMO_OP_LOOKUP, 1, size - PAGE_SIZE, buf, sizeof(buf));
-    EXPECT_EQ(ZX_OK, status, "lookup on committed vmo");
-
-    for (auto addr: buf)
-        EXPECT_NE(0u, addr, "looked up address");
-
-    // invalid args
-
-    // do a lookup with no size
-    status = zx_vmo_op_range(vmo, ZX_VMO_OP_LOOKUP, 0, 0, buf, sizeof(buf));
-    EXPECT_EQ(ZX_ERR_INVALID_ARGS, status, "zero size on lookup");
-
-    // do a lookup out of range
-    status = zx_vmo_op_range(vmo, ZX_VMO_OP_LOOKUP, size + 1, 1, buf, sizeof(buf));
-    EXPECT_EQ(ZX_ERR_OUT_OF_RANGE, status, "out of range");
-
-    // do a lookup out of range
-    status = zx_vmo_op_range(vmo, ZX_VMO_OP_LOOKUP, 0, size + 1, buf, sizeof(buf));
-    EXPECT_EQ(ZX_ERR_BUFFER_TOO_SMALL, status, "buffer too small");
+    EXPECT_STR_EQ(set_name, get_name, "vmo name");
 
     // close the handle
     status = zx_handle_close(vmo);
@@ -581,21 +662,21 @@ bool vmo_commit_test() {
     status = zx_vmar_map(zx_vmar_root_self(), 0, vmo, 0, size,
                          ZX_VM_FLAG_PERM_READ|ZX_VM_FLAG_PERM_WRITE, &ptr);
     EXPECT_EQ(ZX_OK, status, "map");
-    EXPECT_NONNULL(ptr, "map address");
+    EXPECT_NE(ptr, 0, "map address");
 
     // second mapping with an offset
     ptr2 = 0;
     status = zx_vmar_map(zx_vmar_root_self(), 0, vmo, PAGE_SIZE, size,
                          ZX_VM_FLAG_PERM_READ|ZX_VM_FLAG_PERM_WRITE, &ptr2);
     EXPECT_EQ(ZX_OK, status, "map2");
-    EXPECT_NONNULL(ptr2, "map address2");
+    EXPECT_NE(ptr2, 0, "map address2");
 
     // third mapping with a totally non-overlapping offset
     ptr3 = 0;
     status = zx_vmar_map(zx_vmar_root_self(), 0, vmo, size * 2, size,
                          ZX_VM_FLAG_PERM_READ|ZX_VM_FLAG_PERM_WRITE, &ptr3);
     EXPECT_EQ(ZX_OK, status, "map3");
-    EXPECT_NONNULL(ptr3, "map address3");
+    EXPECT_NE(ptr3, 0, "map address3");
 
     // write into it at offset PAGE_SIZE, read it back
     volatile uint32_t *u32 = (volatile uint32_t *)(ptr + PAGE_SIZE);
@@ -683,8 +764,7 @@ bool vmo_zero_page_test() {
 
     // write to the page via a vmo_write call
     uint32_t v = 100;
-    size_t written;
-    status = zx_vmo_write(vmo, &v, PAGE_SIZE, sizeof(v), &written);
+    status = zx_vmo_write(vmo, &v, PAGE_SIZE, sizeof(v));
     EXPECT_EQ(ZX_OK, status, "writing to vmo");
 
     // expect it to read back the new value
@@ -699,7 +779,7 @@ bool vmo_zero_page_test() {
     EXPECT_EQ(ZX_OK, status, "committing memory");
 
     // write to the third page
-    status = zx_vmo_write(vmo, &v, PAGE_SIZE * 2, sizeof(v), &written);
+    status = zx_vmo_write(vmo, &v, PAGE_SIZE * 2, sizeof(v));
     EXPECT_EQ(ZX_OK, status, "writing to vmo");
 
     // expect it to read back the new value
@@ -762,7 +842,6 @@ bool vmo_clone_test_2() {
     zx_handle_t vmo;
     zx_handle_t clone_vmo[1];
     //uintptr_t ptr;
-    size_t bytes_handled;
 
     // create a vmo
     const size_t size = PAGE_SIZE * 4;
@@ -770,7 +849,7 @@ bool vmo_clone_test_2() {
 
     // fill the original with stuff
     for (size_t off = 0; off < size; off += sizeof(off)) {
-        zx_vmo_write(vmo, &off, off, sizeof(off), &bytes_handled);
+        zx_vmo_write(vmo, &off, off, sizeof(off));
     }
 
     // clone it
@@ -782,7 +861,7 @@ bool vmo_clone_test_2() {
     for (size_t off = 0; off < size; off += sizeof(off)) {
         size_t val;
 
-        zx_vmo_read(clone_vmo[0], &val, off, sizeof(val), &bytes_handled);
+        zx_vmo_read(clone_vmo[0], &val, off, sizeof(val));
 
         if (val != off) {
             EXPECT_EQ(val, off, "vm_clone read back");
@@ -792,17 +871,17 @@ bool vmo_clone_test_2() {
 
     // write to part of the clone
     size_t val = 99;
-    zx_vmo_write(clone_vmo[0], &val, 0, sizeof(val), &bytes_handled);
+    zx_vmo_write(clone_vmo[0], &val, 0, sizeof(val));
 
     // verify the clone was written to
-    EXPECT_EQ(ZX_OK, zx_vmo_read(clone_vmo[0], &val, 0, sizeof(val), &bytes_handled), "writing to clone");
+    EXPECT_EQ(ZX_OK, zx_vmo_read(clone_vmo[0], &val, 0, sizeof(val)), "writing to clone");
 
     // verify it was written to
     EXPECT_EQ(99, val, "reading back from clone");
 
     // verify that the rest of the page it was written two was cloned
     for (size_t off = sizeof(val); off < PAGE_SIZE; off += sizeof(off)) {
-        zx_vmo_read(clone_vmo[0], &val, off, sizeof(val), &bytes_handled);
+        zx_vmo_read(clone_vmo[0], &val, off, sizeof(val));
 
         if (val != off) {
             EXPECT_EQ(val, off, "vm_clone read back");
@@ -812,7 +891,7 @@ bool vmo_clone_test_2() {
 
     // verify that it didn't trash the original
     for (size_t off = 0; off < size; off += sizeof(off)) {
-        zx_vmo_read(vmo, &val, off, sizeof(val), &bytes_handled);
+        zx_vmo_read(vmo, &val, off, sizeof(val));
 
         if (val != off) {
             EXPECT_EQ(val, off, "vm_clone read back of original");
@@ -823,8 +902,8 @@ bool vmo_clone_test_2() {
     // write to the original in the part that is still visible to the clone
     val = 99;
     uint64_t offset = PAGE_SIZE * 2;
-    EXPECT_EQ(ZX_OK, zx_vmo_write(vmo, &val, offset, sizeof(val), &bytes_handled), "writing to original");
-    EXPECT_EQ(ZX_OK, zx_vmo_read(clone_vmo[0], &val, offset, sizeof(val), &bytes_handled), "reading back original from clone");
+    EXPECT_EQ(ZX_OK, zx_vmo_write(vmo, &val, offset, sizeof(val)), "writing to original");
+    EXPECT_EQ(ZX_OK, zx_vmo_read(clone_vmo[0], &val, offset, sizeof(val)), "reading back original from clone");
     EXPECT_EQ(99, val, "checking value");
 
     // close the clone handles
@@ -856,7 +935,7 @@ bool vmo_clone_test_3() {
     EXPECT_EQ(ZX_OK,
             zx_vmar_map(zx_vmar_root_self(), 0, vmo, 0, size, ZX_VM_FLAG_PERM_READ|ZX_VM_FLAG_PERM_WRITE, &ptr),
             "map");
-    EXPECT_NONNULL(ptr, "map address");
+    EXPECT_NE(ptr, 0, "map address");
     p = (volatile uint32_t *)ptr;
 
     // clone it and map that
@@ -866,7 +945,7 @@ bool vmo_clone_test_3() {
     EXPECT_EQ(ZX_OK,
             zx_vmar_map(zx_vmar_root_self(), 0, clone_vmo[0], 0, size, ZX_VM_FLAG_PERM_READ|ZX_VM_FLAG_PERM_WRITE, &clone_ptr),
             "map");
-    EXPECT_NONNULL(clone_ptr, "map address");
+    EXPECT_NE(clone_ptr, 0, "map address");
     cp = (volatile uint32_t *)clone_ptr;
 
     // read zeros from both
@@ -927,7 +1006,7 @@ bool vmo_clone_decommit_test() {
     EXPECT_EQ(ZX_OK,
             zx_vmar_map(zx_vmar_root_self(), 0, vmo, 0, size, ZX_VM_FLAG_PERM_READ|ZX_VM_FLAG_PERM_WRITE, &ptr),
             "map");
-    EXPECT_NONNULL(ptr, "map address");
+    EXPECT_NE(ptr, 0, "map address");
     p = (volatile uint32_t *)ptr;
 
     // clone it and map that
@@ -937,7 +1016,7 @@ bool vmo_clone_decommit_test() {
     EXPECT_EQ(ZX_OK,
             zx_vmar_map(zx_vmar_root_self(), 0, clone_vmo, 0, size, ZX_VM_FLAG_PERM_READ|ZX_VM_FLAG_PERM_WRITE, &clone_ptr),
             "map");
-    EXPECT_NONNULL(clone_ptr, "map address");
+    EXPECT_NE(clone_ptr, 0, "map address");
     cp = (volatile uint32_t *)clone_ptr;
 
     // write to parent and make sure clone sees it
@@ -994,7 +1073,7 @@ bool vmo_clone_commit_test() {
     EXPECT_EQ(ZX_OK,
             zx_vmar_map(zx_vmar_root_self(), 0, vmo, 0, size, ZX_VM_FLAG_PERM_READ|ZX_VM_FLAG_PERM_WRITE, &ptr),
             "map");
-    EXPECT_NONNULL(ptr, "map address");
+    EXPECT_NE(ptr, 0, "map address");
     p = (volatile uint32_t *)ptr;
 
     // clone it and map that
@@ -1004,7 +1083,7 @@ bool vmo_clone_commit_test() {
     EXPECT_EQ(ZX_OK,
             zx_vmar_map(zx_vmar_root_self(), 0, clone_vmo, 0, size, ZX_VM_FLAG_PERM_READ|ZX_VM_FLAG_PERM_WRITE, &clone_ptr),
             "map");
-    EXPECT_NONNULL(clone_ptr, "map address");
+    EXPECT_NE(clone_ptr, 0, "map address");
     cp = (volatile uint32_t *)clone_ptr;
 
     // write to parent and make sure clone sees it
@@ -1047,13 +1126,189 @@ bool vmo_cache_test() {
     BEGIN_TEST;
 
     zx_handle_t vmo;
-    const size_t size = PAGE_SIZE * 4;
+    const size_t size = PAGE_SIZE;
 
-    // The objects returned by zx_vmo_create() are VmObjectPaged objects which
-    // should not support these syscalls.
     EXPECT_EQ(ZX_OK, zx_vmo_create(size, 0, &vmo), "creation for cache_policy");
-    EXPECT_EQ(ZX_ERR_NOT_SUPPORTED, zx_vmo_set_cache_policy(vmo, ZX_CACHE_POLICY_UNCACHED),
-              "attempt set cache");
+
+    // clean vmo can have all valid cache policies set
+    EXPECT_EQ(ZX_OK, zx_vmo_set_cache_policy(vmo, ZX_CACHE_POLICY_CACHED));
+    EXPECT_EQ(ZX_OK, zx_vmo_set_cache_policy(vmo, ZX_CACHE_POLICY_UNCACHED));
+    EXPECT_EQ(ZX_OK, zx_vmo_set_cache_policy(vmo, ZX_CACHE_POLICY_UNCACHED_DEVICE));
+    EXPECT_EQ(ZX_OK, zx_vmo_set_cache_policy(vmo, ZX_CACHE_POLICY_WRITE_COMBINING));
+
+    // bad cache policy
+    EXPECT_EQ(ZX_ERR_INVALID_ARGS, zx_vmo_set_cache_policy(vmo, ZX_CACHE_POLICY_MASK + 1));
+
+    // commit a page, make sure the policy doesn't set
+    EXPECT_EQ(ZX_OK, zx_vmo_op_range(vmo, ZX_VMO_OP_COMMIT, 0, size, nullptr, 0));
+    EXPECT_EQ(ZX_ERR_BAD_STATE, zx_vmo_set_cache_policy(vmo, ZX_CACHE_POLICY_CACHED));
+    EXPECT_EQ(ZX_OK, zx_vmo_op_range(vmo, ZX_VMO_OP_DECOMMIT, 0, size, nullptr, 0));
+    EXPECT_EQ(ZX_OK, zx_vmo_set_cache_policy(vmo, ZX_CACHE_POLICY_CACHED));
+
+    // map the vmo, make sure policy doesn't set
+    uintptr_t ptr;
+    EXPECT_EQ(ZX_OK, zx_vmar_map(zx_vmar_root_self(), 0, vmo, 0, size, ZX_VM_FLAG_PERM_READ, &ptr));
+    EXPECT_EQ(ZX_ERR_BAD_STATE, zx_vmo_set_cache_policy(vmo, ZX_CACHE_POLICY_CACHED));
+    EXPECT_EQ(ZX_OK, zx_vmar_unmap(zx_vmar_root_self(), ptr, size));
+    EXPECT_EQ(ZX_OK, zx_vmo_set_cache_policy(vmo, ZX_CACHE_POLICY_CACHED));
+
+    // clone the vmo, make sure policy doesn't set
+    zx_handle_t clone;
+    EXPECT_EQ(ZX_OK, zx_vmo_clone(vmo, ZX_VMO_CLONE_COPY_ON_WRITE, 0, size, &clone));
+    EXPECT_EQ(ZX_ERR_BAD_STATE, zx_vmo_set_cache_policy(vmo, ZX_CACHE_POLICY_CACHED));
+    EXPECT_EQ(ZX_OK, zx_handle_close(clone));
+    EXPECT_EQ(ZX_OK, zx_vmo_set_cache_policy(vmo, ZX_CACHE_POLICY_CACHED));
+
+    // clone the vmo, try to set policy on the clone
+    EXPECT_EQ(ZX_OK, zx_vmo_clone(vmo, ZX_VMO_CLONE_COPY_ON_WRITE, 0, size, &clone));
+    EXPECT_EQ(ZX_ERR_BAD_STATE, zx_vmo_set_cache_policy(clone, ZX_CACHE_POLICY_CACHED));
+    EXPECT_EQ(ZX_OK, zx_handle_close(clone));
+
+    // set the policy, make sure future clones do not go through
+    EXPECT_EQ(ZX_OK, zx_vmo_set_cache_policy(vmo, ZX_CACHE_POLICY_UNCACHED));
+    EXPECT_EQ(ZX_ERR_BAD_STATE, zx_vmo_clone(vmo, ZX_VMO_CLONE_COPY_ON_WRITE, 0, size, &clone));
+    EXPECT_EQ(ZX_OK, zx_vmo_set_cache_policy(vmo, ZX_CACHE_POLICY_CACHED));
+    EXPECT_EQ(ZX_OK, zx_vmo_clone(vmo, ZX_VMO_CLONE_COPY_ON_WRITE, 0, size, &clone));
+    EXPECT_EQ(ZX_OK, zx_handle_close(clone));
+
+    // set the policy, make sure vmo read/write do not work
+    char c;
+    EXPECT_EQ(ZX_OK, zx_vmo_set_cache_policy(vmo, ZX_CACHE_POLICY_UNCACHED));
+    EXPECT_EQ(ZX_ERR_BAD_STATE, zx_vmo_read(vmo, &c, 0, sizeof(c)));
+    EXPECT_EQ(ZX_ERR_BAD_STATE, zx_vmo_write(vmo, &c, 0, sizeof(c)));
+    EXPECT_EQ(ZX_OK, zx_vmo_set_cache_policy(vmo, ZX_CACHE_POLICY_CACHED));
+    EXPECT_EQ(ZX_OK, zx_vmo_read(vmo, &c, 0, sizeof(c)));
+    EXPECT_EQ(ZX_OK, zx_vmo_write(vmo, &c, 0, sizeof(c)));
+
+    EXPECT_EQ(ZX_OK, zx_handle_close(vmo), "close handle");
+    END_TEST;
+}
+
+bool vmo_cache_map_test() {
+    BEGIN_TEST;
+
+    auto maptest = [](uint32_t policy, const char *type) {
+        zx_handle_t vmo;
+        const size_t size = 256*1024; // 256K
+
+        EXPECT_EQ(ZX_OK, zx_vmo_create(size, 0, &vmo));
+
+        // set the cache policy
+        EXPECT_EQ(ZX_OK, zx_vmo_set_cache_policy(vmo, policy));
+
+        // commit it
+        EXPECT_EQ(ZX_OK, zx_vmo_op_range(vmo, ZX_VMO_OP_COMMIT, 0, size, nullptr, 0));
+
+        // map it
+        uintptr_t ptr;
+        EXPECT_EQ(ZX_OK, zx_vmar_map(zx_vmar_root_self(), 0, vmo, 0, size,
+                  ZX_VM_FLAG_PERM_READ | ZX_VM_FLAG_PERM_WRITE | ZX_VM_FLAG_MAP_RANGE, &ptr));
+
+        volatile uint32_t *buf = (volatile uint32_t *)ptr;
+
+        // write it once, priming the cache
+        for (size_t i = 0; i < size / 4; i++)
+            buf[i] = 0;
+
+        // write to it
+        zx_time_t wt = zx_clock_get(ZX_CLOCK_MONOTONIC);
+        for (size_t i = 0; i < size / 4; i++)
+            buf[i] = 0;
+        wt = zx_clock_get(ZX_CLOCK_MONOTONIC) - wt;
+
+        // read from it
+        zx_time_t rt = zx_clock_get(ZX_CLOCK_MONOTONIC);
+        for (size_t i = 0; i < size / 4; i++)
+            __UNUSED uint32_t hole = buf[i];
+        rt = zx_clock_get(ZX_CLOCK_MONOTONIC) - rt;
+
+        printf("took %" PRIu64 " nsec to write %s memory\n", wt, type);
+        printf("took %" PRIu64 " nsec to read %s memory\n", rt, type);
+
+        EXPECT_EQ(ZX_OK, zx_vmar_unmap(zx_vmar_root_self(), ptr, size));
+        EXPECT_EQ(ZX_OK, zx_handle_close(vmo));
+    };
+
+    printf("\n");
+    maptest(ZX_CACHE_POLICY_CACHED, "cached");
+    maptest(ZX_CACHE_POLICY_UNCACHED, "uncached");
+    maptest(ZX_CACHE_POLICY_UNCACHED_DEVICE, "uncached device");
+    maptest(ZX_CACHE_POLICY_WRITE_COMBINING, "write combining");
+
+    END_TEST;
+}
+
+bool vmo_cache_op_test() {
+    BEGIN_TEST;
+
+    zx_handle_t vmo;
+    const size_t size = 0x8000;
+
+    EXPECT_EQ(ZX_OK, zx_vmo_create(size, 0, &vmo), "creation for cache op");
+
+    auto t = [vmo](uint32_t op) {
+        EXPECT_EQ(ZX_OK, zx_vmo_op_range(vmo, op, 0, 1, nullptr, 0), "0 1");
+        EXPECT_EQ(ZX_OK, zx_vmo_op_range(vmo, op, 0, 1, nullptr, 0), "0 1");
+        EXPECT_EQ(ZX_OK, zx_vmo_op_range(vmo, op, 1, 1, nullptr, 0), "1 1");
+        EXPECT_EQ(ZX_OK, zx_vmo_op_range(vmo, op, 0, size, nullptr, 0), "0 size");
+        EXPECT_EQ(ZX_OK, zx_vmo_op_range(vmo, op, 1, size - 1, nullptr, 0), "0 size");
+        EXPECT_EQ(ZX_OK, zx_vmo_op_range(vmo, op, 0x5200, 1, nullptr, 0), "0x5200 1");
+        EXPECT_EQ(ZX_OK, zx_vmo_op_range(vmo, op, 0x5200, 0x800, nullptr, 0), "0x5200 0x800");
+        EXPECT_EQ(ZX_OK, zx_vmo_op_range(vmo, op, 0x5200, 0x1000, nullptr, 0), "0x5200 0x1000");
+        EXPECT_EQ(ZX_OK, zx_vmo_op_range(vmo, op, 0x5200, 0x1200, nullptr, 0), "0x5200 0x1200");
+
+        EXPECT_EQ(ZX_ERR_INVALID_ARGS, zx_vmo_op_range(vmo, op, 0, 0, nullptr, 0), "0 0");
+        EXPECT_EQ(ZX_ERR_OUT_OF_RANGE, zx_vmo_op_range(vmo, op, 1, size, nullptr, 0), "0 size");
+        EXPECT_EQ(ZX_ERR_OUT_OF_RANGE, zx_vmo_op_range(vmo, op, size, 1, nullptr, 0), "size 1");
+        EXPECT_EQ(ZX_ERR_OUT_OF_RANGE, zx_vmo_op_range(vmo, op, size+1, 1, nullptr, 0), "size+1 1");
+        EXPECT_EQ(ZX_ERR_OUT_OF_RANGE, zx_vmo_op_range(vmo, op, UINT64_MAX-1, 1, nullptr, 0), "UINT64_MAX-1 1");
+        EXPECT_EQ(ZX_ERR_OUT_OF_RANGE, zx_vmo_op_range(vmo, op, UINT64_MAX, 1, nullptr, 0), "UINT64_MAX 1");
+        EXPECT_EQ(ZX_ERR_OUT_OF_RANGE, zx_vmo_op_range(vmo, op, UINT64_MAX, UINT64_MAX, nullptr, 0), "UINT64_MAX UINT64_MAX");
+    };
+
+    t(ZX_VMO_OP_CACHE_SYNC);
+    t(ZX_VMO_OP_CACHE_CLEAN);
+    t(ZX_VMO_OP_CACHE_CLEAN_INVALIDATE);
+    t(ZX_VMO_OP_CACHE_INVALIDATE);
+
+    EXPECT_EQ(ZX_OK, zx_handle_close(vmo), "close handle");
+    END_TEST;
+}
+
+bool vmo_cache_flush_test() {
+    BEGIN_TEST;
+
+    zx_handle_t vmo;
+    const size_t size = 0x8000;
+
+    EXPECT_EQ(ZX_OK, zx_vmo_create(size, 0, &vmo), "creation for cache op");
+
+    uintptr_t ptr_ro;
+    EXPECT_EQ(ZX_OK,
+            zx_vmar_map(zx_vmar_root_self(), 0, vmo, 0, size, ZX_VM_FLAG_PERM_READ, &ptr_ro),
+            "map");
+    EXPECT_NE(ptr_ro, 0, "map address");
+    void *pro = (void*)ptr_ro;
+
+    uintptr_t ptr_rw;
+    EXPECT_EQ(ZX_OK,
+            zx_vmar_map(zx_vmar_root_self(), 0, vmo, 0, size, ZX_VM_FLAG_PERM_READ | ZX_VM_FLAG_PERM_WRITE, &ptr_rw),
+            "map");
+    EXPECT_NE(ptr_rw, 0, "map address");
+    void *prw = (void*)ptr_rw;
+
+    zx_vmo_op_range(vmo, ZX_VMO_OP_COMMIT, 0, size, NULL, 0);
+
+    EXPECT_EQ(ZX_OK, zx_cache_flush(prw, size, ZX_CACHE_FLUSH_INSN), "rw flush insn");
+    EXPECT_EQ(ZX_OK, zx_cache_flush(prw, size, ZX_CACHE_FLUSH_DATA), "rw clean");
+    EXPECT_EQ(ZX_OK, zx_cache_flush(prw, size, ZX_CACHE_FLUSH_DATA | ZX_CACHE_FLUSH_INVALIDATE), "rw clean/invalidate");
+
+    EXPECT_EQ(ZX_OK, zx_cache_flush(pro, size, ZX_CACHE_FLUSH_INSN), "ro flush insn");
+    EXPECT_EQ(ZX_OK, zx_cache_flush(pro, size, ZX_CACHE_FLUSH_DATA), "ro clean");
+    EXPECT_EQ(ZX_OK, zx_cache_flush(pro, size, ZX_CACHE_FLUSH_DATA | ZX_CACHE_FLUSH_INVALIDATE), "ro clean/invalidate");
+
+    zx_vmar_unmap(zx_vmar_root_self(), ptr_rw, size);
+    zx_vmar_unmap(zx_vmar_root_self(), ptr_ro, size);
     EXPECT_EQ(ZX_OK, zx_handle_close(vmo), "close handle");
     END_TEST;
 }
@@ -1087,7 +1342,6 @@ bool vmo_clone_test_4() {
     uintptr_t clone_ptr;
     volatile size_t *p;
     volatile size_t *cp;
-    size_t handled_bytes;
 
     // create a vmo
     const size_t size = PAGE_SIZE * 4;
@@ -1097,7 +1351,7 @@ bool vmo_clone_test_4() {
     EXPECT_EQ(ZX_OK,
             zx_vmar_map(zx_vmar_root_self(), 0, vmo, 0, size, ZX_VM_FLAG_PERM_READ|ZX_VM_FLAG_PERM_WRITE, &ptr),
             "map");
-    EXPECT_NONNULL(ptr, "map address");
+    EXPECT_NE(ptr, 0, "map address");
     p = (volatile size_t *)ptr;
 
     // fill it with stuff
@@ -1116,7 +1370,7 @@ bool vmo_clone_test_4() {
     EXPECT_EQ(ZX_OK,
             zx_vmar_map(zx_vmar_root_self(), 0, clone_vmo[0], 0, size, ZX_VM_FLAG_PERM_READ|ZX_VM_FLAG_PERM_WRITE, &clone_ptr),
             "map");
-    EXPECT_NONNULL(clone_ptr, "map address");
+    EXPECT_NE(clone_ptr, 0, "map address");
     cp = (volatile size_t *)clone_ptr;
 
     // verify that it seems to be mapping the original at an offset
@@ -1148,7 +1402,7 @@ bool vmo_clone_test_4() {
 
     // write to the new part of the original
     size_t val = 99;
-    EXPECT_EQ(ZX_OK, zx_vmo_write(vmo, &val, size, sizeof(val), &handled_bytes), "writing to original after extending");
+    EXPECT_EQ(ZX_OK, zx_vmo_write(vmo, &val, size, sizeof(val)), "writing to original after extending");
 
     // verify that it is reflected in the clone
     EXPECT_EQ(99, cp[(size - PAGE_SIZE) / sizeof(*cp)], "modified newly exposed part of cow clone");
@@ -1216,15 +1470,13 @@ bool vmo_clone_rights_test() {
     EXPECT_EQ(zx_object_get_property(vmo, ZX_PROP_NAME,
                                      oldname, sizeof(oldname)),
               ZX_OK);
-    EXPECT_STR_EQ(oldname, kOldVmoName, sizeof(kOldVmoName),
-                  "original VMO name");
+    EXPECT_STR_EQ(oldname, kOldVmoName, "original VMO name");
 
     char newname[ZX_MAX_NAME_LEN] = "bad";
     EXPECT_EQ(zx_object_get_property(clone, ZX_PROP_NAME,
                                      newname, sizeof(newname)),
               ZX_OK);
-    EXPECT_STR_EQ(newname, kNewVmoName, sizeof(kNewVmoName),
-                  "clone VMO name");
+    EXPECT_STR_EQ(newname, kNewVmoName, "clone VMO name");
 
     EXPECT_EQ(zx_handle_close(vmo), ZX_OK);
     EXPECT_EQ(get_handle_rights(clone), kNewVmoRights);
@@ -1233,19 +1485,119 @@ bool vmo_clone_rights_test() {
     END_TEST;
 }
 
+bool vmo_unmap_coherency() {
+    BEGIN_TEST;
+
+    // This is an expensive test to try to detect a multi-cpu coherency
+    // problem with TLB flushing of unmap operations
+    //
+    // algorithm: map a relatively large committed VMO.
+    // Create a worker thread that simply walks through the VMO writing to
+    // each page.
+    // In the main thread continually decommit the vmo with a little bit of
+    // a gap between decommits to allow the worker thread to bring it all back in.
+    // If the worker thread appears stuck by not making it through a loop in
+    // a reasonable time, we have failed.
+
+    // allocate a vmo
+    const size_t len = 32*1024*1024;
+    zx_handle_t vmo;
+    zx_status_t status = zx_vmo_create(len, 0, &vmo);
+    EXPECT_EQ(ZX_OK, status, "vm_object_create");
+
+    // do a regular map
+    uintptr_t ptr = 0;
+    status = zx_vmar_map(zx_vmar_root_self(), 0, vmo, 0, len,
+                         ZX_VM_FLAG_PERM_READ | ZX_VM_FLAG_PERM_WRITE,
+                         &ptr);
+    EXPECT_EQ(ZX_OK, status, "map");
+    EXPECT_NE(0u, ptr, "map address");
+
+    // create a worker thread
+    struct worker_args {
+        size_t len;
+        uintptr_t ptr;
+        fbl::atomic<bool> exit;
+        fbl::atomic<bool> exited;
+        fbl::atomic<size_t> count;
+    } args = {};
+    args.len = len;
+    args.ptr = ptr;
+
+    auto worker = [](void *_args) -> int {
+        worker_args* a = (worker_args*)_args;
+
+        unittest_printf("ptr %#" PRIxPTR " len %zu\n",
+                a->ptr, a->len);
+
+        while (!a->exit.load()) {
+            // walk through the mapping, writing to every page
+            for (size_t off = 0; off < a->len; off += PAGE_SIZE) {
+                *(uint32_t*)(a->ptr + off) = 99;
+            }
+
+            a->count.fetch_add(1);
+        }
+
+        unittest_printf("exiting worker\n");
+
+        a->exited.store(true);
+
+        return 0;
+    };
+
+    thrd_t t;
+    thrd_create(&t, worker, &args);
+
+    const zx_time_t max_duration = ZX_SEC(30);
+    const zx_time_t max_wait = ZX_SEC(1);
+    zx_time_t start = zx_clock_get(ZX_CLOCK_MONOTONIC);
+    for (;;) {
+        // wait for it to loop at least once
+        zx_time_t t = zx_clock_get(ZX_CLOCK_MONOTONIC);
+        size_t last_count = args.count.load();
+        while (args.count.load() <= last_count) {
+            if (zx_clock_get(ZX_CLOCK_MONOTONIC) - t > max_wait) {
+                UNITTEST_FAIL_TRACEF("looper appears stuck!\n");
+                break;
+            }
+        }
+
+        // decommit the vmo
+        status = zx_vmo_op_range(vmo, ZX_VMO_OP_DECOMMIT, 0, len, nullptr, 0);
+        EXPECT_EQ(0, status, "vm decommit");
+
+        if (zx_clock_get(ZX_CLOCK_MONOTONIC) - start > max_duration)
+            break;
+    }
+
+    // stop the thread and wait for it to exit
+    args.exit.store(true);
+    while (args.exited.load() == false)
+        ;
+
+    END_TEST;
+}
+
 BEGIN_TEST_CASE(vmo_tests)
 RUN_TEST(vmo_create_test);
 RUN_TEST(vmo_read_write_test);
+RUN_TEST(vmo_read_write_range_test);
 RUN_TEST(vmo_map_test);
 RUN_TEST(vmo_read_only_map_test);
 RUN_TEST(vmo_no_perm_map_test);
 RUN_TEST(vmo_no_perm_protect_test);
 RUN_TEST(vmo_resize_test);
+RUN_TEST(vmo_size_align_test);
+RUN_TEST(vmo_resize_align_test);
+RUN_TEST(vmo_clone_size_align_test);
 RUN_TEST(vmo_rights_test);
-RUN_TEST(vmo_lookup_test);
 RUN_TEST(vmo_commit_test);
 RUN_TEST(vmo_decommit_misaligned_test);
 RUN_TEST(vmo_cache_test);
+RUN_TEST_PERFORMANCE(vmo_cache_map_test);
+RUN_TEST(vmo_cache_op_test);
+RUN_TEST(vmo_cache_flush_test);
 RUN_TEST(vmo_zero_page_test);
 RUN_TEST(vmo_clone_test_1);
 RUN_TEST(vmo_clone_test_2);
@@ -1254,6 +1606,7 @@ RUN_TEST(vmo_clone_test_4);
 RUN_TEST(vmo_clone_decommit_test);
 RUN_TEST(vmo_clone_commit_test);
 RUN_TEST(vmo_clone_rights_test);
+RUN_TEST_LARGE(vmo_unmap_coherency);
 END_TEST_CASE(vmo_tests)
 
 int main(int argc, char** argv) {

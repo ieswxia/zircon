@@ -39,6 +39,8 @@ VMO syscall interactions with clones.
 
 Both offset and size may start or extend beyond the original VMO's size.
 
+The size of the VMO will be rounded up to the next page size boundary.
+
 By default the rights of the cloned handled will be the same as the
 original with a few exceptions. See [vmo_create](vmo_create.md) for a
 discussion of the details of each right.
@@ -54,6 +56,11 @@ If *options* is *ZX_VMO_CLONE_COPY_ON_WRITE* the following rights are added:
 - **ZX_RIGHT_MAP**
 
 ## NOTES
+
+Cloning a VMO causes the existing (source) VMO **ZX_VMO_ZERO_CHILDREN** signal
+to become inactive. Only when the last clone is destroyed and no mappings
+of those clones into address spaces exist, will **ZX_VMO_ZERO_CHILDREN** become
+active again.
 
 ### ZX_VMO_CLONE_COPY_ON_WRITE
 

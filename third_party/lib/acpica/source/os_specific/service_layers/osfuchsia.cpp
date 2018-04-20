@@ -9,11 +9,13 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <threads.h>
+#include <pthread.h>
 
 #include <hw/inout.h>
 #include <zircon/assert.h>
 #include <zircon/process.h>
 #include <zircon/syscalls.h>
+#include <zircon/thread_annotations.h>
 #include <zxcpp/new.h>
 #include <fbl/auto_lock.h>
 #include <fbl/intrusive_hash_table.h>
@@ -118,6 +120,51 @@ static ACPI_STATUS thrd_status_to_acpi_status(int status) {
         case thrd_timedout: return AE_TIME;
         default: return AE_ERROR;
     }
+}
+
+static void timeout_to_timespec(UINT16 Timeout, struct timespec* timespec) {
+    zx_time_t now = zx_clock_get(ZX_CLOCK_UTC);
+    timespec->tv_sec = static_cast<time_t>(now / ZX_SEC(1)),
+    timespec->tv_nsec = static_cast<long>(now % ZX_SEC(1)),
+    timespec->tv_nsec += ZX_MSEC(Timeout);
+    if (timespec->tv_nsec > static_cast<long>(ZX_SEC(1))) {
+        timespec->tv_sec += timespec->tv_nsec / ZX_SEC(1);
+        timespec->tv_nsec %= ZX_SEC(1);
+    }
+}
+
+// The |acpi_spinlock_lock| is used to guarantee that all spinlock acquisitions will
+// be uncontested in certain circumstances.  This allows us to ensure that
+// the codepaths for entering an S-state will not need to wait for some other thread
+// to finish processing.  The scheme works with the following protocol:
+//
+// Normal operational threads: If attempting to acquire a lock, and the thread
+// holds no spinlock yet, then acquire |acpi_spinlock_lock| in READ mode before
+// acquiring the desired lock.  For all other lock acquisitions behave normally.
+// If a thread is releasing its last held lock, release the |acpi_spinlock_lock|.
+//
+// Non-contested thread: To enter non-contested mode, call
+// |acpica_enable_noncontested_mode| while not holding any ACPI spinlock.  This will
+// acquire the |acpi_spinlock_lock| in WRITE mode.  Call
+// |acpica_disable_noncontested_mode| while not holding any ACPI spinlock to release
+// the |acpi_spinlock_lock|.
+//
+// Non-contested mode needs to apply to both spin locks and mutexes to prevent deadlock.
+static pthread_rwlock_t acpi_spinlock_lock = PTHREAD_RWLOCK_INITIALIZER;
+static thread_local uint64_t acpi_spinlocks_held = 0;
+
+void acpica_enable_noncontested_mode() {
+    ZX_ASSERT(acpi_spinlocks_held == 0);
+    int ret = pthread_rwlock_wrlock(&acpi_spinlock_lock);
+    ZX_ASSERT(ret == 0);
+    acpi_spinlocks_held++;
+}
+
+void acpica_disable_noncontested_mode() {
+    ZX_ASSERT(acpi_spinlocks_held == 1);
+    int ret = pthread_rwlock_unlock(&acpi_spinlock_lock);
+    ZX_ASSERT(ret == 0);
+    acpi_spinlocks_held--;
 }
 
 /**
@@ -556,7 +603,6 @@ ACPI_STATUS AcpiOsCreateSemaphore(
  *        previous call to AcpiOsCreateSemaphore.
  *
  * @return AE_OK The semaphore was successfully deleted.
- * @return AE_BAD_PARAMETER The Handle is invalid.
  */
 ACPI_STATUS AcpiOsDeleteSemaphore(ACPI_SEMAPHORE Handle) {
     free(Handle);
@@ -589,17 +635,8 @@ ACPI_STATUS AcpiOsWaitSemaphore(
         return AE_OK;
     }
 
-    zx_time_t now = zx_time_get(ZX_CLOCK_UTC);
-    struct timespec then = {
-        .tv_sec = static_cast<time_t>(now / ZX_SEC(1)),
-        .tv_nsec = static_cast<long>(now % ZX_SEC(1)),
-    };
-    then.tv_nsec += ZX_MSEC(Timeout);
-    if (then.tv_nsec > static_cast<long>(ZX_SEC(1))) {
-        then.tv_sec += then.tv_nsec / ZX_SEC(1);
-        then.tv_nsec %= ZX_SEC(1);
-    }
-
+    struct timespec then;
+    timeout_to_timespec(Timeout, &then);
     if (sem_timedwait(Handle, &then) < 0) {
         ZX_ASSERT_MSG(errno == ETIMEDOUT, "sem_timedwait failed unexpectedly %d", errno);
         return AE_TIME;
@@ -628,18 +665,16 @@ ACPI_STATUS AcpiOsSignalSemaphore(
 }
 
 /**
- * @brief Create a spin lock.
+ * @brief Create a mutex.
  *
- * @param OutHandle A pointer to a locaton where a handle to the lock is
+ * @param OutHandle A pointer to a locaton where a handle to the mutex is
  *        to be returned.
  *
- * @return AE_OK The lock was successfully created.
+ * @return AE_OK The mutex was successfully created.
  * @return AE_BAD_PARAMETER The OutHandle pointer is NULL.
- * @return AE_NO_MEMORY Insufficient memory to create the lock.
+ * @return AE_NO_MEMORY Insufficient memory to create the mutex.
  */
-ACPI_STATUS AcpiOsCreateLock(ACPI_SPINLOCK *OutHandle) {
-    // Since we don't have a notion of interrupt contex in usermode, just make
-    // these mutexes.
+ACPI_STATUS AcpiOsCreateMutex(ACPI_MUTEX *OutHandle) {
     mtx_t* lock = (mtx_t*)malloc(sizeof(mtx_t));
     if (!lock) {
         return AE_NO_MEMORY;
@@ -655,17 +690,106 @@ ACPI_STATUS AcpiOsCreateLock(ACPI_SPINLOCK *OutHandle) {
 }
 
 /**
+ * @brief Delete a mutex.
+ *
+ * @param Handle A handle to a mutex objected that was returned by a
+ *        previous call to AcpiOsCreateMutex.
+ */
+void AcpiOsDeleteMutex(ACPI_MUTEX Handle) {
+    mtx_destroy(Handle);
+    free(Handle);
+}
+
+/**
+ * @brief Acquire a mutex.
+ *
+ * @param Handle A handle to a mutex objected that was returned by a
+ *        previous call to AcpiOsCreateMutex.
+ * @param Timeout How long the caller is willing to wait for the requested
+ *        units, in milliseconds.  A value of -1 indicates that the caller
+ *        is willing to wait forever. Timeout may be 0.
+ *
+ * @return AE_OK The requested units were successfully received.
+ * @return AE_BAD_PARAMETER The Handle is invalid.
+ * @return AE_TIME The mutex could not be acquired within the specified time.
+ */
+ACPI_STATUS AcpiOsAcquireMutex(
+        ACPI_MUTEX Handle,
+        UINT16 Timeout) TA_TRY_ACQ(AE_OK, Handle) TA_NO_THREAD_SAFETY_ANALYSIS {
+    if (Timeout == UINT16_MAX) {
+        if (acpi_spinlocks_held == 0) {
+            int ret = pthread_rwlock_rdlock(&acpi_spinlock_lock);
+            ZX_ASSERT(ret == 0);
+        }
+
+        int res = mtx_lock(Handle);
+        ZX_ASSERT(res == thrd_success);
+    } else {
+        struct timespec then;
+        timeout_to_timespec(Timeout, &then);
+
+        if (acpi_spinlocks_held == 0) {
+            int ret = pthread_rwlock_timedrdlock(&acpi_spinlock_lock, &then);
+            if (ret == ETIMEDOUT)
+                return AE_TIME;
+            ZX_ASSERT(ret == 0);
+        }
+
+        int res = mtx_timedlock(Handle, &then);
+        if (res == thrd_timedout) {
+            if (acpi_spinlocks_held == 0) {
+                int res = pthread_rwlock_unlock(&acpi_spinlock_lock);
+                ZX_ASSERT(res == 0);
+            }
+            return AE_TIME;
+        }
+        ZX_ASSERT(res == thrd_success);
+    }
+
+    acpi_spinlocks_held++;
+    return AE_OK;
+}
+
+/**
+ * @brief Release a mutex.
+ *
+ * @param Handle A handle to a mutex objected that was returned by a
+ *        previous call to AcpiOsCreateMutex.
+ */
+void AcpiOsReleaseMutex(ACPI_MUTEX Handle) TA_REL(Handle) {
+    mtx_unlock(Handle);
+
+    acpi_spinlocks_held--;
+    if (acpi_spinlocks_held == 0) {
+        int ret = pthread_rwlock_unlock(&acpi_spinlock_lock);
+        ZX_ASSERT(ret == 0);
+    }
+}
+
+/**
+ * @brief Create a spin lock.
+ *
+ * @param OutHandle A pointer to a locaton where a handle to the lock is
+ *        to be returned.
+ *
+ * @return AE_OK The lock was successfully created.
+ * @return AE_BAD_PARAMETER The OutHandle pointer is NULL.
+ * @return AE_NO_MEMORY Insufficient memory to create the lock.
+ */
+ACPI_STATUS AcpiOsCreateLock(ACPI_SPINLOCK *OutHandle) {
+    // Since we don't have a notion of interrupt contex in usermode, just make
+    // these mutexes.
+    return AcpiOsCreateMutex(OutHandle);
+}
+
+/**
  * @brief Delete a spin lock.
  *
  * @param Handle A handle to a lock objected that was returned by a
  *        previous call to AcpiOsCreateLock.
- *
- * @return AE_OK The lock was successfully deleted.
- * @return AE_BAD_PARAMETER The Handle is invalid.
  */
 void AcpiOsDeleteLock(ACPI_SPINLOCK Handle) {
-    mtx_destroy(Handle);
-    free(Handle);
+    AcpiOsDeleteMutex(Handle);
 }
 
 /**
@@ -676,8 +800,10 @@ void AcpiOsDeleteLock(ACPI_SPINLOCK Handle) {
  *
  * @return Platform-dependent CPU flags.  To be used when the lock is released.
  */
-ACPI_CPU_FLAGS AcpiOsAcquireLock(ACPI_SPINLOCK Handle) {
-    mtx_lock(Handle);
+ACPI_CPU_FLAGS AcpiOsAcquireLock(ACPI_SPINLOCK Handle) TA_ACQ(Handle) TA_NO_THREAD_SAFETY_ANALYSIS {
+    int ret = AcpiOsAcquireMutex(Handle, UINT16_MAX);
+    // The thread safety analysis doesn't seem to handle the noreturn inside of the assert
+    ZX_ASSERT(ret == AE_OK);
     return 0;
 }
 
@@ -688,8 +814,8 @@ ACPI_CPU_FLAGS AcpiOsAcquireLock(ACPI_SPINLOCK Handle) {
  *        previous call to AcpiOsCreateLock.
  * @param Flags CPU Flags that were returned from AcpiOsAcquireLock.
  */
-void AcpiOsReleaseLock(ACPI_SPINLOCK Handle, ACPI_CPU_FLAGS Flags) {
-    mtx_unlock(Handle);
+void AcpiOsReleaseLock(ACPI_SPINLOCK Handle, ACPI_CPU_FLAGS Flags) TA_REL(Handle) {
+    AcpiOsReleaseMutex(Handle);
 }
 
 // Wrapper structs for interfacing between our interrupt handler convention and
@@ -702,15 +828,14 @@ struct acpi_irq_thread_arg {
 static int acpi_irq_thread(void *arg) {
     struct acpi_irq_thread_arg *real_arg = (struct acpi_irq_thread_arg *)arg;
     while (1) {
-        zx_status_t status = zx_interrupt_wait(real_arg->irq_handle);
+        uint64_t slots;
+        zx_status_t status = zx_interrupt_wait(real_arg->irq_handle, &slots);
         if (status != ZX_OK) {
             continue;
         }
 
         // TODO: Should we do something with the return value from the handler?
         real_arg->handler(real_arg->context);
-
-        zx_interrupt_complete(real_arg->irq_handle);
     }
     return 0;
 }
@@ -755,9 +880,15 @@ ACPI_STATUS AcpiOsInstallInterruptHandler(
     }
 
     zx_handle_t handle;
-    zx_status_t status = zx_interrupt_create(root_resource_handle, InterruptLevel,
-                                             ZX_FLAG_REMAP_IRQ, &handle);
+    zx_status_t status = zx_interrupt_create(root_resource_handle, 0, &handle);
     if (status != ZX_OK) {
+        free(arg);
+        return AE_ERROR;
+    }
+    status = zx_interrupt_bind(handle, 0, root_resource_handle, InterruptLevel,
+                               ZX_INTERRUPT_REMAP_IRQ);
+    if (status != ZX_OK) {
+        zx_handle_close(handle);
         free(arg);
         return AE_ERROR;
     }

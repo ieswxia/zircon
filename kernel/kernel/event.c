@@ -29,6 +29,8 @@
 #include <err.h>
 #include <kernel/event.h>
 #include <kernel/thread.h>
+#include <sys/types.h>
+#include <zircon/types.h>
 
 /**
  * @brief  Initialize an event object
@@ -59,6 +61,37 @@ void event_destroy(event_t* e) {
     wait_queue_destroy(&e->wait);
 }
 
+static zx_status_t event_wait_worker(event_t* e, zx_time_t deadline,
+                                     bool interruptable,
+                                     uint signal_mask) {
+    thread_t* current_thread = get_current_thread();
+    zx_status_t ret = ZX_OK;
+
+    DEBUG_ASSERT(e->magic == EVENT_MAGIC);
+    DEBUG_ASSERT(!arch_in_int_handler());
+
+    THREAD_LOCK(state);
+
+    current_thread->interruptable = interruptable;
+
+    if (e->signaled) {
+        /* signaled, we're going to fall through */
+        if (e->flags & EVENT_FLAG_AUTOUNSIGNAL) {
+            /* autounsignal flag lets one thread fall through before unsignaling */
+            e->signaled = false;
+        }
+    } else {
+        /* unsignaled, block here */
+        ret = wait_queue_block_with_mask(&e->wait, deadline, signal_mask);
+    }
+
+    current_thread->interruptable = false;
+
+    THREAD_UNLOCK(state);
+
+    return ret;
+}
+
 /**
  * @brief  Wait for event to be signaled
  *
@@ -76,38 +109,34 @@ void event_destroy(event_t* e) {
  *          other values depending on wait_result value
  *          when event_signal_etc is used.
  */
-status_t event_wait_deadline(event_t* e, lk_time_t deadline, bool interruptable) {
-    thread_t* current_thread = get_current_thread();
-    status_t ret = ZX_OK;
-
-    DEBUG_ASSERT(e->magic == EVENT_MAGIC);
-    DEBUG_ASSERT(!arch_in_int_handler());
-
-    THREAD_LOCK(state);
-
-    current_thread->interruptable = interruptable;
-
-    if (e->signaled) {
-        /* signaled, we're going to fall through */
-        if (e->flags & EVENT_FLAG_AUTOUNSIGNAL) {
-            /* autounsignal flag lets one thread fall through before unsignaling */
-            e->signaled = false;
-        }
-    } else {
-        /* unsignaled, block here */
-        ret = wait_queue_block(&e->wait, deadline);
-    }
-
-    current_thread->interruptable = false;
-
-    THREAD_UNLOCK(state);
-
-    return ret;
+zx_status_t event_wait_deadline(event_t* e, zx_time_t deadline, bool interruptable) {
+    return event_wait_worker(e, deadline, interruptable, 0);
 }
 
-static int event_signal_internal(event_t* e, bool reschedule, status_t wait_result, bool thread_lock_held) {
+/**
+ * @brief  Wait for event to be signaled, ignoring existing signals in
+           |signal_mask|.
+ *
+ * If the event has already been signaled (except for signals in
+ * |signal_mask|), this function returns immediately.
+ * Otherwise, the current thread goes to sleep until the event object is
+ * signaled, or the event object is destroyed by another thread.
+ * There is no deadline, and the caller must be interruptable.
+ *
+ * @param e        Event object
+ *
+ * @return  0 on success, other values depending on wait_result value
+ *          when event_signal_etc is used.
+ */
+zx_status_t event_wait_with_mask(event_t* e, uint signal_mask) {
+    return event_wait_worker(e, ZX_TIME_INFINITE, true, signal_mask);
+}
+
+// We need to disable thread safety analysis due to the conditional locking of
+// the thread lock (Clang does not support conditional analysis).
+static int event_signal_internal(event_t* e, bool reschedule, zx_status_t wait_result,
+                                 bool thread_lock_held) TA_NO_THREAD_SAFETY_ANALYSIS {
     DEBUG_ASSERT(e->magic == EVENT_MAGIC);
-    DEBUG_ASSERT(!reschedule || !arch_in_int_handler());
 
     // conditionally acquire/release the thread lock
     // NOTE: using the manual spinlock grab/release instead of THREAD_LOCK because
@@ -162,7 +191,7 @@ static int event_signal_internal(event_t* e, bool reschedule, status_t wait_resu
  *
  * @return  Returns the number of threads that have been unblocked.
  */
-int event_signal_etc(event_t* e, bool reschedule, status_t wait_result) {
+int event_signal_etc(event_t* e, bool reschedule, zx_status_t wait_result) {
     return event_signal_internal(e, reschedule, wait_result, false);
 }
 
@@ -207,7 +236,7 @@ int event_signal_thread_locked(event_t* e) {
  *
  * @return  Returns ZX_OK on success.
  */
-status_t event_unsignal(event_t* e) {
+zx_status_t event_unsignal(event_t* e) {
     DEBUG_ASSERT(e->magic == EVENT_MAGIC);
 
     e->signaled = false;

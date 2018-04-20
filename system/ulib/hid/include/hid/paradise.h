@@ -39,6 +39,28 @@ typedef struct paradise_touch {
     uint16_t scan_time;
 } __attribute__((packed)) paradise_touch_t;
 
+typedef struct paradise_finger_v2 {
+    uint8_t flags;
+    uint16_t finger_id;
+
+    uint8_t width;
+    uint8_t height;
+
+    uint16_t x;
+    uint16_t y;
+
+    uint8_t pressure;
+} __attribute__((packed)) paradise_finger_v2_t;
+
+typedef struct paradise_touch_v2 {
+    uint8_t rpt_id;
+    uint8_t pad;
+    uint8_t contact_count;
+
+    paradise_finger_v2_t fingers[5];
+    uint16_t scan_time;
+} __attribute__((packed)) paradise_touch_v2_t;
+
 #define PARADISE_STYLUS_STATUS_TSWITCH 0x01
 #define PARADISE_STYLUS_STATUS_BARREL  0x02
 #define PARADISE_STYLUS_STATUS_ERASER  0x04
@@ -71,7 +93,75 @@ typedef struct paradise_stylus {
     uint16_t scan_time;
 } __attribute__((packed)) paradise_stylus_t;
 
-extern bool is_paradise_touch_report_desc(const uint8_t* data, size_t len);
-extern zx_status_t setup_paradise_touch(int fd);
+bool is_paradise_touch_report_desc(const uint8_t* data, size_t len);
+bool is_paradise_touch_v2_report_desc(const uint8_t* data, size_t len);
+zx_status_t setup_paradise_touch(int fd);
+
+typedef struct paradise_touchpad_finger_v1 {
+    uint8_t tip_switch : 1;
+    uint8_t in_range : 7;
+
+    uint16_t id;
+
+    uint16_t x;
+    uint16_t y;
+    uint16_t width;
+    uint16_t height;
+    uint8_t tip_pressure;
+} __attribute((packed)) paradise_touchpad_finger_v1_t;
+
+typedef struct paradise_touchpad_finger_v2 {
+    uint8_t tip_switch : 1;
+    uint8_t in_range : 7;
+
+    uint16_t id;
+
+    uint16_t x;
+    uint16_t y;
+    uint16_t width;
+    uint16_t height;
+    uint8_t tip_pressure;
+    uint16_t azimuth;
+} __attribute((packed)) paradise_touchpad_finger_v2_t;
+
+typedef struct paradise_touchpad_v1 {
+    uint8_t report_id;
+
+    uint8_t button : 1;
+    uint8_t contact_count : 7;
+
+    paradise_touchpad_finger_v1_t fingers[5];
+} __attribute((packed)) paradise_touchpad_v1_t;
+
+typedef struct paradise_touchpad_v2 {
+    uint8_t report_id;
+
+    uint8_t button : 1;
+    uint8_t contact_count : 7;
+
+    paradise_touchpad_finger_v2_t fingers[5];
+} __attribute((packed)) paradise_touchpad_v2_t;
+
+// The following typedef and function are transitional.
+typedef paradise_touchpad_v2_t paradise_touchpad_t;
+bool is_paradise_touchpad_report_desc(const uint8_t* data, size_t len);
+
+bool is_paradise_touchpad_v1_report_desc(const uint8_t* data, size_t len);
+bool is_paradise_touchpad_v2_report_desc(const uint8_t* data, size_t len);
+
+zx_status_t setup_paradise_touchpad(int fd);
+
+typedef struct paradise_sensor_vector_data {
+  uint8_t sensor_num;
+  int16_t vector[3];
+} __attribute__((packed)) paradise_sensor_vector_data_t;
+
+typedef struct paradise_sensor_scalar_data {
+  uint8_t sensor_num;
+  uint16_t scalar;
+} __attribute__((packed)) paradise_sensor_scalar_data_t;
+
+bool is_paradise_sensor_report_desc(const uint8_t* data, size_t len);
+zx_status_t setup_paradise_sensor(int fd);
 
 __END_CDECLS

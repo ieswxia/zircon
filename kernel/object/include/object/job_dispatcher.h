@@ -12,7 +12,6 @@
 #include <object/excp_port.h>
 #include <object/policy_manager.h>
 #include <object/process_dispatcher.h>
-#include <object/state_tracker.h>
 
 #include <zircon/types.h>
 #include <fbl/array.h>
@@ -38,7 +37,25 @@ protected:
     virtual ~JobEnumerator() = default;
 };
 
-class JobDispatcher final : public Dispatcher {
+// This class implements the Job object kernel interface. Each Job has a parent
+// Job and zero or more child Jobs and zero or more Child processes. This
+// creates a DAG (tree) that connects every living task in the system.
+// This is critically important because of the bottoms up refcount nature of
+// the system in which the scheduler keeps alive the thread and the thread keeeps
+// alive the process, so without the Job it would not be possible to enumerate
+// or control the tasks in the system for which there are no outstanding handles.
+//
+// The second important job of the Job is to apply policies that cannot otherwise
+// be easily enforced by capabilities, for example kernel object creation.
+//
+// The third one is to support exception propagation from the leaf tasks to
+// the root tasks.
+//
+// Obviously there is a special case for the 'root' Job which its parent is null
+// and in the current implementation will call platform_halt() when its process
+// and job count reaches zero. The root job is not exposed to user mode, instead
+// the single child Job of the root job is given to the userboot process.
+class JobDispatcher final : public SoloDispatcher {
 public:
     // Traits to belong to the parent's raw job list.
     struct ListTraitsRaw {
@@ -66,8 +83,7 @@ public:
 
     // Dispatcher implementation.
     zx_obj_type_t get_type() const final { return ZX_OBJ_TYPE_JOB; }
-    StateTracker* get_state_tracker() final { return &state_tracker_; }
-    void on_zero_handles() final;
+    bool has_state_tracker() const final { return true; }
     zx_koid_t get_related_koid() const final;
     fbl::RefPtr<JobDispatcher> parent() { return fbl::RefPtr<JobDispatcher>(parent_); }
 
@@ -137,7 +153,10 @@ private:
     enum class State {
         READY,
         KILLING,
+        DEAD
     };
+
+    using LiveRefsArray = fbl::Array<fbl::RefPtr<Dispatcher>>;
 
     JobDispatcher(uint32_t flags, fbl::RefPtr<JobDispatcher> parent, pol_cookie_t policy);
 
@@ -148,8 +167,15 @@ private:
     bool AddChildJob(JobDispatcher* job);
     void RemoveChildJob(JobDispatcher* job);
 
-    void UpdateSignalsIncrementLocked() TA_REQ(lock_);
-    void UpdateSignalsDecrementLocked() TA_REQ(lock_);
+    void UpdateSignalsIncrementLocked() TA_REQ(get_lock());
+    void UpdateSignalsDecrementLocked() TA_REQ(get_lock());
+
+    template <typename T, typename Fn>
+     __attribute__((warn_unused_result)) LiveRefsArray ForEachChildInLocked(
+        T& children, zx_status_t* status, Fn func) TA_REQ(get_lock());
+
+    template <typename T>
+    uint32_t ChildCountLocked() const TA_REQ(get_lock());
 
     fbl::Canary<fbl::magic("JOBD")> canary_;
 
@@ -163,13 +189,11 @@ private:
     // is, there is no mechanism to mint a handle to a job via this name.
     fbl::Name<ZX_MAX_NAME_LEN> name_;
 
-    // The |lock_| protects all members below.
-    mutable fbl::Mutex lock_;
-    State state_ TA_GUARDED(lock_);
-    uint32_t process_count_ TA_GUARDED(lock_);
-    uint32_t job_count_ TA_GUARDED(lock_);
-    zx_job_importance_t importance_ TA_GUARDED(lock_);
-    StateTracker state_tracker_;
+    // The common |get_lock()| protects all members below.
+    State state_ TA_GUARDED(get_lock());
+    uint32_t process_count_ TA_GUARDED(get_lock());
+    uint32_t job_count_ TA_GUARDED(get_lock());
+    zx_job_importance_t importance_ TA_GUARDED(get_lock());
 
     using RawJobList =
         fbl::DoublyLinkedList<JobDispatcher*, ListTraitsRaw>;
@@ -181,12 +205,16 @@ private:
     using JobList =
         fbl::SinglyLinkedList<fbl::RefPtr<JobDispatcher>, ListTraits>;
 
-    RawJobList jobs_ TA_GUARDED(lock_);
-    RawProcessList procs_ TA_GUARDED(lock_);
+    // Access to the pointers in these lists, especially any promotions to
+    // RefPtr, must be handled very carefully, because the children can die
+    // even when |lock_| is held. See ForEachChildInLocked() for more details
+    // and for a safe way to enumerate them.
+    RawJobList jobs_ TA_GUARDED(get_lock());
+    RawProcessList procs_ TA_GUARDED(get_lock());
 
-    pol_cookie_t policy_ TA_GUARDED(lock_);
+    pol_cookie_t policy_ TA_GUARDED(get_lock());
 
-    fbl::RefPtr<ExceptionPort> exception_port_ TA_GUARDED(lock_);
+    fbl::RefPtr<ExceptionPort> exception_port_ TA_GUARDED(get_lock());
 
     // Global list of JobDispatchers, ordered by relative importance. Used to
     // find victims in low-resource situations.

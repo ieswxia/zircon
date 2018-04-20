@@ -24,8 +24,13 @@
 const char* test_root_path;
 bool use_real_disk = false;
 char test_disk_path[PATH_MAX];
-char fvm_disk_path[PATH_MAX];
 fs_info_t* test_info;
+
+static char fvm_disk_path[PATH_MAX];
+
+constexpr const char minfs_name[] = "minfs";
+constexpr const char memfs_name[] = "memfs";
+constexpr const char thinfs_name[] = "thinfs";
 
 const fsck_options_t test_fsck_options = {
     .verbose = false,
@@ -78,7 +83,7 @@ void setup_fs_test(size_t disk_size, fs_test_type_t test_class) {
             fprintf(stderr, "[FAILED]: Could not bind disk to FVM driver\n");
             exit(-1);
         } else if (wait_for_driver_bind(test_disk_path, "fvm")) {
-            fprintf(stderr, "[FAILED]: FVM driver never appeared\n");
+            fprintf(stderr, "[FAILED]: FVM driver never appeared at %s\n", test_disk_path);
             exit(-1);
         }
 
@@ -91,11 +96,9 @@ void setup_fs_test(size_t disk_size, fs_test_type_t test_class) {
             fprintf(stderr, "[FAILED]: Could not open FVM driver\n");
             exit(-1);
         }
-        // Restore the "fvm_disk_path" to the ramdisk, so it can
-        // be destroyed when the test completes
-        fvm_disk_path[strlen(fvm_disk_path) - strlen("/fvm")] = 0;
 
         alloc_req_t request;
+        memset(&request, 0, sizeof(request));
         request.slice_count = 1;
         strcpy(request.name, "fs-test-partition");
         memcpy(request.type, kTestPartGUID, sizeof(request.type));
@@ -108,7 +111,7 @@ void setup_fs_test(size_t disk_size, fs_test_type_t test_class) {
         close(fvm_fd);
         close(fd);
 
-        if ((fd = fvm_open_partition(kTestUniqueGUID, kTestPartGUID, test_disk_path)) < 0) {
+        if ((fd = open_partition(kTestUniqueGUID, kTestPartGUID, 0, test_disk_path)) < 0) {
             fprintf(stderr, "[FAILED]: Could not locate FVM partition\n");
             exit(-1);
         }
@@ -116,7 +119,7 @@ void setup_fs_test(size_t disk_size, fs_test_type_t test_class) {
     }
 
     if (test_info->mkfs(test_disk_path)) {
-        fprintf(stderr, "[FAILED]: Could not format ramdisk for test\n");
+        fprintf(stderr, "[FAILED]: Could not format disk (%s) for test\n", test_disk_path);
         exit(-1);
     }
 
@@ -137,13 +140,24 @@ void teardown_fs_test(fs_test_type_t test_class) {
         exit(-1);
     }
 
-    if (!use_real_disk) {
-        if (test_class == FS_TEST_FVM) {
-            // Destryoing the ramdisk will clean up most
-            // of the FVM, but first we need to adjust the "test_disk_path"
-            // from the "fvm partition" --> the disk
-            strcpy(test_disk_path, fvm_disk_path);
+    if (test_class == FS_TEST_FVM) {
+        // Restore the "fvm_disk_path" to the containing disk, so it can
+        // be destroyed when the test completes
+        fvm_disk_path[strlen(fvm_disk_path) - strlen("/fvm")] = 0;
+
+        if (use_real_disk) {
+            if (fvm_destroy(fvm_disk_path) != ZX_OK) {
+                fprintf(stderr, "[FAILED]: Couldn't destroy FVM on test disk\n");
+                exit(-1);
+            }
         }
+
+        // Move the test_disk_path back to the 'real' disk, rather than
+        // a partition within the FVM.
+        strcpy(test_disk_path, fvm_disk_path);
+    }
+
+    if (!use_real_disk) {
         if (destroy_ramdisk(test_disk_path)) {
             fprintf(stderr, "[FAILED]: Error destroying ramdisk\n");
             exit(-1);
@@ -153,7 +167,10 @@ void teardown_fs_test(fs_test_type_t test_class) {
 
 // FS-specific functionality:
 
-bool always_exists(void) { return true; }
+template <const char* fs_name>
+bool should_test_filesystem(void) {
+    return !strcmp(filesystem_name_filter, "") || !strcmp(fs_name, filesystem_name_filter);
+}
 
 int mkfs_memfs(const char* disk_path) {
     return 0;
@@ -268,9 +285,9 @@ int unmount_minfs(const char* mount_path) {
     return 0;
 }
 
-bool thinfs_exists(void) {
+bool should_test_thinfs(void) {
     struct stat buf;
-    return stat("/system/bin/thinfs", &buf) == 0;
+    return (stat("/system/bin/thinfs", &buf) == 0) && should_test_filesystem<thinfs_name>();
 }
 
 int mkfs_thinfs(const char* disk_path) {
@@ -321,8 +338,8 @@ int unmount_thinfs(const char* mount_path) {
 }
 
 fs_info_t FILESYSTEMS[NUM_FILESYSTEMS] = {
-    {"memfs",
-        always_exists, mkfs_memfs, mount_memfs, unmount_memfs, fsck_memfs,
+    {memfs_name,
+        should_test_filesystem<memfs_name>, mkfs_memfs, mount_memfs, unmount_memfs, fsck_memfs,
         .can_be_mounted = false,
         .can_mount_sub_filesystems = true,
         .supports_hardlinks = true,
@@ -332,8 +349,8 @@ fs_info_t FILESYSTEMS[NUM_FILESYSTEMS] = {
         .supports_resize = false,
         .nsec_granularity = 1,
     },
-    {"minfs",
-        always_exists, mkfs_minfs, mount_minfs, unmount_minfs, fsck_minfs,
+    {minfs_name,
+        should_test_filesystem<minfs_name>, mkfs_minfs, mount_minfs, unmount_minfs, fsck_minfs,
         .can_be_mounted = true,
         .can_mount_sub_filesystems = true,
         .supports_hardlinks = true,
@@ -343,8 +360,8 @@ fs_info_t FILESYSTEMS[NUM_FILESYSTEMS] = {
         .supports_resize = true,
         .nsec_granularity = 1,
     },
-    {"FAT",
-        thinfs_exists, mkfs_thinfs, mount_thinfs, unmount_thinfs, fsck_thinfs,
+    {thinfs_name,
+        should_test_thinfs, mkfs_thinfs, mount_thinfs, unmount_thinfs, fsck_thinfs,
         .can_be_mounted = true,
         .can_mount_sub_filesystems = false,
         .supports_hardlinks = false,

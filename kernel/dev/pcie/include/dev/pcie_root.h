@@ -27,6 +27,7 @@ public:
 
     // Properties
     PcieBusDriver& driver() { return bus_drv_; }
+    RegionAllocator& pf_mmio_regions() final { return bus_drv_.pf_mmio_regions(); }
     RegionAllocator& mmio_lo_regions() final { return bus_drv_.mmio_lo_regions(); }
     RegionAllocator& mmio_hi_regions() final { return bus_drv_.mmio_hi_regions(); }
     RegionAllocator& pio_regions()     final { return bus_drv_.pio_regions(); }
@@ -44,7 +45,7 @@ public:
     //
     // @return ZX_OK if we successfully swizzled
     // @return ZX_ERR_NOT_FOUND if we did not know how to swizzle this pin
-    virtual status_t Swizzle(uint dev_id, uint func_id, uint pin, uint *irq) = 0;
+    virtual zx_status_t Swizzle(uint dev_id, uint func_id, uint pin, uint *irq) = 0;
 
     // WAVL-tree Index
     uint GetKey() const { return managed_bus_id(); }

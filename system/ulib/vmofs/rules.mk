@@ -16,9 +16,13 @@ MODULE_STATIC_LIBS := \
     system/ulib/fbl \
 
 MODULE_LIBS := \
+    system/ulib/async.cpp \
+    system/ulib/async \
     system/ulib/c \
     system/ulib/fs \
     system/ulib/zircon \
     system/ulib/fdio \
+
+MODULE_PACKAGE := src
 
 include make/module.mk

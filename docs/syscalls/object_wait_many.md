@@ -22,7 +22,7 @@ typedef struct {
 
 **object_wait_many**() is a blocking syscall which causes the caller to
 wait until at least one of the specified signals is pending on one of
-the specified *items* or *deadline* passes.
+the specified *items*, or until *deadline* passes, whichever comes first.
 
 The caller must provide *count* zx_wait_item_ts in the *items* array,
 containing the handle and signals bitmask to wait for for each item.
@@ -38,6 +38,9 @@ signals if the state of the object was modified by another thread or
 process.  (For example, a Channel ceases asserting **ZX_CHANNEL_READABLE**
 once the last message in its queue is read).
 
+The maximum number of items that may be waited upon is **ZX_WAIT_MANY_MAX_ITEMS**,
+which is 8.  To wait on more things at once use [Ports](../objects/port.md).
+
 ## RETURN VALUE
 
 **object_wait_many**() returns **ZX_OK** if any of *waitfor* signals were
@@ -46,16 +49,22 @@ observed on their respective object before *deadline* passed.
 In the event of **ZX_ERR_TIMED_OUT**, *items* may reflect state changes
 that occurred after the deadline pased, but before the syscall returned.
 
+In the event of **ZX_ERR_CANCELED**, one or more of the items being waited
+upon have had their handles closed, and the *pending* field for those items
+will have the **ZX_SIGNAL_HANDLE_CLOSED** bit set.
+
 For any other return value, the *pending* fields of *items* are undefined.
 
 ## ERRORS
 
-**ZX_ERR_INVALID_ARGS**  *items* isn't a valid pointer or if *count* is too large.
+**ZX_ERR_INVALID_ARGS**  *items* isn't a valid pointer.
+
+**ZX_ERR_OUT_OF_RANGE**  *count* is greater than **ZX_WAIT_MANY_MAX_ITEMS**.
 
 **ZX_ERR_BAD_HANDLE**  one of *items* contains an invalid handle.
 
 **ZX_ERR_ACCESS_DENIED**  One or more of the provided *handles* does not
-have **ZX_RIGHT_READ** and may not be waited upon.
+have **ZX_RIGHT_WAIT** and may not be waited upon.
 
 **ZX_ERR_CANCELED**  One or more of the provided *handles* was invalidated
 (e.g., closed) during the wait.

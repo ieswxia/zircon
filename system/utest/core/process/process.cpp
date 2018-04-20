@@ -73,7 +73,7 @@ bool process_start_fail() {
     END_TEST;
 }
 
-bool kill_process_via_thread_close() {
+bool process_not_killed_via_thread_close() {
     BEGIN_TEST;
 
     zx_handle_t event;
@@ -83,19 +83,20 @@ bool kill_process_via_thread_close() {
     zx_handle_t thread;
     ASSERT_EQ(start_mini_process(zx_job_default(), event, &process, &thread), ZX_OK);
 
-    // closing the only thread handle should cause the process to terminate.
     EXPECT_EQ(zx_handle_close(thread), ZX_OK);
 
-    zx_signals_t signals;
+    // The timeout below does not have to be large because the processing happens
+    // synchronously if indeed |thread| is the last handle.
+    zx_signals_t signals = 0;
     EXPECT_EQ(zx_object_wait_one(
-        process, ZX_TASK_TERMINATED, ZX_TIME_INFINITE, &signals), ZX_OK);
-    EXPECT_EQ(signals, ZX_TASK_TERMINATED | ZX_SIGNAL_LAST_HANDLE);
+        process, ZX_TASK_TERMINATED, zx_deadline_after(ZX_MSEC(1)), &signals), ZX_ERR_TIMED_OUT);
+    EXPECT_NE(signals, ZX_TASK_TERMINATED);
 
     EXPECT_EQ(zx_handle_close(process), ZX_OK);
     END_TEST;
 }
 
-bool kill_process_via_process_close() {
+bool process_not_killed_via_process_close() {
     BEGIN_TEST;
 
     zx_handle_t event;
@@ -105,13 +106,13 @@ bool kill_process_via_process_close() {
     zx_handle_t thread;
     ASSERT_EQ(start_mini_process(zx_job_default(), event, &process, &thread), ZX_OK);
 
-    // closing the only process handle should cause the process to terminate.
     EXPECT_EQ(zx_handle_close(process), ZX_OK);
 
+    // The timeout below does not have to be large because the processing happens
+    // synchronously if indeed |process| is the last handle.
     zx_signals_t signals;
     EXPECT_EQ(zx_object_wait_one(
-        thread, ZX_TASK_TERMINATED, ZX_TIME_INFINITE, &signals), ZX_OK);
-    EXPECT_EQ(signals, ZX_TASK_TERMINATED | ZX_SIGNAL_LAST_HANDLE);
+        thread, ZX_TASK_TERMINATED, zx_deadline_after(ZX_MSEC(1)), &signals), ZX_ERR_TIMED_OUT);
 
     EXPECT_EQ(zx_handle_close(thread), ZX_OK);
     END_TEST;
@@ -133,7 +134,7 @@ bool kill_process_via_thread_kill() {
     zx_signals_t signals;
     EXPECT_EQ(zx_object_wait_one(
         process, ZX_TASK_TERMINATED, ZX_TIME_INFINITE, &signals), ZX_OK);
-    EXPECT_EQ(signals, ZX_TASK_TERMINATED | ZX_SIGNAL_LAST_HANDLE);
+    EXPECT_EQ(signals, ZX_TASK_TERMINATED);
 
     EXPECT_EQ(zx_handle_close(process), ZX_OK);
     EXPECT_EQ(zx_handle_close(thread), ZX_OK);
@@ -174,62 +175,6 @@ bool kill_process_via_vmar_destroy() {
     END_TEST;
 }
 
-bool kill_process_handle_cycle() {
-    BEGIN_TEST;
-
-    zx_handle_t proc1, proc2;
-    zx_handle_t vmar1, vmar2;
-
-    ASSERT_EQ(zx_process_create(zx_job_default(), "ttp1", 4u, 0u, &proc1, &vmar1), ZX_OK);
-    ASSERT_EQ(zx_process_create(zx_job_default(), "ttp2", 4u, 0u, &proc2, &vmar2), ZX_OK);
-
-    zx_handle_t thread1, thread2;
-
-    ASSERT_EQ(zx_thread_create(proc1, "th1", 3u, 0u, &thread1), ZX_OK);
-    ASSERT_EQ(zx_thread_create(proc2, "th2", 3u, 0u, &thread2), ZX_OK);
-
-    zx_handle_t dup1, dup2;
-
-    EXPECT_EQ(zx_handle_duplicate(proc1, ZX_RIGHT_SAME_RIGHTS, &dup1), ZX_OK);
-    EXPECT_EQ(zx_handle_duplicate(proc2, ZX_RIGHT_SAME_RIGHTS, &dup2), ZX_OK);
-
-    zx_handle_t minip_chn[2];
-
-    EXPECT_EQ(start_mini_process_etc(proc1, thread1, vmar1, dup2, &minip_chn[0]),
-              ZX_OK);
-    EXPECT_EQ(start_mini_process_etc(proc2, thread2, vmar2, dup1, &minip_chn[1]),
-              ZX_OK);
-
-    EXPECT_EQ(zx_handle_close(vmar2), ZX_OK);
-    EXPECT_EQ(zx_handle_close(vmar1), ZX_OK);
-
-    EXPECT_EQ(zx_handle_close(proc1), ZX_OK);
-    EXPECT_EQ(zx_handle_close(proc2), ZX_OK);
-
-    // At this point each processes have each other last process handle.  Make sure
-    // they are running.
-
-    zx_signals_t signals;
-    EXPECT_EQ(zx_object_wait_one(
-        thread1, ZX_TASK_TERMINATED, zx_deadline_after(kTimeoutNs), &signals), ZX_ERR_TIMED_OUT);
-
-    EXPECT_EQ(zx_object_wait_one(
-        thread2, ZX_TASK_TERMINATED, zx_deadline_after(kTimeoutNs), &signals), ZX_ERR_TIMED_OUT);
-
-    EXPECT_EQ(zx_handle_close(thread1), ZX_OK);
-
-    // Closing thread1 should cause process 1 to exit which should cause process 2 to
-    // exit which we test by waiting on the second process thread handle.
-
-    EXPECT_EQ(zx_object_wait_one(
-        thread2, ZX_TASK_TERMINATED, ZX_TIME_INFINITE, &signals), ZX_OK);
-    EXPECT_EQ(signals, ZX_TASK_TERMINATED | ZX_SIGNAL_LAST_HANDLE);
-
-    EXPECT_EQ(zx_handle_close(thread2), ZX_OK);
-
-    END_TEST;
-}
-
 static zx_status_t dup_send_handle(zx_handle_t channel, zx_handle_t handle) {
     zx_handle_t dup;
     zx_status_t st = zx_handle_duplicate(handle, ZX_RIGHT_SAME_RIGHTS, &dup);
@@ -259,7 +204,6 @@ bool kill_channel_handle_cycle() {
     ASSERT_EQ(zx_thread_create(proc2, "th2", 3u, 0u, &thread2), ZX_OK);
 
     // Now we stuff duplicated process and thread handles into each side of the channel.
-
     EXPECT_EQ(dup_send_handle(chan[0], proc2), ZX_OK);
     EXPECT_EQ(dup_send_handle(chan[0], thread2), ZX_OK);
 
@@ -291,17 +235,13 @@ bool kill_channel_handle_cycle() {
     EXPECT_EQ(zx_object_wait_one(
         thread2, ZX_TASK_TERMINATED, zx_deadline_after(kTimeoutNs), &signals), ZX_ERR_TIMED_OUT);
 
-    // At this point the two processes have each other thread/process handles. For example
-    // if we close the thread handles, unlike the previous test, the processes will
-    // still be alive.
-
+    // At this point the two processes have each other thread/process handles.
     EXPECT_EQ(zx_handle_close(thread1), ZX_OK);
 
     EXPECT_EQ(zx_object_wait_one(
         thread2, ZX_TASK_TERMINATED, zx_deadline_after(kTimeoutNs), &signals), ZX_ERR_TIMED_OUT);
 
     // The only way out of this situation is to use the job handle.
-
     EXPECT_EQ(zx_task_kill(job_child), ZX_OK);
 
     EXPECT_EQ(zx_object_wait_one(
@@ -356,7 +296,7 @@ bool info_reflects_process_state() {
     ASSERT_EQ(zx_task_kill(proc), ZX_OK);
     ASSERT_EQ(zx_object_wait_one(
         proc, ZX_TASK_TERMINATED, ZX_TIME_INFINITE, &signals), ZX_OK);
-    ASSERT_EQ(signals, ZX_TASK_TERMINATED | ZX_SIGNAL_LAST_HANDLE);
+    ASSERT_EQ(signals, ZX_TASK_TERMINATED);
 
     ASSERT_EQ(zx_object_get_info(
             proc, ZX_INFO_PROCESS, &info, sizeof(info), NULL, NULL), ZX_OK);
@@ -372,11 +312,10 @@ bool info_reflects_process_state() {
 BEGIN_TEST_CASE(process_tests)
 RUN_TEST(mini_process_sanity);
 RUN_TEST(process_start_fail);
-RUN_TEST(kill_process_via_thread_close);
-RUN_TEST(kill_process_via_process_close);
+RUN_TEST(process_not_killed_via_thread_close);
+RUN_TEST(process_not_killed_via_process_close);
 RUN_TEST(kill_process_via_thread_kill);
 RUN_TEST_ENABLE_CRASH_HANDLER(kill_process_via_vmar_destroy);
-RUN_TEST(kill_process_handle_cycle);
 RUN_TEST(kill_channel_handle_cycle);
 RUN_TEST(info_reflects_process_state);
 END_TEST_CASE(process_tests)

@@ -7,24 +7,18 @@
 // license that can be found in the LICENSE file or at
 // https://opensource.org/licenses/MIT
 
-#include <asm.h>
+#include <arch/x86/asm.h>
 #include <arch/x86/descriptor.h>
 
-#define PHYS_LOAD_ADDRESS (MEMBASE + KERNEL_LOAD_OFFSET)
-#define PHYS_ADDR_DELTA (KERNEL_BASE + KERNEL_LOAD_OFFSET - PHYS_LOAD_ADDRESS)
-#define PHYS(x) ((x) - PHYS_ADDR_DELTA)
-
-.section .rodata
-
-.align 8
-DATA(_gdtr_phys)
-    .short _gdt_end - _gdt - 1
-    .int PHYS(_gdt)
-
-.align 8
+.section .rodata.gdt,"a",%progbits
+// Intentionlly misalign this by 6 so that the address word holding _gdt
+// is naturally aligned.  This address gets fixed up by apply_fixups (image.S).
+.balign 8
+.skip 6
 DATA(_gdtr)
     .short _gdt_end - _gdt - 1
     .quad _gdt
+END_DATA(_gdtr)
 
 .data
 .align 8
@@ -93,4 +87,3 @@ DATA(_gdt)
 END_DATA(_gdt)
 
 DATA(_gdt_end)
-

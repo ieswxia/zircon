@@ -15,12 +15,11 @@
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <kernel/cmdline.h>
 #include <kernel/thread.h>
 #include <kernel/mutex.h>
 #include <lib/console.h>
-#if WITH_LIB_ENV
-#include <lib/env.h>
-#endif
+#include <lk/init.h>
 
 #ifndef CONSOLE_ENABLE_HISTORY
 #define CONSOLE_ENABLE_HISTORY 1
@@ -45,7 +44,7 @@ static char *debug_buffer;
 static bool echo = true;
 
 /* command processor state */
-static mutex_t *command_lock;
+static mutex_t command_lock = MUTEX_INITIAL_VALUE(command_lock);
 int lastresult;
 static bool abort_script;
 
@@ -62,14 +61,9 @@ static const char *prev_history(uint *cursor);
 static void dump_history(void);
 #endif
 
-/* list of installed commands */
-static cmd_block *command_list = NULL;
-
-/* a linear array of statically defined command blocks,
-   defined in the linker script.
- */
-extern cmd_block __start_commands[] __WEAK;
-extern cmd_block __stop_commands[] __WEAK;
+// A linear array of statically defined commands.
+extern const cmd __start_commands[];
+extern const cmd __stop_commands[];
 
 static int cmd_help(int argc, const cmd_args *argv, uint32_t flags);
 static int cmd_echo(int argc, const cmd_args *argv, uint32_t flags);
@@ -89,25 +83,14 @@ STATIC_COMMAND("history", "command history", &cmd_history)
 #endif
 STATIC_COMMAND_END(help);
 
-int console_init(void)
+static void console_init(uint level)
 {
-    LTRACE_ENTRY;
-
-    command_lock = calloc(sizeof(mutex_t), 1);
-    mutex_init(command_lock);
-
-    /* add all the statically defined commands to the list */
-    cmd_block *block;
-    for (block = __start_commands; block != __stop_commands; block++) {
-        console_register_commands(block);
-    }
-
 #if CONSOLE_ENABLE_HISTORY
     init_history();
 #endif
-
-    return 0;
 }
+
+LK_INIT_HOOK(console, console_init, LK_INIT_LEVEL_HEAP);
 
 #if CONSOLE_ENABLE_HISTORY
 static int cmd_history(int argc, const cmd_args *argv, uint32_t flags)
@@ -204,21 +187,14 @@ static const char *prev_history(uint *cursor)
 
 static const cmd *match_command(const char *command, const uint8_t availability_mask)
 {
-    cmd_block *block;
-    size_t i;
-
-    for (block = command_list; block != NULL; block = block->next) {
-        const cmd *curr_cmd = block->list;
-        for (i = 0; i < block->count; i++) {
-            if ((availability_mask & curr_cmd[i].availability_mask) == 0) {
-                continue;
-            }
-            if (strcmp(command, curr_cmd[i].cmd_str) == 0) {
-                return &curr_cmd[i];
-            }
+    for (const cmd *curr_cmd = __start_commands;
+         curr_cmd != __stop_commands;
+         ++curr_cmd) {
+        if ((availability_mask & curr_cmd->availability_mask) != 0 &&
+            strcmp(command, curr_cmd->cmd_str) == 0) {
+            return curr_cmd;
         }
     }
-
     return NULL;
 }
 
@@ -232,7 +208,7 @@ static inline void cputchar(char c) {
     platform_dputc(c);
 }
 static inline void cputs(const char* s) {
-    platform_dputs(s, strlen(s));
+    platform_dputs_thread(s, strlen(s));
 }
 #else
 static inline int cgetchar(void) {
@@ -621,13 +597,12 @@ static zx_status_t command_loop(int (*get_line)(const char **, void *),
         /* try to match the command */
         const cmd *command = match_command(args[0].str, CMD_AVAIL_NORMAL);
         if (!command) {
-            if (showprompt)
-                printf("command not found\n");
+            printf("command \"%s\" not found\n", args[0].str);
             continue;
         }
 
         if (!locked)
-            mutex_acquire(command_lock);
+            mutex_acquire(&command_lock);
 
         abort_script = false;
         lastresult = command->cmd_callback(argc, args, 0);
@@ -654,7 +629,7 @@ static zx_status_t command_loop(int (*get_line)(const char **, void *),
         abort_script = false;
 
         if (!locked)
-            mutex_release(command_lock);
+            mutex_release(&command_lock);
     }
 
     free(outbuf);
@@ -677,7 +652,7 @@ void console_abort_script(void)
     abort_script = true;
 }
 
-void console_start(void)
+static void console_start(void)
 {
     debug_buffer = malloc(LINE_LEN);
 
@@ -762,36 +737,22 @@ console_cmd console_get_command_handler(const char *commandstr)
         return NULL;
 }
 
-void console_register_commands(cmd_block *block)
-{
-    DEBUG_ASSERT(block);
-    DEBUG_ASSERT(block->next == NULL);
-
-    block->next = command_list;
-    command_list = block;
-}
-
-
 static int cmd_help(int argc, const cmd_args *argv, uint32_t flags)
 {
     printf("command list:\n");
 
-    cmd_block *block;
-    size_t i;
-
     /* filter out commands based on if we're called at normal or panic time */
     uint8_t availability_mask = (flags & CMD_FLAG_PANIC) ? CMD_AVAIL_PANIC : CMD_AVAIL_NORMAL;
 
-    for (block = command_list; block != NULL; block = block->next) {
-        const cmd *curr_cmd = block->list;
-        for (i = 0; i < block->count; i++) {
-            if ((availability_mask & curr_cmd[i].availability_mask) == 0) {
-                // Skip commands that aren't available in the current shell.
-                continue;
-            }
-            if (curr_cmd[i].help_str)
-                printf("\t%-16s: %s\n", curr_cmd[i].cmd_str, curr_cmd[i].help_str);
+    for (const cmd *curr_cmd = __start_commands;
+         curr_cmd != __stop_commands;
+         ++curr_cmd) {
+        if ((availability_mask & curr_cmd->availability_mask) == 0) {
+            // Skip commands that aren't available in the current shell.
+            continue;
         }
+        if (curr_cmd->help_str)
+            printf("\t%-16s: %s\n", curr_cmd->cmd_str, curr_cmd->help_str);
     }
 
     return 0;
@@ -911,3 +872,12 @@ static int cmd_test(int argc, const cmd_args *argv, uint32_t flags)
     return 0;
 }
 #endif
+
+static void kernel_shell_init(uint level)
+{
+    if (cmdline_get_bool("kernel.shell", false)) {
+        console_start();
+    }
+}
+
+LK_INIT_HOOK(kernel_shell, kernel_shell_init, LK_INIT_LEVEL_USER);

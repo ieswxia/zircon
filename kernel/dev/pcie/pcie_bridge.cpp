@@ -10,13 +10,13 @@
 #include <debug.h>
 #include <err.h>
 #include <inttypes.h>
-#include <kernel/vm.h>
 #include <lk/init.h>
 #include <fbl/limits.h>
 #include <dev/interrupt.h>
 #include <string.h>
 #include <trace.h>
 #include <platform.h>
+#include <vm/vm.h>
 
 #include <dev/pci_config.h>
 #include <dev/pcie_bridge.h>
@@ -32,6 +32,7 @@ PcieBridge::PcieBridge(PcieBusDriver& bus_drv, uint bus_id, uint dev_id, uint fu
       PcieUpstreamNode(bus_drv, PcieUpstreamNode::Type::BRIDGE, mbus_id) {
     /* Assign the driver-wide region pool to this bridge's allocators. */
     DEBUG_ASSERT(driver().region_bookkeeping() != nullptr);
+    pf_mmio_regions_.SetRegionPool(driver().region_bookkeeping());
     mmio_lo_regions_.SetRegionPool(driver().region_bookkeeping());
     mmio_hi_regions_.SetRegionPool(driver().region_bookkeeping());
     pio_regions_.SetRegionPool(driver().region_bookkeeping());
@@ -53,7 +54,7 @@ fbl::RefPtr<PcieDevice> PcieBridge::Create(PcieUpstreamNode& upstream,
     }
 
     auto bridge = fbl::AdoptRef(static_cast<PcieDevice*>(raw_bridge));
-    status_t res = raw_bridge->Init(upstream);
+    zx_status_t res = raw_bridge->Init(upstream);
     if (res != ZX_OK) {
         TRACEF("Failed to initialize PCIe bridge %02x:%02x.%01x. (res %d)\n",
                 upstream.managed_bus_id(), dev_id, func_id, res);
@@ -63,11 +64,11 @@ fbl::RefPtr<PcieDevice> PcieBridge::Create(PcieUpstreamNode& upstream,
     return bridge;
 }
 
-status_t PcieBridge::Init(PcieUpstreamNode& upstream) {
+zx_status_t PcieBridge::Init(PcieUpstreamNode& upstream) {
     AutoLock dev_lock(&dev_lock_);
 
     // Initialize the device portion of ourselves first.
-    status_t res = PcieDevice::InitLocked(upstream);
+    zx_status_t res = PcieDevice::InitLocked(upstream);
     if (res != ZX_OK)
         return res;
 
@@ -119,7 +120,7 @@ status_t PcieBridge::Init(PcieUpstreamNode& upstream) {
     return res;
 }
 
-status_t PcieBridge::ParseBusWindowsLocked() {
+zx_status_t PcieBridge::ParseBusWindowsLocked() {
     DEBUG_ASSERT(dev_lock_.IsHeld());
 
     // Parse the currently configured windows used to determine MMIO/PIO
@@ -164,16 +165,25 @@ status_t PcieBridge::ParseBusWindowsLocked() {
     return ZX_OK;
 }
 
+void PcieBridge::Dump() const {
+    PcieDevice::Dump();
+
+    printf("\tbridge managed bus id %#02x\n", managed_bus_id());
+    printf("\tio base %#x limit %#x\n", io_base(), io_limit());
+    printf("\tmem base %#x limit %#x\n", mem_base(), mem_limit());
+    printf("\tprefectable base %#" PRIx64 " limit %#" PRIx64 "\n", pf_mem_base(), pf_mem_limit());
+}
+
 void PcieBridge::Unplug() {
     PcieDevice::Unplug();
     PcieUpstreamNode::UnplugDownstream();
 }
 
-status_t PcieBridge::AllocateBars() {
+zx_status_t PcieBridge::AllocateBars() {
     AutoLock dev_lock(&dev_lock_);
 
     // Start by making sure we can allocate our bridge windows.
-    status_t res = AllocateBridgeWindowsLocked();
+    zx_status_t res = AllocateBridgeWindowsLocked();
     if (res != ZX_OK)
         return res;
 
@@ -189,8 +199,8 @@ status_t PcieBridge::AllocateBars() {
     return ZX_OK;
 }
 
-status_t PcieBridge::AllocateBridgeWindowsLocked() {
-    status_t ret;
+zx_status_t PcieBridge::AllocateBridgeWindowsLocked() {
+    zx_status_t ret;
     DEBUG_ASSERT(dev_lock_.IsHeld());
 
     // Hold a reference to our upstream node while we do this.  If we cannot
@@ -220,10 +230,6 @@ status_t PcieBridge::AllocateBridgeWindowsLocked() {
         pio_regions().AddRegion(*pio_window_);
     }
 
-    // TODO(johngro) : Figure out what we are supposed to do with prefetchable
-    // MMIO windows and allocations behind bridges above 4GB.  See ZX-321 for
-    // details.
-    //
     if (mem_base_ <= mem_limit_) {
         uint64_t size = mem_limit_ - mem_base_ + 1;
         ret = upstream->mmio_lo_regions().GetRegion({ .base = mem_base_, .size = size },
@@ -237,6 +243,35 @@ status_t PcieBridge::AllocateBridgeWindowsLocked() {
 
         DEBUG_ASSERT(mmio_window_ != nullptr);
         mmio_lo_regions().AddRegion(*mmio_window_);
+    }
+
+    if (pf_mem_base_ <= pf_mem_limit_) {
+        uint64_t size = pf_mem_limit_ - pf_mem_base_ + 1;
+
+        // Attempt to allocate out of the upstream's prefetchable region.
+        ret = upstream->pf_mmio_regions().GetRegion({ .base = pf_mem_base_, .size = size },
+                                                    pf_mmio_window_);
+        if (ret != ZX_OK) {
+            // We failed. If it's the root bridge try to allocate from its MMIO regions.
+            if (upstream->type() == PcieUpstreamNode::Type::ROOT) {
+                ret = upstream->mmio_lo_regions().GetRegion({ .base = pf_mem_base_, .size = size },
+                                                            pf_mmio_window_);
+                if (ret != ZX_OK) {
+                    ret = upstream->mmio_hi_regions().GetRegion({ .base = pf_mem_base_, .size = size },
+                                                                pf_mmio_window_);
+                }
+            }
+        }
+
+        if (ret != ZX_OK) {
+            TRACEF("Failed to allocate bridge prefetcable MMIO window "
+                   "[%#" PRIx64 ", %#" PRIx64 "]\n",
+                    pf_mem_base_, pf_mem_limit_);
+            return ret;
+        }
+
+        DEBUG_ASSERT(pf_mmio_window_ != nullptr);
+        pf_mmio_regions().AddRegion(*pf_mmio_window_);
     }
 
     return ZX_OK;

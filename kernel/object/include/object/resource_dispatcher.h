@@ -14,13 +14,12 @@
 #include <fbl/intrusive_double_list.h>
 #include <fbl/name.h>
 #include <object/dispatcher.h>
-#include <object/handle_owner.h>
-#include <object/state_tracker.h>
+#include <object/handle.h>
 #include <sys/types.h>
 
 class ResourceRecord;
 
-class ResourceDispatcher final : public Dispatcher,
+class ResourceDispatcher final : public SoloDispatcher,
     public fbl::DoublyLinkedListable<fbl::RefPtr<ResourceDispatcher>> {
 public:
     static zx_status_t Create(fbl::RefPtr<ResourceDispatcher>* dispatcher,
@@ -29,7 +28,7 @@ public:
 
     ~ResourceDispatcher() final;
     zx_obj_type_t get_type() const final { return ZX_OBJ_TYPE_RESOURCE; }
-    StateTracker* get_state_tracker()  final { return &state_tracker_; }
+    bool has_state_tracker() const final { return true; }
     CookieJar* get_cookie_jar() final { return &cookie_jar_; }
 
     uint32_t get_kind() const { return kind_; }
@@ -44,6 +43,5 @@ private:
     const uint64_t low_;
     const uint64_t high_;
 
-    StateTracker state_tracker_;
     CookieJar cookie_jar_;
 };

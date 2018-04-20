@@ -1,49 +1,29 @@
 uboringssl
 =======================================
 
-uboringssl is a subset of [BoringSSL's][boringssl] libcrypto.  The source
+uboringssl is a subset of [BoringSSL]'s libcrypto.  The source
 code under this directory comprises a minimal set needed for selected
 cryptographic operations in the kernel.
 
 ## Changes
 
-Changes to the upstream files are easily identifiable as falling into one of
-three categories:
-<ul>
-<li>Code which should be disabled when in used in kernel has
-<code>#ifdef _KERNEL</code> guards added.</li>
-<li>Code which is added for Zircon is guarded by
-<code>#ifdef \__Fuchsia\__</code>.</li>
-<li>New source files are named with a *'-zircon.cpp'* suffix.</li>
-</ul>
+Changes from the upstream files are limited to a single files:
+  * [base.h]: BORINGSSL_NO_CXX and OPENSSL_NO_THREADS added to Fuchsia case.
 
 All other code is unchanged from BoringSSL.
 
 ## Updating
 
-A [check-boringssl.go][script] script recognizes these changes and will
-identify any other changes introduce when updating BoringSSL.  Maintainers
-should port these differences until the script exits cleanly.
-
-Care should be taken to minimize the differences between files in boring-crypto
-and BoringSSL.  Only the minimum number of changes necessary to limit pulling in
-excessive dependencies should be added.
-
-This subset does not include tests from BoringSSL.  When updating from
-[BoringSSL][boringssl], maintainers should first ensure the unit tests in that
-package pass on Fuchsia before updating the subset for Zircon.
-
-Finally, maintainers should update this file with the new [revision][revision]
-of BoringSSL to provide an easy way to confirm boring-crypto was checked.
+Use the [roll_boringssl.go] script in Fuchsia's BoringSSL [package].
 
 ## License
 
-All code under this directory is covered by the same [license][license] as
-BoringSSL.
+All code under this directory is covered by the same [license] as BoringSSL.
 
-[boringssl]: https://fuchsia.googlesource.com/third_party/boringssl/+/master/README.md "BoringSSL"
-[script]: https://fuchsia.googlesource.com/zircon/+/master/third_party/boring-crypto/scripts/check-boringssl.go "check-boringssl.go"
-[license]: https://fuchsia.googlesource.com/third_party/boringssl/+/master/LICENSE "BoringSSL license"
+[BoringSSL]: https://fuchsia.googlesource.com/third_party/boringssl/+/master/README.md
+[base.h]: include/openssl/base.h
+[package]: https://fuchsia.googlesource.com/garnet/+/master/packages/boringssl
+[license]: https://fuchsia.googlesource.com/third_party/boringssl/+/master/LICENSE
 
 [//]: # (UPDATE THE DIGEST WHEN ROLLING BORINGSSL)
-[revision]: https://fuchsia.googlesource.com/third_party/boringssl/+/27e377ec65d57589499c1dbabc6b74f6464f5d6d/
+[revision]: https://fuchsia.googlesource.com/third_party/boringssl/+/c9775322408095b42840c5599942bbe9a74f7921/

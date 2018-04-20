@@ -507,12 +507,9 @@ static int i8042_irq_thread(void* arg) {
         return 0;
 
     for (;;) {
-        status = zx_interrupt_wait(device->irq);
+         uint64_t slots;
+       status = zx_interrupt_wait(device->irq, &slots);
         if (status == ZX_OK) {
-            // ack IRQ so we don't lose any IRQs that arrive while processing
-            // (as this is an edge-triggered IRQ)
-            zx_interrupt_complete(device->irq);
-
             // keep handling status on the controller until no bits are set we care about
             bool retry;
             do {
@@ -673,7 +670,7 @@ static zx_status_t i8042_get_descriptor(void* ctx, uint8_t desc_type,
 }
 
 static zx_status_t i8042_get_report(void* ctx, uint8_t rpt_type, uint8_t rpt_id,
-        void* data, size_t len) {
+        void* data, size_t len, size_t* out_len) {
     return ZX_ERR_NOT_SUPPORTED;
 }
 
@@ -738,9 +735,13 @@ static zx_status_t i8042_dev_init(i8042_device_t* dev, const char* name, zx_devi
 
     uint32_t interrupt = dev->type == INPUT_PROTO_KBD ?
         ISA_IRQ_KEYBOARD : ISA_IRQ_MOUSE;
-    zx_status_t status = zx_interrupt_create(get_root_resource(), interrupt, ZX_FLAG_REMAP_IRQ,
-                                             &(dev->irq));
+    zx_status_t status = zx_interrupt_create(get_root_resource(), 0, &(dev->irq));
     if (status != ZX_OK) {
+        return status;
+    }
+    status = zx_interrupt_bind(dev->irq, 0, get_root_resource(), interrupt, ZX_INTERRUPT_REMAP_IRQ);
+    if (status != ZX_OK) {
+        zx_handle_close(dev->irq);
         return status;
     }
 
@@ -819,7 +820,7 @@ static int i8042_init_thread(void* arg) {
     return ZX_OK;
 }
 
-static zx_status_t i8042_bind(void* ctx, zx_device_t* parent, void** cookie) {
+static zx_status_t i8042_bind(void* ctx, zx_device_t* parent) {
     thrd_t t;
     int rc = thrd_create_with_name(&t, i8042_init_thread, parent, "i8042-init");
     return rc;
@@ -830,7 +831,11 @@ static zx_driver_ops_t i8042_driver_ops = {
     .bind = i8042_bind,
 };
 
-//TODO: should bind against PC/ACPI instead of misc
-ZIRCON_DRIVER_BEGIN(i8042, i8042_driver_ops, "zircon", "0.1", 1)
-    BI_MATCH_IF(EQ, BIND_PROTOCOL, ZX_PROTOCOL_MISC_PARENT),
+ZIRCON_DRIVER_BEGIN(i8042, i8042_driver_ops, "zircon", "0.1", 6)
+    BI_ABORT_IF(NE, BIND_PROTOCOL, ZX_PROTOCOL_ACPI),
+    BI_GOTO_IF(NE, BIND_ACPI_HID_0_3, 0x504e5030, 0), // PNP0303\0
+    BI_MATCH_IF(EQ, BIND_ACPI_HID_4_7, 0x33303300),
+    BI_LABEL(0),
+    BI_ABORT_IF(NE, BIND_ACPI_CID_0_3, 0x504e5030), // PNP0303\0
+    BI_MATCH_IF(EQ, BIND_ACPI_CID_4_7, 0x33303300),
 ZIRCON_DRIVER_END(i8042)

@@ -16,11 +16,22 @@
 
 #include "bench.h"
 
+static zx_ticks_t ns_to_ticks(zx_time_t ns) {
+    __uint128_t temp = (__uint128_t)ns * zx_ticks_per_second() / ZX_SEC(1);
+    return (zx_ticks_t)temp;
+}
+
+static zx_time_t ticks_to_ns(zx_ticks_t ticks) {
+    __uint128_t temp = (__uint128_t)ticks * ZX_SEC(1) / zx_ticks_per_second();
+    return (zx_time_t)temp;
+}
+
 // spin the cpu a bit to make sure the frequency is cranked to the top
 static void spin(zx_time_t nanosecs) {
-    zx_time_t t = zx_time_get(ZX_CLOCK_MONOTONIC);
+    zx_ticks_t target_ticks = ns_to_ticks(nanosecs);
+    zx_ticks_t t = zx_ticks_get();
 
-    while (zx_time_get(ZX_CLOCK_MONOTONIC) - t < nanosecs)
+    while (zx_ticks_get() - t < target_ticks)
         ;
 }
 
@@ -28,9 +39,11 @@ template <typename T>
 inline zx_time_t time_it(T func) {
     spin(ZX_MSEC(10));
 
-    zx_time_t t = zx_time_get(ZX_CLOCK_MONOTONIC);
+    zx_ticks_t ticks = zx_ticks_get();
     func();
-    return zx_time_get(ZX_CLOCK_MONOTONIC) - t;
+    ticks = zx_ticks_get() - ticks;
+
+    return ticks_to_ns(ticks);
 }
 
 int vmo_run_benchmark() {
@@ -150,15 +163,6 @@ int vmo_run_benchmark() {
         zx_vmo_op_range(vmo, ZX_VMO_OP_COMMIT, 0, size, nullptr, 0);
     });
     printf("\ttook %" PRIu64 " nsecs to commit vmo of size %zu\n", t, size);
-
-    uint64_t addrs[size / PAGE_SIZE];
-    t = time_it([&](){
-        zx_status_t status = zx_vmo_op_range(vmo, ZX_VMO_OP_LOOKUP, 0, size, addrs, sizeof(addrs));
-        if (status != ZX_OK) {
-            __builtin_trap();
-        }
-    });
-    printf("\ttook %" PRIu64 " nsecs to lookup vmo of size %zu\n", t, size);
 
     t = time_it([&](){
         zx_status_t status = zx_vmo_op_range(vmo, ZX_VMO_OP_COMMIT, 0, size, nullptr, 0);

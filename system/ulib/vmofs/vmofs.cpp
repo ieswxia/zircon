@@ -9,6 +9,7 @@
 
 #include <fbl/algorithm.h>
 #include <fbl/alloc_checker.h>
+#include <zircon/device/vfs.h>
 #include <zircon/syscalls.h>
 
 namespace vmofs {
@@ -17,7 +18,7 @@ struct dircookie_t {
     uint64_t last_id;
 };
 
-static_assert(sizeof(dircookie_t) <= sizeof(vdircookie_t),
+static_assert(sizeof(dircookie_t) <= sizeof(fs::vdircookie_t),
               "vmofs dircookie too large to fit in IO state");
 
 // Vnode -----------------------------------------------------------------------
@@ -48,13 +49,11 @@ uint32_t VnodeFile::GetVType() {
     return V_TYPE_FILE;
 }
 
-zx_status_t VnodeFile::Open(uint32_t flags) {
-    if (flags & O_DIRECTORY) {
+zx_status_t VnodeFile::ValidateFlags(uint32_t flags) {
+    if (flags & ZX_FS_FLAG_DIRECTORY) {
         return ZX_ERR_NOT_DIR;
     }
-    switch (flags & O_ACCMODE) {
-    case O_WRONLY:
-    case O_RDWR:
+    if (flags & ZX_FS_RIGHT_WRITABLE) {
         return ZX_ERR_ACCESS_DENIED;
     }
     return ZX_OK;
@@ -64,7 +63,7 @@ zx_status_t VnodeFile::Serve(fs::Vfs* vfs, zx::channel channel, uint32_t flags) 
     return ZX_OK;
 }
 
-ssize_t VnodeFile::Read(void* data, size_t length, size_t offset) {
+zx_status_t VnodeFile::Read(void* data, size_t length, size_t offset, size_t* out_actual) {
     if (offset > length_) {
         return 0;
     }
@@ -72,11 +71,11 @@ ssize_t VnodeFile::Read(void* data, size_t length, size_t offset) {
     if (length > remaining_length) {
         length = remaining_length;
     }
-    zx_status_t r = zx_vmo_read(vmo_, data, offset_ + offset, length, &length);
-    if (r < 0) {
-        return r;
+    zx_status_t status = zx_vmo_read(vmo_, data, offset_ + offset, length);
+    if (status == ZX_OK) {
+        *out_actual = length;
     }
-    return length;
+    return status;
 }
 
 constexpr uint64_t kVmofsBlksize = PAGE_SIZE;
@@ -86,15 +85,15 @@ zx_status_t VnodeFile::Getattr(vnattr_t* attr) {
     attr->mode = V_TYPE_FILE | V_IRUSR;
     attr->size = length_;
     attr->blksize = kVmofsBlksize;
-    attr->blkcount = fbl::roundup(attr->size, kVmofsBlksize) / VNATTR_BLKSIZE;
+    attr->blkcount = fbl::round_up(attr->size, kVmofsBlksize) / VNATTR_BLKSIZE;
     attr->nlink = 1;
     return ZX_OK;
 }
 
-zx_status_t VnodeFile::GetHandles(uint32_t flags, zx_handle_t* hnds,
-                                  uint32_t* type, void* extra, uint32_t* esize) {
-    zx_off_t* offset = static_cast<zx_off_t*>(extra);
-    zx_off_t* length = offset + 1;
+zx_status_t VnodeFile::GetHandles(uint32_t flags, zx_handle_t* hnd, uint32_t* type,
+                                  zxrio_object_info_t* extra) {
+    uint64_t* offset = &extra->vmofile.offset;
+    uint64_t* length = &extra->vmofile.length;
     zx_handle_t vmo;
     zx_status_t status;
 
@@ -109,7 +108,7 @@ zx_status_t VnodeFile::GetHandles(uint32_t flags, zx_handle_t* hnds,
     status = zx_handle_duplicate(
         vmo_,
         ZX_RIGHT_READ | ZX_RIGHT_EXECUTE | ZX_RIGHT_MAP |
-        ZX_RIGHT_DUPLICATE | ZX_RIGHT_TRANSFER | ZX_RIGHT_GET_PROPERTY,
+        ZX_RIGHTS_BASIC | ZX_RIGHT_GET_PROPERTY,
         &vmo);
     if (status < 0) {
         return status;
@@ -117,10 +116,9 @@ zx_status_t VnodeFile::GetHandles(uint32_t flags, zx_handle_t* hnds,
 
     *offset = offset_;
     *length = length_;
-    hnds[0] = vmo;
+    *hnd = vmo;
     *type = FDIO_PROTOCOL_VMOFILE;
-    *esize = sizeof(zx_off_t) * 2;
-    return 1;
+    return ZX_OK;
 }
 
 // VnodeDir --------------------------------------------------------------------
@@ -138,14 +136,16 @@ uint32_t VnodeDir::GetVType() {
     return V_TYPE_DIR;
 }
 
-zx_status_t VnodeDir::Open(uint32_t flags) {
+zx_status_t VnodeDir::ValidateFlags(uint32_t flags) {
+    if (flags & ZX_FS_RIGHT_WRITABLE) {
+        return ZX_ERR_NOT_FILE;
+    }
     return ZX_OK;
 }
 
-zx_status_t VnodeDir::Lookup(fbl::RefPtr<fs::Vnode>* out, const char* name, size_t len) {
-    fbl::StringPiece value(name, len);
-    auto* it = fbl::lower_bound(names_.begin(), names_.end(), value);
-    if (it == names_.end() || *it != value) {
+zx_status_t VnodeDir::Lookup(fbl::RefPtr<fs::Vnode>* out, fbl::StringPiece name) {
+    auto* it = fbl::lower_bound(names_.begin(), names_.end(), name);
+    if (it == names_.end() || *it != name) {
         return ZX_ERR_NOT_FOUND;
     }
     *out = children_[it - names_.begin()];
@@ -156,18 +156,20 @@ zx_status_t VnodeDir::Getattr(vnattr_t* attr) {
     memset(attr, 0, sizeof(vnattr_t));
     attr->mode = V_TYPE_DIR | V_IRUSR;
     attr->blksize = kVmofsBlksize;
-    attr->blkcount = fbl::roundup(attr->size, kVmofsBlksize) / VNATTR_BLKSIZE;
+    attr->blkcount = fbl::round_up(attr->size, kVmofsBlksize) / VNATTR_BLKSIZE;
     attr->nlink = 1;
     return ZX_OK;
 }
 
-zx_status_t VnodeDir::Readdir(void* cookie, void* data, size_t len) {
-    dircookie_t* c = static_cast<dircookie_t*>(cookie);
+zx_status_t VnodeDir::Readdir(fs::vdircookie_t* cookie, void* data, size_t len,
+                              size_t* out_actual) {
+    dircookie_t* c = reinterpret_cast<dircookie_t*>(cookie);
     fs::DirentFiller df(data, len);
     zx_status_t r = 0;
     if (c->last_id < 1) {
-        if ((r = df.Next(".", 1, VTYPE_TO_DTYPE(V_TYPE_DIR))) != ZX_OK) {
-            return df.BytesFilled();
+        if ((r = df.Next(".", VTYPE_TO_DTYPE(V_TYPE_DIR))) != ZX_OK) {
+            *out_actual = df.BytesFilled();
+            return ZX_OK;
         }
         c->last_id = 1;
     }
@@ -176,13 +178,14 @@ zx_status_t VnodeDir::Readdir(void* cookie, void* data, size_t len) {
         fbl::StringPiece name = names_[i];
         const auto& child = children_[i];
         uint32_t vtype = child->GetVType();
-        if ((r = df.Next(name.data(), name.length(), VTYPE_TO_DTYPE(vtype))) != ZX_OK) {
+        if ((r = df.Next(name, VTYPE_TO_DTYPE(vtype))) != ZX_OK) {
             break;
         }
         c->last_id = i + 2;
     }
 
-    return df.BytesFilled();
+    *out_actual = df.BytesFilled();
+    return ZX_OK;
 }
 
 } // namespace vmofs

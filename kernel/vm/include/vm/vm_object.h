@@ -15,11 +15,11 @@
 #include <fbl/ref_counted.h>
 #include <fbl/ref_ptr.h>
 #include <kernel/mutex.h>
-#include <kernel/vm.h>
 #include <lib/user_copy/user_ptr.h>
 #include <list.h>
 #include <stdint.h>
 #include <vm/page.h>
+#include <vm/vm.h>
 #include <vm/vm_page_list.h>
 #include <zircon/thread_annotations.h>
 #include <zircon/types.h>
@@ -27,6 +27,13 @@
 class VmMapping;
 
 typedef zx_status_t (*vmo_lookup_fn_t)(void* context, size_t offset, size_t index, paddr_t pa);
+
+class VmObjectChildObserver {
+public:
+    virtual void OnZeroChild() = 0;
+    virtual void OnOneChild() = 0;
+};
+
 
 // The base vm object that holds a range of bytes of data
 //
@@ -43,6 +50,9 @@ public:
 
     // Returns true if the object is backed by RAM.
     virtual bool is_paged() const { return false; }
+    // Returns true if the object is backed by a contiguous range of physical
+    // memory.
+    virtual bool is_contiguous() const { return false; }
 
     // Returns the number of physical pages currently allocated to the
     // object where (offset <= page_offset < offset+len).
@@ -57,12 +67,6 @@ public:
 
     // find physical pages to back the range of the object
     virtual zx_status_t CommitRange(uint64_t offset, uint64_t len, uint64_t* committed) {
-        return ZX_ERR_NOT_SUPPORTED;
-    }
-
-    // find a contiguous run of physical pages to back the range of the object
-    virtual zx_status_t CommitRangeContiguous(uint64_t offset, uint64_t len, uint64_t* committed,
-                                              uint8_t alignment_log2) {
         return ZX_ERR_NOT_SUPPORTED;
     }
 
@@ -85,10 +89,10 @@ public:
     }
 
     // read/write operators against kernel pointers only
-    virtual zx_status_t Read(void* ptr, uint64_t offset, size_t len, size_t* bytes_read) {
+    virtual zx_status_t Read(void* ptr, uint64_t offset, size_t len) {
         return ZX_ERR_NOT_SUPPORTED;
     }
-    virtual zx_status_t Write(const void* ptr, uint64_t offset, size_t len, size_t* bytes_written) {
+    virtual zx_status_t Write(const void* ptr, uint64_t offset, size_t len) {
         return ZX_ERR_NOT_SUPPORTED;
     }
 
@@ -99,19 +103,21 @@ public:
     }
 
     // read/write operators against user space pointers only
-    virtual zx_status_t ReadUser(user_ptr<void> ptr, uint64_t offset, size_t len, size_t* bytes_read) {
+    virtual zx_status_t ReadUser(user_out_ptr<void> ptr, uint64_t offset, size_t len) {
         return ZX_ERR_NOT_SUPPORTED;
     }
-    virtual zx_status_t WriteUser(user_ptr<const void> ptr, uint64_t offset, size_t len,
-                                  size_t* bytes_written) {
+    virtual zx_status_t WriteUser(user_in_ptr<const void> ptr, uint64_t offset, size_t len) {
         return ZX_ERR_NOT_SUPPORTED;
     }
 
     // translate a range of the vmo to physical addresses and store in the buffer
-    virtual zx_status_t LookupUser(uint64_t offset, uint64_t len, user_ptr<paddr_t> buffer,
+    virtual zx_status_t LookupUser(uint64_t offset, uint64_t len, user_inout_ptr<paddr_t> buffer,
                                    size_t buffer_size) {
         return ZX_ERR_NOT_SUPPORTED;
     }
+
+    // The assocaited VmObjectDispatcher will set an observer to notify user mode.
+    void SetChildObserver(VmObjectChildObserver* child_observer);
 
     // Returns a null-terminated name, or the empty string if set_name() has not
     // been called.
@@ -212,8 +218,7 @@ public:
 protected:
     // private constructor (use Create())
     explicit VmObject(fbl::RefPtr<VmObject> parent);
-    VmObject()
-        : VmObject(nullptr) {}
+    VmObject() : VmObject(nullptr) {}
 
     // private destructor, only called from refptr
     virtual ~VmObject();
@@ -262,6 +267,9 @@ protected:
     fbl::Name<ZX_MAX_NAME_LEN> name_;
 
 private:
+    // This member, if not null, is used to signal the user facing Dispatcher.
+    VmObjectChildObserver* child_observer_ TA_GUARDED(lock_) = nullptr;
+
     // Per-node state for the global VMO list.
     using NodeState = fbl::DoublyLinkedListNodeState<VmObject*>;
     NodeState global_list_state_;

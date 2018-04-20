@@ -13,17 +13,18 @@
 #include <fbl/auto_call.h>
 #include <fbl/auto_lock.h>
 #include <fbl/intrusive_double_list.h>
+#include <fbl/mutex.h>
 #include <fbl/type_support.h>
 #include <inttypes.h>
 #include <kernel/cmdline.h>
 #include <kernel/thread.h>
-#include <kernel/vm.h>
 #include <lib/crypto/global_prng.h>
 #include <lib/crypto/prng.h>
-#include <safeint/safe_math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <trace.h>
+#include <vm/fault.h>
+#include <vm/vm.h>
 #include <vm/vm_address_region.h>
 #include <vm/vm_object.h>
 #include <vm/vm_object_paged.h>
@@ -38,6 +39,9 @@ using fbl::AutoLock;
 
 #define LOCAL_TRACE MAX(VM_GLOBAL_TRACE, 0)
 
+#define GUEST_PHYSICAL_ASPACE_BASE 0UL
+#define GUEST_PHYSICAL_ASPACE_SIZE (1UL << MMU_GUEST_SIZE_SHIFT)
+
 // pointer to a singleton kernel address space
 VmAspace* VmAspace::kernel_aspace_ = nullptr;
 
@@ -45,11 +49,13 @@ VmAspace* VmAspace::kernel_aspace_ = nullptr;
 static VmAddressRegion* dummy_root_vmar = nullptr;
 
 // list of all address spaces
-static mutex_t aspace_list_lock = MUTEX_INITIAL_VALUE(aspace_list_lock);
-static fbl::DoublyLinkedList<VmAspace*> aspaces;
+static fbl::Mutex aspace_list_lock;
+static fbl::DoublyLinkedList<VmAspace*> aspaces TA_GUARDED(aspace_list_lock);
 
-// called once at boot to initialize the singleton kernel address space
-void VmAspace::KernelAspaceInitPreHeap() {
+// Called once at boot to initialize the singleton kernel address
+// space. Thread safety analysis is disabled since we don't need to
+// lock yet.
+void VmAspace::KernelAspaceInitPreHeap() TA_NO_THREAD_SAFETY_ANALYSIS {
     // the singleton kernel address space
     static VmAspace _kernel_aspace(KERNEL_ASPACE_BASE, KERNEL_ASPACE_SIZE, VmAspace::TYPE_KERNEL, "kernel");
 
@@ -144,7 +150,7 @@ zx_status_t VmAspace::Init() {
     bool is_guest = (flags_ & TYPE_MASK) == TYPE_GUEST_PHYS;
     uint arch_aspace_flags =
         (is_high_kernel ? ARCH_ASPACE_FLAG_KERNEL : 0u) |
-        (is_guest ? ARCH_ASPACE_FLAG_GUEST_PASPACE : 0u);
+        (is_guest ? ARCH_ASPACE_FLAG_GUEST : 0u);
     zx_status_t status = arch_aspace_.Init(base_, size_, arch_aspace_flags);
     if (status != ZX_OK) {
         return status;
@@ -363,6 +369,7 @@ zx_status_t VmAspace::ReserveSpace(const char* name, size_t size, vaddr_t vaddr)
     zx_status_t status = VmObjectPaged::Create(PMM_ALLOC_FLAG_ANY, 0, &vmo);
     if (status != ZX_OK)
         return status;
+    vmo->set_name(name, strlen(name));
 
     // lookup how it's already mapped
     uint arch_mmu_flags = 0;
@@ -398,6 +405,7 @@ zx_status_t VmAspace::AllocPhysical(const char* name, size_t size, void** ptr, u
     zx_status_t status = VmObjectPhysical::Create(paddr, size, &vmo);
     if (status != ZX_OK)
         return status;
+    vmo->set_name(name, strlen(name));
 
     // force it to be mapped up front
     // TODO: add new flag to precisely mean pre-map
@@ -428,20 +436,10 @@ zx_status_t VmAspace::AllocContiguous(const char* name, size_t size, void** ptr,
 
     // create a vm object to back it
     fbl::RefPtr<VmObject> vmo;
-    zx_status_t status = VmObjectPaged::Create(PMM_ALLOC_FLAG_ANY, size, &vmo);
+    zx_status_t status = VmObjectPaged::CreateContiguous(PMM_ALLOC_FLAG_ANY, size, align_pow2, &vmo);
     if (status != ZX_OK)
         return status;
-
-    // always immediately commit memory to the object
-    uint64_t committed;
-    status = vmo->CommitRangeContiguous(0, size, &committed, align_pow2);
-    if (status < 0)
-        return status;
-    if (static_cast<size_t>(committed) < size) {
-        LTRACEF("failed to allocate enough pages (asked for %zu, got %zu)\n", size / PAGE_SIZE,
-                static_cast<size_t>(committed) / PAGE_SIZE);
-        return ZX_ERR_NO_MEMORY;
-    }
+    vmo->set_name(name, strlen(name));
 
     return MapObjectInternal(fbl::move(vmo), name, 0, size, ptr, align_pow2, vmm_flags,
                              arch_mmu_flags);
@@ -462,6 +460,7 @@ zx_status_t VmAspace::Alloc(const char* name, size_t size, void** ptr, uint8_t a
     zx_status_t status = VmObjectPaged::Create(PMM_ALLOC_FLAG_ANY, size, &vmo);
     if (status != ZX_OK)
         return status;
+    vmo->set_name(name, strlen(name));
 
     // commit memory up front if requested
     if (vmm_flags & VMM_FLAG_COMMIT) {
@@ -527,6 +526,11 @@ zx_status_t VmAspace::PageFault(vaddr_t va, uint flags) {
     canary_.Assert();
     DEBUG_ASSERT(!aspace_destroyed_);
     LTRACEF("va %#" PRIxPTR ", flags %#x\n", va, flags);
+
+    if ((flags_ & TYPE_MASK) == TYPE_GUEST_PHYS) {
+        flags &= ~VMM_PF_FLAG_USER;
+        flags |= VMM_PF_FLAG_GUEST;
+    }
 
     // for now, hold the aspace lock across the page fault operation,
     // which stops any other operations on the address space from moving

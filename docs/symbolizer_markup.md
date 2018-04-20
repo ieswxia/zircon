@@ -117,7 +117,7 @@ The accepted SGR control sequences all have the form `"\033[%um"`
 | `32` | Green foreground   | |
 | `33` | Yellow foreground  | |
 | `34` | Blue foreground    | |
-| `35` | Zircon foreground | |
+| `35` | Magenta foreground | |
 | `36` | Cyan foreground    | |
 | `37` | White foreground   | |
 
@@ -276,6 +276,14 @@ in human-readable symbolic form.
   }}}
   ```
 
+## Trigger elements ##
+
+These elements cause an external action and will be presented to the
+user in a human readable form. Generally they trigger an external
+action to occur that results in a linkable page. The link or some
+other informative information about the external action can then be
+presented to the user.
+
 * `{{{dumpfile:%s:%s}}}`
 
   Here the first `%s` is an identifier for a type of dump and the
@@ -285,17 +293,17 @@ in human-readable symbolic form.
   format per se.  In general it might correspond to writing a file by
   that name or something similar.
 
-  This is technically a presentation element, but it may also serve to
-  trigger additional post-processing work beyond symbolizing the markup.
-  It indicates that a dump file of some sort has been published.  Some
-  logic attached to the symbolizing filter may understand certain types
-  of dump file and trigger additional post-processing of the dump file
-  upon encountering this element (e.g. generating visualizations,
-  symbolization).  The expectation is that the information collected
-  from contextual elements (described below) in the logging stream may
-  be necessary to decode the content of the dump.  So if the symbolizing
-  filter triggers other processing, it may need to feed some distilled
-  form of the contextual information to those processes.
+  This element may trigger additional post-processing work beyond
+  symbolizing the markup. It indicates that a dump file of some sort
+  has been published.  Some logic attached to the symbolizing filter may
+  understand certain types of dump file and trigger additional
+  post-processing of the dump file upon encountering this element (e.g.
+  generating visualizations, symbolization).  The expectation is that the
+  information collected from contextual elements (described below) in the
+  logging stream may be necessary to decode the content of the dump.  So
+  if the symbolizing filter triggers other processing, it may need to
+  feed some distilled form of the contextual information to those
+  processes.
 
   On Zircon and Fuchsia in particular, "publish" means to call the
   `__sanitizer_publish_data` function from `<zircon/sanitizer.h>`
@@ -337,36 +345,70 @@ somewhere earlier in the logging stream.  It should always be possible
 for the symbolizing filter to be implemented as a single pass over the
 raw logging stream, accumulating context and massaging text as it goes.
 
-* `{{{module:%x:%s:...}}}`
+* `{{{reset}}}`
 
-  Here `%x` encodes an ELF Build ID (or equivalent unique identifier).
-  The `%s` is a human-readable identifier for the module, such as an ELF
-  `DT_SONAME` string or a file name; but it might be empty.  It's only
-  for casual information.  The Build ID string is the sole way to
-  identify the binary from which this module was loaded.  A "module" is
-  a single linked binary, such as a loaded ELF file.  Usually each
-  module occupies a contiguous range of memory (always does on Zircon).
+  This should be output before any other contextual element. The need
+  for this contextual element is to support implementations that handle
+  logs coming from multiple processes. Such implementations might not
+  know when a new process starts or ends. Because some identifying
+  information (like process IDs) might be the same between old and new
+  processes, a way is needed to distinguish two processes with such
+  identical identifying information. This element informs such
+  implementations to reset the state of a filter so that information
+  from a previous process's contextual elements is not assumed for new
+  process that just happens have the same identifying information.
 
-  The `...` is a sequence of fields (separated by `:`) that each
-  describe a range of memory, called a _segment_.  The field for each
-  segment has the form `%p,%p,%s` which can be read as: address, size,
-  flags.  The first `%p` is the starting address of the segment and
-  the second `%p` is its size in bytes.  The starting address will
-  usually have been rounded down to the active page size, and the size
-  rounded up.  The `%s` is one or more of the letters 'r', 'w', and
-  'x' (in that order and in either upper or lower case) to indicate
-  this segment of memory is readable, writable, and/or executable.
-  The symbolizing filter can use this information to guess whether an
-  address is a likely code address or a likely data address in the
-  given module.
+* `{{{module:%i:%s:%s:...}}}`
 
-  There can be any number of segments (within reason), but there must
-  be at least one.  They must be in ascending order of address and
-  must not overlap.  For an ELF module, the segments should correspond
-  exactly to the `PT_LOAD` segments in the ELF file's program headers
-  (except for address and size rounding).
+  This element represents a so called "module". A "module" is a single
+  linked binary, such as a loaded ELF file. Usually each module occupies
+  a contiguous range of memory (always does on Zircon).
+ 
+  Here `%i` is the Module ID which is used by other contextual elements
+  to refer to this module. The first `%s` is a human-readable identifier
+  for the module, such as an ELF `DT_SONAME` string or a file name; but
+  it might be empty. It's only for casual information. The Module ID
+  will be exclusivelly used to refer to this module in other contextual
+  elements. The second `%s` is the module type and it determines what
+  the remaining fields are. The following module types are supported:
+
+  * `elf:%x`
+
+    Here `%x` encodes an ELF Build ID. The Build ID should refer to a
+    single linked binary. The Build ID string is the sole way to identify
+    the binary from which this module was loaded.
 
   Example:
   ```
-  {{{module:83238ab56ba10497:libc.so:0x7acba69d5000,0x5a000,r:0x7acba6a2f000,0x7e000,rx:0x7acba6aad000,0x8000,rw}}}
+  {{{module:1:libc.so:elf:83238ab56ba10497}}}
+  ```
+
+* `{{{mmap:%p:%x:...}}}`
+
+  This contextual element is used to give information about a particular
+  region in memory. `%p` is the starting address and `%x` gives the size
+  in hex of the region of memory. The `...` part can take different forms
+  to give different information about the specified region of memory. The
+  allowed forms are the following:
+
+  * `load:%i:%s:%p`
+
+    This subelement informs the filter that a segment was loaded from a
+    module. The module is identified by its module id `%i`. The `%s` is
+    one or more of the letters 'r', 'w', and 'x' (in that order and in
+    either upper or lower case) to indicate this segment of memory is
+    readable, writable, and/or executable. The symbolizing filter can use
+    this information to guess whether an address is a likely code address
+    or a likely data address in the given module. The remaining `%p` gives
+    the module relative address. For ELF files the module relative address
+    will be the `p_vaddr` of the associated program header. For example if
+    your module's executable segment has `p_vaddr=0x1000`, `p_memsz=0x1234`,
+    and was loaded at 0x7acba69d5000 then you need to subtract 0x7acba69d4000
+    from any address between 0x7acba69d5000 and 0x7acba69d6234 to get the
+    module relative address. The starting address will usually have been
+    rounded down to the active page size, and the size rounded up.
+
+  Example:
+  ```
+  {{{mmap:0x7acba69d5000:0x5a000:load:1:rx:0x1000}}}
   ```

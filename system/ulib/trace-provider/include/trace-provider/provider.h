@@ -9,10 +9,21 @@
 #pragma once
 
 #include <zircon/compiler.h>
+#include <zircon/types.h>
 
-#include <async/dispatcher.h>
+#include <lib/async/dispatcher.h>
 
 __BEGIN_CDECLS
+
+// Signals to pass to zx_object_signal_peer(fence).
+
+// Indicate the provider successfully started.
+#define TRACE_PROVIDER_SIGNAL_STARTED ZX_USER_SIGNAL_0
+
+// Indicate a record was dropped because the trace buffer is full.
+#define TRACE_PROVIDER_SIGNAL_BUFFER_OVERFLOW ZX_USER_SIGNAL_1
+
+// End signals for zx_object_signal_peer(fence).
 
 // Represents a trace provider.
 typedef struct trace_provider trace_provider_t;

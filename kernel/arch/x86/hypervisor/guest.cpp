@@ -6,12 +6,9 @@
 
 #include <arch/x86/apic.h>
 #include <arch/x86/feature.h>
-#include <hypervisor/guest_physical_address_space.h>
 #include <zircon/syscalls/hypervisor.h>
 
 #include "vmx_cpu_state_priv.h"
-
-static const zx_vaddr_t kIoApicPhysBase = 0xfec00000;
 
 static void ignore_msr(VmxPage* msr_bitmaps_page, uint32_t msr) {
     // From Volume 3, Section 24.6.9.
@@ -33,33 +30,25 @@ static void ignore_msr(VmxPage* msr_bitmaps_page, uint32_t msr) {
 
 // static
 zx_status_t Guest::Create(fbl::RefPtr<VmObject> physmem, fbl::unique_ptr<Guest>* out) {
+    // Check that the CPU supports VMX.
+    if (!x86_feature_test(X86_FEATURE_VMX))
+        return ZX_ERR_NOT_SUPPORTED;
+
+    zx_status_t status = alloc_vmx_state();
+    if (status != ZX_OK)
+        return status;
+
     fbl::AllocChecker ac;
     fbl::unique_ptr<Guest> guest(new (&ac) Guest);
     if (!ac.check())
         return ZX_ERR_NO_MEMORY;
 
-    zx_status_t status = GuestPhysicalAddressSpace::Create(fbl::move(physmem), &guest->gpas_);
-    if (status != ZX_OK)
-        return status;
-
-    // We ensure the page containing the IO APIC address is not mapped so that
-    // we VM exit with an EPT violation when the guest accesses the page.
-    status = guest->gpas_->UnmapRange(kIoApicPhysBase, PAGE_SIZE);
-    if (status != ZX_OK)
-        return status;
-
-    // Setup common APIC access.
-    VmxInfo vmx_info;
-    status = guest->apic_access_page_.Alloc(vmx_info, 0);
-    if (status != ZX_OK)
-        return status;
-
-    status = guest->gpas_->MapApicPage(APIC_PHYS_BASE,
-                                       guest->apic_access_page_.PhysicalAddress());
+    status = hypervisor::GuestPhysicalAddressSpace::Create(fbl::move(physmem), &guest->gpas_);
     if (status != ZX_OK)
         return status;
 
     // Setup common MSR bitmaps.
+    VmxInfo vmx_info;
     status = guest->msr_bitmaps_page_.Alloc(vmx_info, UINT8_MAX);
     if (status != ZX_OK)
         return status;
@@ -75,13 +64,18 @@ zx_status_t Guest::Create(fbl::RefPtr<VmObject> physmem, fbl::unique_ptr<Guest>*
     ignore_msr(&guest->msr_bitmaps_page_, X86_MSR_IA32_TSC_ADJUST);
     ignore_msr(&guest->msr_bitmaps_page_, X86_MSR_IA32_TSC_AUX);
 
+    // Setup VPID allocator
+    fbl::AutoLock lock(&guest->vcpu_mutex_);
+    status = guest->vpid_allocator_.Init();
+    if (status != ZX_OK)
+        return status;
+
     *out = fbl::move(guest);
     return ZX_OK;
 }
 
 Guest::~Guest() {
-    __UNUSED zx_status_t status = gpas_->UnmapRange(APIC_PHYS_BASE, PAGE_SIZE);
-    DEBUG_ASSERT(status == ZX_OK);
+    free_vmx_state();
 }
 
 zx_status_t Guest::SetTrap(uint32_t kind, zx_vaddr_t addr, size_t len,
@@ -90,29 +84,41 @@ zx_status_t Guest::SetTrap(uint32_t kind, zx_vaddr_t addr, size_t len,
         return ZX_ERR_INVALID_ARGS;
     if (SIZE_MAX - len < addr)
         return ZX_ERR_OUT_OF_RANGE;
+
     switch (kind) {
     case ZX_GUEST_TRAP_MEM:
-        if (!IS_PAGE_ALIGNED(addr) || !IS_PAGE_ALIGNED(len))
+        if (port)
             return ZX_ERR_INVALID_ARGS;
-        return gpas_->UnmapRange(addr, len);
+        break;
+    case ZX_GUEST_TRAP_BELL:
+        if (!port)
+            return ZX_ERR_INVALID_ARGS;
+        break;
     case ZX_GUEST_TRAP_IO:
+        if (port)
+            return ZX_ERR_INVALID_ARGS;
         if (addr + len > UINT16_MAX)
             return ZX_ERR_OUT_OF_RANGE;
-        return mux_.AddPortRange(addr, len, fbl::move(port), key);
+        return traps_.InsertTrap(kind, addr, len, fbl::move(port), key);
     default:
         return ZX_ERR_INVALID_ARGS;
     }
+
+    // Common logic for memory-based traps.
+    if (!IS_PAGE_ALIGNED(addr) || !IS_PAGE_ALIGNED(len))
+        return ZX_ERR_INVALID_ARGS;
+    zx_status_t status = gpas_->UnmapRange(addr, len);
+    if (status != ZX_OK)
+        return status;
+    return traps_.InsertTrap(kind, addr, len, fbl::move(port), key);
 }
 
-zx_status_t arch_guest_create(fbl::RefPtr<VmObject> physmem, fbl::unique_ptr<Guest>* guest) {
-    // Check that the CPU supports VZX.
-    if (!x86_feature_test(X86_FEATURE_VMX))
-        return ZX_ERR_NOT_SUPPORTED;
-
-    return Guest::Create(fbl::move(physmem), guest);
+zx_status_t Guest::AllocVpid(uint16_t* vpid) {
+    fbl::AutoLock lock(&vcpu_mutex_);
+    return vpid_allocator_.AllocId(vpid);
 }
 
-zx_status_t arch_guest_set_trap(Guest* guest, uint32_t kind, zx_vaddr_t addr, size_t len,
-                                fbl::RefPtr<PortDispatcher> port, uint64_t key) {
-    return guest->SetTrap(kind, addr, len, port, key);
+zx_status_t Guest::FreeVpid(uint16_t vpid) {
+    fbl::AutoLock lock(&vcpu_mutex_);
+    return vpid_allocator_.FreeId(vpid);
 }

@@ -7,20 +7,21 @@
 // license that can be found in the LICENSE file or at
 // https://opensource.org/licenses/MIT
 
-#include <assert.h>
-#include <sys/types.h>
-#include <string.h>
-#include <stdlib.h>
-#include <debug.h>
-#include <kernel/thread.h>
-#include <kernel/spinlock.h>
 #include <arch/x86.h>
 #include <arch/x86/descriptor.h>
+#include <arch/x86/feature.h>
 #include <arch/x86/mp.h>
 #include <arch/x86/registers.h>
+#include <arch/x86/x86intrin.h>
+#include <assert.h>
+#include <debug.h>
+#include <kernel/spinlock.h>
+#include <kernel/thread.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/types.h>
 
-void arch_thread_initialize(thread_t *t, vaddr_t entry_point)
-{
+void arch_thread_initialize(thread_t* t, vaddr_t entry_point) {
     // create a default stack frame on the stack
     vaddr_t stack_top = (vaddr_t)t->stack + t->stack_size;
 
@@ -32,12 +33,12 @@ void arch_thread_initialize(thread_t *t, vaddr_t entry_point)
     // of the way the context switch will pop the return address off the stack. After the first
     // context switch, this leaves the stack in unaligned relative to how a called function expects it.
     stack_top -= 8;
-    struct x86_64_context_switch_frame *frame = (struct x86_64_context_switch_frame *)(stack_top);
+    struct x86_64_context_switch_frame* frame = (struct x86_64_context_switch_frame*)(stack_top);
 
     // Record a zero return address so that backtraces will stop here.
     // Otherwise if heap debugging is on, and say there is 99..99 here,
     // then the debugger could try to continue the backtrace from there.
-    memset((void*) stack_top, 0, 8);
+    memset((void*)stack_top, 0, 8);
 
     // move down a frame size and zero it out
     frame--;
@@ -49,8 +50,8 @@ void arch_thread_initialize(thread_t *t, vaddr_t entry_point)
     vaddr_t buf = ROUNDUP(((vaddr_t)t->arch.extended_register_buffer), 64);
     __UNUSED size_t overhead = buf - (vaddr_t)t->arch.extended_register_buffer;
     DEBUG_ASSERT(sizeof(t->arch.extended_register_buffer) - overhead >=
-            x86_extended_register_size());
-    t->arch.extended_register_state = (vaddr_t *)buf;
+                 x86_extended_register_size());
+    t->arch.extended_register_state = (vaddr_t*)buf;
     x86_extended_register_init_state(t->arch.extended_register_state);
 
     // set the stack pointer
@@ -65,21 +66,26 @@ void arch_thread_initialize(thread_t *t, vaddr_t entry_point)
     t->arch.gs_base = 0;
 }
 
-void arch_thread_construct_first(thread_t *t)
-{
+void arch_thread_construct_first(thread_t* t) {
 }
 
-void arch_dump_thread(thread_t *t)
-{
+void arch_dump_thread(thread_t* t) {
     if (t->state != THREAD_RUNNING) {
         dprintf(INFO, "\tarch: ");
         dprintf(INFO, "sp %#" PRIxPTR "\n", t->arch.sp);
     }
 }
 
-__NO_SAFESTACK
-void arch_context_switch(thread_t *oldthread, thread_t *newthread)
-{
+void* arch_thread_get_blocked_fp(struct thread* t) {
+    if (!WITH_FRAME_POINTERS)
+        return nullptr;
+
+    struct x86_64_context_switch_frame* frame = (struct x86_64_context_switch_frame*)t->arch.sp;
+
+    return (void*)frame->rbp;
+}
+
+__NO_SAFESTACK __attribute__((target("fsgsbase"))) void arch_context_switch(thread_t* oldthread, thread_t* newthread) {
     x86_extended_register_context_switch(oldthread, newthread);
 
     //printf("cs 0x%llx\n", kstack_top);
@@ -87,11 +93,14 @@ void arch_context_switch(thread_t *oldthread, thread_t *newthread)
     /* set the tss SP0 value to point at the top of our stack */
     x86_set_tss_sp(newthread->stack_top);
 
-    /* user and kernel gs have been swapped, so unswap them when loading
-     * from the msrs
-     */
-    oldthread->arch.fs_base = read_msr(X86_MSR_IA32_FS_BASE);
-    oldthread->arch.gs_base = read_msr(X86_MSR_IA32_KERNEL_GS_BASE);
+    /* Save the user fs_base register value.  The new rdfsbase instruction
+     * is much faster than reading the MSR, so use the former in
+     * preference. */
+    if (likely(g_x86_feature_fsgsbase)) {
+        oldthread->arch.fs_base = _readfsbase_u64();
+    } else {
+        oldthread->arch.fs_base = read_msr(X86_MSR_IA32_FS_BASE);
+    }
 
     /* The segment selector registers can't be preserved across context
      * switches in all cases, because some values get clobbered when
@@ -113,8 +122,29 @@ void arch_context_switch(thread_t *oldthread, thread_t *newthread)
         write_msr(X86_MSR_IA32_GS_BASE, gs_base);
     }
 
-    write_msr(X86_MSR_IA32_FS_BASE, newthread->arch.fs_base);
-    write_msr(X86_MSR_IA32_KERNEL_GS_BASE, newthread->arch.gs_base);
+    /* Restore fs_base and save+restore user gs_base.  Note that the user
+     * and kernel gs_base values have been swapped -- the user value is
+     * currently in KERNEL_GS_BASE. */
+    if (likely(g_x86_feature_fsgsbase)) {
+        /* There is no variant of the {rd,wr}gsbase instructions for
+         * accessing KERNEL_GS_BASE, so we wrap those in two swapgs
+         * instructions to get the same effect.  This is a little
+         * convoluted, but still faster than using the KERNEL_GS_BASE
+         * MSRs. */
+        __asm__ __volatile__(
+            "swapgs\n"
+            "rdgsbase %[old_value]\n"
+            "wrgsbase %[new_value]\n"
+            "swapgs\n"
+            : [old_value] "=&r"(oldthread->arch.gs_base)
+            : [new_value] "r"(newthread->arch.gs_base));
+
+        _writefsbase_u64(newthread->arch.fs_base);
+    } else {
+        oldthread->arch.gs_base = read_msr(X86_MSR_IA32_KERNEL_GS_BASE);
+        write_msr(X86_MSR_IA32_FS_BASE, newthread->arch.fs_base);
+        write_msr(X86_MSR_IA32_KERNEL_GS_BASE, newthread->arch.gs_base);
+    }
 
 #if __has_feature(safe_stack)
     oldthread->arch.unsafe_sp = x86_read_gs_offset64(ZX_TLS_UNSAFE_SP_OFFSET);

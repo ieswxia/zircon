@@ -8,6 +8,7 @@
 #include <gpt/gpt.h>
 #include <zircon/device/block.h>
 #include <stdlib.h>
+#include <string.h>
 
 #define FVM_MAGIC (0x54524150204d5646ull) // 'FVM PART'
 #define FVM_VERSION 0x00000001
@@ -40,12 +41,19 @@ static_assert(sizeof(fvm_t) <= FVM_BLOCK_SIZE, "FVM Superblock too large");
 
 #define FVM_MAX_ENTRIES 1024
 
+// Identifies that the partition is inactive, and should be destroyed on
+// reboot (unless activated before rebinding the FVM).
+constexpr uint32_t kVPartFlagInactive = 0x00000001;
+constexpr uint32_t kVPartAllocateMask = 0x00000001; // All acceptable flags to pass to allocate.
+
 typedef struct {
-    void init(const uint8_t* type_, const uint8_t* guid_, uint32_t slices_, const char* name_) {
+    void init(const uint8_t* type_, const uint8_t* guid_, uint32_t slices_,
+              const char* name_, uint32_t flags_) {
         slices = slices_;
         memcpy(type, type_, FVM_GUID_LEN);
         memcpy(guid, guid_, FVM_GUID_LEN);
         memcpy(name, name_, FVM_NAME_LEN);
+        flags = flags_;
     }
 
     void clear() {
@@ -55,7 +63,7 @@ typedef struct {
     uint8_t type[FVM_GUID_LEN]; // Mirroring GPT value
     uint8_t guid[FVM_GUID_LEN]; // Mirroring GPT value
     uint32_t slices;            // '0' if unallocated
-    uint32_t reserved;
+    uint32_t flags;
     uint8_t name[FVM_NAME_LEN];
 } vpart_entry_t;
 
@@ -67,13 +75,16 @@ static_assert(sizeof(vpart_entry_t) * FVM_MAX_ENTRIES % FVM_BLOCK_SIZE == 0,
 
 #define VPART_BITS 16
 #define VPART_MAX ((1UL << VPART_BITS) - 1)
-#define VSLICE_BITS 48
+#define VSLICE_BITS 32
 #define VSLICE_MAX ((1UL << VSLICE_BITS) - 1)
+#define RESERVED_BITS 16
+
 #define PSLICE_UNALLOCATED 0
 
 typedef struct slice_entry {
     size_t vpart : VPART_BITS; // '0' if unallocated
     size_t vslice : VSLICE_BITS;
+    size_t reserved : RESERVED_BITS;
 } __attribute__((packed)) slice_entry_t;
 
 static_assert(FVM_MAX_ENTRIES <= VPART_MAX, "vpart adress space too small");
@@ -86,7 +97,7 @@ constexpr size_t kVPartTableLength = (sizeof(vpart_entry_t) * FVM_MAX_ENTRIES);
 constexpr size_t kAllocTableOffset = kVPartTableOffset + kVPartTableLength;
 
 constexpr size_t AllocTableLength(size_t total_size, size_t slice_size) {
-    return fbl::roundup(sizeof(slice_entry_t) * (total_size / slice_size),
+    return fbl::round_up(sizeof(slice_entry_t) * (total_size / slice_size),
                          FVM_BLOCK_SIZE);
 }
 
@@ -112,6 +123,10 @@ constexpr size_t SliceStart(size_t total_size, size_t slice_size, size_t pslice)
 
 } // namespace fvm
 
+#endif //  __cplusplus
+
+__BEGIN_CDECLS
+
 // Update's the metadata's hash field to accurately reflect
 // the contents of metadata.
 void fvm_update_hash(void* metadata, size_t metadata_size);
@@ -127,6 +142,10 @@ zx_status_t fvm_validate_header(const void* metadata, const void* backup,
 
 // Format a block device to be an empty FVM.
 zx_status_t fvm_init(int fd, size_t slice_size);
+// Queries driver to obtain slice_size, then overwrites and unbinds an FVM
+zx_status_t fvm_destroy(const char* path);
+// Given the slice_size, overwrites and unbinds an FVM
+zx_status_t fvm_overwrite(const char* path, size_t slice_size);
 
 // Allocates a new vpartition in the fvm, and waits for it to become
 // accessible (by watching for a corresponding block device).
@@ -134,12 +153,21 @@ zx_status_t fvm_init(int fd, size_t slice_size);
 // Returns an open fd to the new partition on success, -1 on error.
 int fvm_allocate_partition(int fvm_fd, const alloc_req_t* request);
 
-// Finds and opens a vpartition by GUID.
-// Returns an open fd to the partition on success, -1 on error.
-//
-// "out" is an optional output parameter, which, if non-null,
-// should contain a buffer of size "PATH_MAX", and will contain
-// the path to the vpartition on success.
-int fvm_open_partition(const uint8_t* uniqueGUID, const uint8_t* typeGUID, char* out);
+// TODO(smklein): Move the following function out of ulib/fvm, it is
+// also applicable to the GPT
 
-#endif //  __cplusplus
+// Waits for a partition with a GUID pair to appear, and opens it.
+//
+// If one of the GUIDs is null, it is ignored. For example:
+//   wait_for_partition(NULL, systemGUID, ZX_SEC(5));
+// Waits for any partition with the corresponding system GUID to appear.
+// At least one of the GUIDs must be non-null.
+//
+// Returns an open fd to the partition on success, -1 on error.
+int open_partition(const uint8_t* uniqueGUID, const uint8_t* typeGUID,
+                   zx_duration_t timeout, char* out_path);
+
+// Finds and destroys the partition with the given GUID pair, if it exists.
+zx_status_t destroy_partition(const uint8_t* uniqueGUID, const uint8_t* typeGUID);
+
+__END_CDECLS

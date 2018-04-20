@@ -13,11 +13,13 @@
 #include <lib/console.h>
 #include <lib/ktrace.h>
 #include <fbl/auto_lock.h>
-#include <object/handles.h>
+#include <object/handle.h>
 #include <object/job_dispatcher.h>
+#include <object/port_dispatcher.h>
 #include <object/process_dispatcher.h>
 #include <object/vm_object_dispatcher.h>
 #include <pretty/sizes.h>
+#include <zircon/types.h>
 
 // Machinery to walk over a job tree and run a callback on each process.
 template <typename ProcessCallbackType>
@@ -55,10 +57,11 @@ static void DumpProcessListKeyMap() {
     printf("#so: number of sockets\n");
     printf("#tm : number of timers\n");
     printf("#fi : number of fifos\n");
+    printf("#?? : number of all other handle types\n");
 }
 
 static const char* ObjectTypeToString(zx_obj_type_t type) {
-    static_assert(ZX_OBJ_TYPE_LAST == 23, "need to update switch below");
+    static_assert(ZX_OBJ_TYPE_LAST == 28, "need to update switch below");
 
     switch (type) {
         case ZX_OBJ_TYPE_PROCESS: return "process";
@@ -79,6 +82,11 @@ static const char* ObjectTypeToString(zx_obj_type_t type) {
         case ZX_OBJ_TYPE_GUEST: return "guest";
         case ZX_OBJ_TYPE_VCPU: return "vcpu";
         case ZX_OBJ_TYPE_TIMER: return "timer";
+        case ZX_OBJ_TYPE_IOMMU: return "iommu";
+        case ZX_OBJ_TYPE_BTI: return "bti";
+        case ZX_OBJ_TYPE_PROFILE: return "profile";
+        case ZX_OBJ_TYPE_PMT: return "pmt";
+        case ZX_OBJ_TYPE_SUSPEND_TOKEN: return "suspend-token";
         default: return "???";
     }
 }
@@ -90,7 +98,7 @@ static uint32_t BuildHandleStats(const ProcessDispatcher& pd,
                                  uint32_t* handle_type, size_t size) {
     uint32_t total = 0;
     pd.ForEachHandle([&](zx_handle_t handle, zx_rights_t rights,
-                         fbl::RefPtr<const Dispatcher> disp) {
+                         const Dispatcher* disp) {
         if (handle_type) {
             uint32_t type = static_cast<uint32_t>(disp->get_type());
             if (size > type) {
@@ -103,15 +111,6 @@ static uint32_t BuildHandleStats(const ProcessDispatcher& pd,
     return total;
 }
 
-uint32_t ProcessDispatcher::ThreadCount() const {
-    fbl::AutoLock lock(&state_lock_);
-    return static_cast<uint32_t>(thread_list_.size_slow());
-}
-
-size_t ProcessDispatcher::PageCount() const {
-    return aspace_->AllocatedPages();
-}
-
 // Counts the process's handles by type and formats them into the provided
 // buffer as strings.
 static void FormatHandleTypeCount(const ProcessDispatcher& pd,
@@ -119,7 +118,7 @@ static void FormatHandleTypeCount(const ProcessDispatcher& pd,
     uint32_t types[ZX_OBJ_TYPE_LAST] = {0};
     uint32_t handle_count = BuildHandleStats(pd, types, sizeof(types));
 
-    snprintf(buf, buf_len, "%4u: %3u %3u %3u %3u %3u %3u %3u %3u %3u %3u %3u",
+    snprintf(buf, buf_len, "%4u: %4u %3u %3u %3u %3u %3u %3u %3u %3u %3u %3u %3u",
              handle_count,
              types[ZX_OBJ_TYPE_JOB],
              types[ZX_OBJ_TYPE_PROCESS],
@@ -131,12 +130,18 @@ static void FormatHandleTypeCount(const ProcessDispatcher& pd,
              types[ZX_OBJ_TYPE_PORT],
              types[ZX_OBJ_TYPE_SOCKET],
              types[ZX_OBJ_TYPE_TIMER],
-             types[ZX_OBJ_TYPE_FIFO]
+             types[ZX_OBJ_TYPE_FIFO],
+             types[ZX_OBJ_TYPE_INTERRUPT] + types[ZX_OBJ_TYPE_PCI_DEVICE] +
+             types[ZX_OBJ_TYPE_LOG] + types[ZX_OBJ_TYPE_RESOURCE] +
+             types[ZX_OBJ_TYPE_GUEST] + types[ZX_OBJ_TYPE_VCPU] +
+             types[ZX_OBJ_TYPE_IOMMU] + types[ZX_OBJ_TYPE_BTI] +
+             types[ZX_OBJ_TYPE_PROFILE] + types[ZX_OBJ_TYPE_PMT] +
+             types[ZX_OBJ_TYPE_SUSPEND_TOKEN]
              );
 }
 
 void DumpProcessList() {
-    printf("%7s  #h:  #jb #pr #th #vo #vm #ch #ev #po #so #tm #fi [name]\n", "id");
+    printf("%7s  #h:  #jb #pr #th #vo #vm #ch #ev #po #so #tm #fi #?? [name]\n", "id");
 
     auto walker = MakeProcessWalker([](ProcessDispatcher* process) {
         char handle_counts[(ZX_OBJ_TYPE_LAST * 4) + 1 + /*slop*/ 16];
@@ -175,7 +180,7 @@ void DumpProcessHandles(zx_koid_t id) {
 
     uint32_t total = 0;
     pd->ForEachHandle([&](zx_handle_t handle, zx_rights_t rights,
-                          fbl::RefPtr<const Dispatcher> disp) {
+                          const Dispatcher* disp) {
         printf("%9x %7" PRIu64 " : %s\n",
             handle, disp->get_koid(), ObjectTypeToString(disp->get_type()));
         ++total;
@@ -351,8 +356,8 @@ static void DumpProcessVmObjects(zx_koid_t id, char format_unit) {
     uint64_t total_size = 0;
     uint64_t total_alloc = 0;
     pd->ForEachHandle([&](zx_handle_t handle, zx_rights_t rights,
-                          fbl::RefPtr<const Dispatcher> disp) {
-        auto vmod = DownCastDispatcher<const VmObjectDispatcher>(&disp);
+                          const Dispatcher* disp) {
+        auto vmod = DownCastDispatcher<const VmObjectDispatcher>(disp);
         if (vmod == nullptr) {
             return ZX_OK;
         }
@@ -455,7 +460,7 @@ class VmMapBuilder final : public VmEnumerator {
 public:
     // NOTE: Code outside of the syscall layer should not typically know about
     // user_ptrs; do not use this pattern as an example.
-    VmMapBuilder(user_ptr<zx_info_maps_t> maps, size_t max)
+    VmMapBuilder(user_out_ptr<zx_info_maps_t> maps, size_t max)
         : maps_(maps), max_(max) {}
 
     bool OnVmAddressRegion(const VmAddressRegion* vmar, uint depth) override {
@@ -507,7 +512,7 @@ private:
     // The caller must write an entry for the root VmAspace at index 0.
     size_t nelem_ = 1;
     size_t available_ = 1;
-    user_ptr<zx_info_maps_t> maps_;
+    user_out_ptr<zx_info_maps_t> maps_;
     size_t max_;
 };
 } // namespace
@@ -515,7 +520,7 @@ private:
 // NOTE: Code outside of the syscall layer should not typically know about
 // user_ptrs; do not use this pattern as an example.
 zx_status_t GetVmAspaceMaps(fbl::RefPtr<VmAspace> aspace,
-                            user_ptr<zx_info_maps_t> maps, size_t max,
+                            user_out_ptr<zx_info_maps_t> maps, size_t max,
                             size_t* actual, size_t* available) {
     DEBUG_ASSERT(aspace != nullptr);
     *actual = 0;
@@ -575,7 +580,7 @@ class AspaceVmoEnumerator final : public VmEnumerator {
 public:
     // NOTE: Code outside of the syscall layer should not typically know about
     // user_ptrs; do not use this pattern as an example.
-    AspaceVmoEnumerator(user_ptr<zx_info_vmo_t> vmos, size_t max)
+    AspaceVmoEnumerator(user_out_ptr<zx_info_vmo_t> vmos, size_t max)
         : vmos_(vmos), max_(max) {}
 
     bool OnVmMapping(const VmMapping* map, const VmAddressRegion* vmar,
@@ -600,7 +605,7 @@ public:
     size_t available() const { return available_; }
 
 private:
-    const user_ptr<zx_info_vmo_t> vmos_;
+    const user_out_ptr<zx_info_vmo_t> vmos_;
     const size_t max_;
 
     size_t nelem_ = 0;
@@ -611,7 +616,7 @@ private:
 // NOTE: Code outside of the syscall layer should not typically know about
 // user_ptrs; do not use this pattern as an example.
 zx_status_t GetVmAspaceVmos(fbl::RefPtr<VmAspace> aspace,
-                            user_ptr<zx_info_vmo_t> vmos, size_t max,
+                            user_out_ptr<zx_info_vmo_t> vmos, size_t max,
                             size_t* actual, size_t* available) {
     DEBUG_ASSERT(aspace != nullptr);
     DEBUG_ASSERT(actual != nullptr);
@@ -636,7 +641,7 @@ zx_status_t GetVmAspaceVmos(fbl::RefPtr<VmAspace> aspace,
 // NOTE: Code outside of the syscall layer should not typically know about
 // user_ptrs; do not use this pattern as an example.
 zx_status_t GetProcessVmosViaHandles(ProcessDispatcher* process,
-                                     user_ptr<zx_info_vmo_t> vmos, size_t max,
+                                     user_out_ptr<zx_info_vmo_t> vmos, size_t max,
                                      size_t* actual_out, size_t* available_out) {
     DEBUG_ASSERT(process != nullptr);
     DEBUG_ASSERT(actual_out != nullptr);
@@ -647,8 +652,8 @@ zx_status_t GetProcessVmosViaHandles(ProcessDispatcher* process,
     // do deduping.
     zx_status_t s = process->ForEachHandle([&](zx_handle_t handle,
                                                zx_rights_t rights,
-                                               fbl::RefPtr<Dispatcher> disp) {
-        auto vmod = DownCastDispatcher<VmObjectDispatcher>(&disp);
+                                               const Dispatcher* disp) {
+        auto vmod = DownCastDispatcher<const VmObjectDispatcher>(disp);
         if (vmod == nullptr) {
             // This handle isn't a VMO; skip it.
             return ZX_OK;
@@ -694,8 +699,9 @@ static void DumpAddressSpace(const cmd_args* arg) {
 }
 
 static void DumpHandleTable() {
-    printf("outstanding handles: %zu\n", internal::OutstandingHandles());
-    internal::DumpHandleTableInfo();
+    printf("outstanding handles: %zu\n",
+           Handle::diagnostics::OutstandingHandles());
+    Handle::diagnostics::DumpTableInfo();
 }
 
 static size_t mwd_limit = 32 * 256;
@@ -708,7 +714,7 @@ static int hwd_thread(void* arg) {
     static size_t previous_handle_count = 0u;
 
     for (;;) {
-        auto handle_count = internal::OutstandingHandles();
+        auto handle_count = Handle::diagnostics::OutstandingHandles();
         if (handle_count != previous_handle_count) {
             if (handle_count > hwd_limit) {
                 printf("HandleWatchdog! %zu handles outstanding (greater than limit %zu)\n",
@@ -721,7 +727,7 @@ static int hwd_thread(void* arg) {
 
         previous_handle_count = handle_count;
 
-        thread_sleep_relative(LK_SEC(1));
+        thread_sleep_relative(ZX_SEC(1));
     }
 }
 
@@ -738,9 +744,14 @@ void DumpProcessMemoryUsage(const char* prefix, size_t min_pages) {
     GetRootJobDispatcher()->EnumerateChildren(&walker, /* recurse */ true);
 }
 
+static void DumpPortPacketInfo() {
+    const size_t count = PortPacket::DiagnosticAllocationCount();
+    printf("port packet allocation count: %zu\n", count);
+}
+
 static int mwd_thread(void* arg) {
     for (;;) {
-        thread_sleep_relative(LK_SEC(1));
+        thread_sleep_relative(ZX_SEC(1));
         DumpProcessMemoryUsage("MemoryHog! ", mwd_limit);
     }
 }
@@ -760,6 +771,7 @@ static int cmd_diagnostics(int argc, const cmd_args* argv, uint32_t flags) {
         printf("                     : dump process/all/hidden VMOs\n");
         printf("                 -u? : fix all sizes to the named unit\n");
         printf("                       where ? is one of [BkMGTPE]\n");
+        printf("%s ppinfo            : port packet arena info\n", argv[0].str);
         printf("%s kill <pid>        : kill process\n", argv[0].str);
         printf("%s asd  <pid>|kernel : dump process/kernel address space\n",
                argv[0].str);
@@ -820,6 +832,10 @@ static int cmd_diagnostics(int argc, const cmd_args* argv, uint32_t flags) {
         } else {
             DumpProcessVmObjects(argv[2].u, format_unit);
         }
+    } else if (strcmp(argv[1].str, "ppinfo") == 0) {
+        if (argc != 2)
+            goto usage;
+        DumpPortPacketInfo();
     } else if (strcmp(argv[1].str, "kill") == 0) {
         if (argc < 3)
             goto usage;

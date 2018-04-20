@@ -24,14 +24,15 @@ enum lk_init_level {
     LK_INIT_LEVEL_ARCH_EARLY     = 0x10000,
     LK_INIT_LEVEL_PLATFORM_EARLY = 0x20000,
     LK_INIT_LEVEL_TARGET_EARLY   = 0x30000,
-    LK_INIT_LEVEL_HEAP           = 0x40000,
-    LK_INIT_LEVEL_VM             = 0x50000,
-    LK_INIT_LEVEL_KERNEL         = 0x60000,
-    LK_INIT_LEVEL_THREADING      = 0x70000,
-    LK_INIT_LEVEL_ARCH           = 0x80000,
-    LK_INIT_LEVEL_PLATFORM       = 0x90000,
-    LK_INIT_LEVEL_TARGET         = 0xa0000,
-    LK_INIT_LEVEL_APPS           = 0xb0000,
+    LK_INIT_LEVEL_VM_PREHEAP     = 0x40000,
+    LK_INIT_LEVEL_HEAP           = 0x50000,
+    LK_INIT_LEVEL_VM             = 0x60000,
+    LK_INIT_LEVEL_KERNEL         = 0x70000,
+    LK_INIT_LEVEL_THREADING      = 0x80000,
+    LK_INIT_LEVEL_ARCH           = 0x90000,
+    LK_INIT_LEVEL_PLATFORM       = 0xa0000,
+    LK_INIT_LEVEL_TARGET         = 0xb0000,
+    LK_INIT_LEVEL_USER           = 0xc0000,
 
     LK_INIT_LEVEL_LAST = UINT_MAX,
 };
@@ -63,13 +64,13 @@ struct lk_init_struct {
     const char *name;
 };
 
-#define LK_INIT_HOOK_FLAGS(_name, _hook, _level, _flags)        \
-    __ALIGNED(sizeof(void *)) __USED __SECTION("lk_init")       \
-    static const struct lk_init_struct _init_struct_##_name = { \
-        .level = _level,                                        \
-        .flags = _flags,                                        \
-        .hook = _hook,                                          \
-        .name = #_name,                                         \
+#define LK_INIT_HOOK_FLAGS(_name, _hook, _level, _flags)                \
+    __ALIGNED(sizeof(void *)) __USED __SECTION(".data.rel.ro.lk_init")  \
+    static const struct lk_init_struct _init_struct_##_name = {         \
+        .level = _level,                                                \
+        .flags = _flags,                                                \
+        .hook = _hook,                                                  \
+        .name = #_name,                                                 \
     };
 
 #define LK_INIT_HOOK(_name, _hook, _level) \

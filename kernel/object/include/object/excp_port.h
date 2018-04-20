@@ -27,7 +27,7 @@ class ProcessDispatcher;
 class PortDispatcher;
 
 // Represents the binding of an exception port to a specific target
-// (system/process/thread). Multiple ExceptionPorts may exist for a
+// (job/process/thread). Multiple ExceptionPorts may exist for a
 // single underlying PortDispatcher.
 class ExceptionPort : public fbl::DoublyLinkedListable<fbl::RefPtr<ExceptionPort>>
                     , public fbl::RefCounted<ExceptionPort> {
@@ -43,13 +43,7 @@ public:
 
     zx_status_t SendPacket(ThreadDispatcher* thread, uint32_t type);
 
-    void OnThreadStart(ThreadDispatcher* thread);
-
-    void OnThreadSuspending(ThreadDispatcher* thread);
-    void OnThreadResuming(ThreadDispatcher* thread);
-
-    void OnProcessExit(ProcessDispatcher* process);
-    void OnThreadExit(ThreadDispatcher* thread);
+    void OnThreadStartForDebugger(ThreadDispatcher* thread);
     void OnThreadExitForDebugger(ThreadDispatcher* thread);
 
     // Records the target that the ExceptionPort is bound to, so it can
@@ -61,6 +55,9 @@ public:
     // Drops the ExceptionPort's references to its target and PortDispatcher.
     // Called by the target when the port is explicitly unbound.
     void OnTargetUnbind();
+
+    // Validates that this eport is associated with the given instance.
+    bool PortMatches(const PortDispatcher* port, bool allow_null);
 
     static void BuildArchReport(zx_exception_report_t* report, uint32_t type,
                                 const arch_exception_context_t* arch_context);
@@ -78,15 +75,6 @@ private:
     // Unbinds from the target if bound, and drops the ref to |port_|.
     // Called by |port_| when it reaches zero handles.
     void OnPortZeroHandles();
-
-#if DEBUG_ASSERT_IMPLEMENTED
-    // Lets PortDispatcher assert that this eport is associated
-    // with the right instance.
-    bool PortMatches(const PortDispatcher *port, bool allow_null) {
-        fbl::AutoLock lock(&lock_);
-        return (allow_null && port_ == nullptr) || port_.get() == port;
-    }
-#endif  // if DEBUG_ASSERT_IMPLEMENTED
 
     // Returns true if the ExceptionPort is currently bound to a target.
     bool IsBoundLocked() const TA_REQ(lock_) {
@@ -115,10 +103,3 @@ private:
     // and should only be touched using port_->LinkExceptionPort()
     // or port_->UnlinkExceptionPort(). This goes for ::InContainer(), too.
 };
-
-// Sets the system exception port. |eport| must be non-null; use
-// ResetSystemExceptionPort() to remove the currently-set port.
-zx_status_t SetSystemExceptionPort(fbl::RefPtr<ExceptionPort> eport);
-
-// Removes the system exception port. Returns true if a port had been set.
-bool ResetSystemExceptionPort();

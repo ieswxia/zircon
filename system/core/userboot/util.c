@@ -26,6 +26,12 @@ static char* hexstring(char* s, size_t len, uint64_t n) {
         n >>= 4;
     } while (n);
 
+    if (len > 2) {
+        *s++ = '0';
+        *s++ = 'x';
+        len -= 2;
+    }
+
     while ((hex > tmp) && (len > 0)) {
         *s++ = *--hex;
         len--;
@@ -84,6 +90,22 @@ void vprintl(zx_handle_t log, const char* fmt, va_list ap) {
                 avail--;
             }
             break;
+        case '.':
+            fmt++;
+            if (*fmt != '*')
+                goto bad_format;
+            fmt++;
+            if (*fmt != 's')
+                goto bad_format;
+            i = va_arg(ap, int);
+            s = va_arg(ap, const char*);
+            while (avail && *s && i != 0) {
+                *p++ = *s++;
+                avail--;
+                if (i > 0)
+                    --i;
+            }
+            break;
         case 'z':
             fmt++;
             switch (*fmt) {
@@ -126,7 +148,6 @@ bad_format:
         fmt++;
     }
 
-done:
     if ((log == ZX_HANDLE_INVALID) ||
         (zx_log_write(log, p - buffer, buffer, 0) != ZX_OK)) {
         zx_debug_write(buffer, p - buffer);
@@ -148,5 +169,3 @@ void fail(zx_handle_t log, const char* fmt, ...) {
     va_end(ap);
     zx_process_exit(-1);
 }
-
-

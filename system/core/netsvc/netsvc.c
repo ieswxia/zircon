@@ -86,6 +86,24 @@ void netifc_recv(void* data, size_t len) {
     eth_recv(data, len);
 }
 
+bool netifc_send_pending(void) {
+    if (!tftp_has_pending()) {
+        return false;
+    }
+    tftp_send_next();
+    return tftp_has_pending();
+}
+
+void update_timeouts(void) {
+    zx_time_t now = zx_clock_get(ZX_CLOCK_MONOTONIC);
+    zx_time_t next_timeout = (debuglog_next_timeout < tftp_next_timeout) ?
+                             debuglog_next_timeout : tftp_next_timeout;
+    if (next_timeout != ZX_TIME_INFINITE) {
+        netifc_set_timer((next_timeout < now) ? 0 :
+                         ((next_timeout - now)/ZX_MSEC(1)));
+    }
+}
+
 static const char* zedboot_banner =
 "              _ _                 _   \n"
 "             | | |               | |  \n"
@@ -105,10 +123,23 @@ int main(int argc, char** argv) {
         return -1;
     }
 
+    const char* interface = NULL;
     bool nodename_provided = false;
+    bool should_advertise = false;
     while (argc > 1) {
         if (!strncmp(argv[1], "--netboot", 9)) {
             netbootloader = true;
+        } else if (!strncmp(argv[1], "--advertise", 11)) {
+            should_advertise = true;
+        } else if (!strncmp(argv[1], "--interface", 11)) {
+            if (argc < 3) {
+                printf("netsvc: fatal error: missing argument to --interface\n");
+                return -1;
+            }
+            interface = argv[2];
+            // Advance args one position. The second arg will be advanced below.
+            argv++;
+            argc--;
         } else {
             nodename = argv[1];
             nodename_provided = true;
@@ -116,9 +147,12 @@ int main(int argc, char** argv) {
         argv++;
         argc--;
     }
+    if (interface != NULL) {
+        printf("netsvc: looking for interface %s\n", interface);
+    }
 
     for (;;) {
-        if (netifc_open() != 0) {
+        if (netifc_open(interface) != 0) {
             printf("netsvc: fatal error initializing network\n");
             return -1;
         }
@@ -131,25 +165,26 @@ int main(int argc, char** argv) {
         }
 
         if (netbootloader) {
-            puts(zedboot_banner);
+            printf("%szedboot: version: %s\n\n", zedboot_banner, BOOTLOADER_VERSION);
         }
 
         printf("netsvc: nodename='%s'\n", nodename);
+        if (!should_advertise) {
+            printf("netsvc: will not advertise\n");
+        }
         printf("netsvc: start\n");
         for (;;) {
-            if (netbootloader)
+            if (netbootloader && should_advertise) {
                 netboot_advertise(nodename);
-
-            zx_time_t now = zx_time_get(ZX_CLOCK_MONOTONIC);
-            zx_time_t next_timeout = (debuglog_next_timeout < tftp_next_timeout) ?
-                                     debuglog_next_timeout : tftp_next_timeout;
-            if (next_timeout != ZX_TIME_INFINITE) {
-                netifc_set_timer((next_timeout < now) ? 0 :
-                                 ((next_timeout - now)/ZX_MSEC(1)));
             }
-            if (netifc_poll())
+
+            update_timeouts();
+
+            if (netifc_poll()) {
+                printf("netsvc: netifc_poll() failed - terminating\n");
                 break;
-            now = zx_time_get(ZX_CLOCK_MONOTONIC);
+            }
+            zx_time_t now = zx_clock_get(ZX_CLOCK_MONOTONIC);
             if (now > debuglog_next_timeout) {
                 debuglog_timeout_expired();
             }

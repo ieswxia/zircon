@@ -9,7 +9,6 @@
 #include <stdlib.h>
 
 #include <ddk/device.h>
-#include <ddk/protocol/block.h>
 #include <fvm/fvm.h>
 #include <zircon/device/block.h>
 #include <zircon/thread_annotations.h>
@@ -32,8 +31,7 @@ class VPartitionManager;
 using ManagerDeviceType = ddk::Device<VPartitionManager, ddk::Ioctlable, ddk::Unbindable>;
 
 class VPartition;
-using PartitionDeviceType = ddk::Device<VPartition, ddk::Ioctlable,
-                                        ddk::IotxnQueueable, ddk::GetSizable, ddk::Unbindable>;
+using PartitionDeviceType = ddk::Device<VPartition, ddk::Ioctlable, ddk::GetSizable, ddk::Unbindable>;
 
 class SliceExtent : public fbl::WAVLTreeContainable<fbl::unique_ptr<SliceExtent>> {
 public:
@@ -98,6 +96,10 @@ public:
     // Automatically handles alternating writes to primary / backup copy of FVM.
     zx_status_t WriteFvmLocked() TA_REQ(lock_);
 
+    // Block Protocol
+    size_t BlockOpSize() const { return block_op_size_; }
+    void Queue(block_op_t* txn) const { bp_.ops->queue(bp_.ctx, txn); }
+
     // Acquire access to a VPart Entry which has already been modified (and
     // will, as a consequence, not be de-allocated underneath us).
     vpart_entry_t* GetAllocatedVPartEntry(size_t index) const TA_NO_THREAD_SAFETY_ANALYSIS {
@@ -121,6 +123,17 @@ public:
     zx_status_t AllocateSlicesLocked(VPartition* vp, size_t vslice_start,
                                      size_t count) TA_REQ(lock_);
 
+    // Marks the partition with instance GUID |old_guid| as inactive,
+    // and marks partitions with instance GUID |new_guid| as active.
+    //
+    // If a partition with |old_guid| does not exist, it is ignored.
+    // If |old_guid| equals |new_guid|, then |old_guid| is ignored.
+    // If a partition with |new_guid| does not exist, |ZX_ERR_NOT_FOUND|
+    // is returned.
+    //
+    // Updates the FVM metadata atomically.
+    zx_status_t Upgrade(const uint8_t* old_guid, const uint8_t* new_guid) TA_EXCL(lock_);
+
     // Deallocate 'count' slices, write back the FVM.
     // If a request is made to remove vslice_count = 0, deallocates the entire
     // VPartition.
@@ -137,7 +150,8 @@ public:
     void DdkUnbind();
     void DdkRelease();
 
-    VPartitionManager(zx_device_t* dev, const block_info_t& info);
+    VPartitionManager(zx_device_t* dev, const block_info_t& info, size_t block_op_size,
+                      const block_protocol_t* bp);
     ~VPartitionManager();
     block_info_t info_; // Cached info from parent device
     thrd_t init_;
@@ -174,11 +188,17 @@ private:
         return metadata_size_;
     }
 
+    zx_status_t DoIoLocked(zx_handle_t vmo, size_t off, size_t len, uint32_t command);
+
     fbl::Mutex lock_;
     fbl::unique_ptr<MappedVmo> metadata_ TA_GUARDED(lock_);
     bool first_metadata_is_primary_ TA_GUARDED(lock_);
     size_t metadata_size_;
     size_t slice_size_;
+
+    // Block Protocol
+    const size_t block_op_size_;
+    block_protocol_t bp_;
 };
 
 class VPartition : public PartitionDeviceType, public ddk::BlockProtocol<VPartition> {
@@ -188,20 +208,13 @@ public:
     // Device Protocol
     zx_status_t DdkIoctl(uint32_t op, const void* cmd, size_t cmdlen,
                          void* reply, size_t max, size_t* out_actual);
-    void DdkIotxnQueue(iotxn_t* txn);
     zx_off_t DdkGetSize();
     void DdkUnbind();
     void DdkRelease();
 
     // Block Protocol
-    void Txn(uint32_t opcode, zx_handle_t vmo, uint64_t length,
-             uint64_t vmo_offset, uint64_t dev_offset, void* cookie);
-    void BlockSetCallbacks(block_callbacks_t* cb);
-    void BlockGetInfo(block_info_t* info);
-    void BlockRead(zx_handle_t vmo, uint64_t length, uint64_t vmo_offset,
-                   uint64_t dev_offset, void* cookie);
-    void BlockWrite(zx_handle_t vmo, uint64_t length, uint64_t vmo_offset,
-                    uint64_t dev_offset, void* cookie);
+    void BlockQuery(block_info_t* info_out, size_t* block_op_size_out);
+    void BlockQueue(block_op_t* txn);
 
     auto ExtentBegin() TA_REQ(lock_) {
         return slice_map_.begin();
@@ -227,6 +240,9 @@ public:
     // If freeing from the back of an extent, guaranteed not to fail.
     bool SliceFreeLocked(size_t vslice) TA_REQ(lock_);
 
+    // Destroy the extent containing the vslice.
+    void ExtentDestroyLocked(size_t vslice) TA_REQ(lock_);
+
     size_t BlockSize() const TA_NO_THREAD_SAFETY_ANALYSIS {
         return info_.block_size;
     }
@@ -239,7 +255,7 @@ public:
     void KillLocked() TA_REQ(lock_) { entry_index_ = 0; }
     bool IsKilledLocked() TA_REQ(lock_) { return entry_index_ == 0; }
 
-    VPartition(VPartitionManager* vpm, size_t entry_index);
+    VPartition(VPartitionManager* vpm, size_t entry_index, size_t block_op_size);
     ~VPartition();
     fbl::Mutex lock_;
 
@@ -250,7 +266,6 @@ private:
 
     VPartitionManager* mgr_;
     size_t entry_index_;
-    block_callbacks_t* callbacks_;
 
     // Mapping of virtual slice number (index) to physical slice number (value).
     // Physical slice zero is reserved to mean "unmapped", so a zeroed slice_map
@@ -265,16 +280,6 @@ private:
 #endif // ifdef __cplusplus
 
 __BEGIN_CDECLS
-
-/////////////////// C++-compatibility definitions (Provided to C++ from C)
-
-// Completions don't exist in C++, thanks to an incompatibility of atomics.
-// This function allows C++ functions to synchronously execute iotxns using
-// C completions.
-//
-// Modifies "completion_cb" and "cookie" fields of txn; doesn't free or
-// allocate any memory.
-void iotxn_synchronous_op(zx_device_t* dev, iotxn_t* txn);
 
 /////////////////// C-compatibility definitions (Provided to C from C++)
 

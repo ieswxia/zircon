@@ -143,6 +143,10 @@
 // Example: A USB isochronous transfer that failed to complete due to an overrun or underrun.
 #define ZX_ERR_IO_MISSED_DEADLINE (-46)
 
+// ZX_ERR_IO_INVALID: The data in the operation is invalid parameter or is out of range.
+// Example: A USB transfer that failed to complete with TRB Error
+#define ZX_ERR_IO_INVALID (-47)
+
 // ======== Filesystem Errors ========
 // ZX_ERR_BAD_PATH: Path name is too long.
 #define ZX_ERR_BAD_PATH (-50)
@@ -183,6 +187,19 @@
 // to indicate it did not "consume" an item passed to it,
 // but by choice, not due to an error condition.
 #define ZX_ERR_NEXT (-61)
+
+// ZX_ERR_ASYNC: Ownership of the item has moved to an asynchronous worker.
+//
+// Unlike ZX_ERR_STOP, which implies that iteration on an object
+// should stop, and ZX_ERR_NEXT, which implies that iteration
+// should continue to the next item, ZX_ERR_ASYNC implies
+// that an asynchronous worker is responsible for continuing interation.
+//
+// Example: A notification callback will be called on every
+// event, but one event needs to handle some work asynchronously
+// before it can continue. ZX_ERR_ASYNC implies the worker is
+// responsible for resuming iteration once its work has completed.
+#define ZX_ERR_ASYNC (-62)
 
 // ======== Network-related errors ========
 

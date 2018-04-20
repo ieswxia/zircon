@@ -10,15 +10,15 @@
 #include <bits.h>
 #include <string.h>
 
+#include <hypervisor/cpu.h>
 #include <kernel/auto_lock.h>
 #include <kernel/mp.h>
-#include <vm/pmm.h>
 
 #include <fbl/mutex.h>
 
-static fbl::Mutex vmx_mutex;
-static size_t num_vcpus TA_GUARDED(vmx_mutex) = 0;
-static fbl::unique_ptr<VmxCpuState> vmx_cpu_state TA_GUARDED(vmx_mutex);
+static fbl::Mutex guest_mutex;
+static size_t num_guests TA_GUARDED(guest_mutex) = 0;
+static fbl::Array<VmxPage> vmxon_pages TA_GUARDED(guest_mutex);
 
 static zx_status_t vmxon(paddr_t pa) {
     uint8_t err;
@@ -54,22 +54,11 @@ VmxInfo::VmxInfo() {
     vmx_controls = BIT_SHIFT(basic_info, 55);
 }
 
-MiscInfo::MiscInfo() {
-    // From Volume 3, Appendix A.6.
-    uint64_t misc_info = read_msr(X86_MSR_IA32_VMX_MISC);
-    wait_for_sipi = BIT_SHIFT(misc_info, 8);
-    msr_list_limit = static_cast<uint32_t>(BITS_SHIFT(misc_info, 27, 25) + 1) * 512;
-}
-
 EptInfo::EptInfo() {
     // From Volume 3, Appendix A.10.
     uint64_t ept_info = read_msr(X86_MSR_IA32_VMX_EPT_VPID_CAP);
     page_walk_4 = BIT_SHIFT(ept_info, 6);
     write_back = BIT_SHIFT(ept_info, 14);
-    pde_2mb_page = BIT_SHIFT(ept_info, 16);
-    pdpe_1gb_page = BIT_SHIFT(ept_info, 17);
-    ept_flags = BIT_SHIFT(ept_info, 21);
-    exit_info = BIT_SHIFT(ept_info, 22);
     invept =
         // INVEPT instruction is supported.
         BIT_SHIFT(ept_info, 20) &&
@@ -77,12 +66,6 @@ EptInfo::EptInfo() {
         BIT_SHIFT(ept_info, 25) &&
         // All-context INVEPT type is supported.
         BIT_SHIFT(ept_info, 26);
-}
-
-VmxPage::~VmxPage() {
-    vm_page_t* page = paddr_to_vm_page(pa_);
-    if (page != nullptr)
-        pmm_free_page(page);
 }
 
 zx_status_t VmxPage::Alloc(const VmxInfo& vmx_info, uint8_t fill) {
@@ -99,24 +82,10 @@ zx_status_t VmxPage::Alloc(const VmxInfo& vmx_info, uint8_t fill) {
 
     // The maximum size for a VMXON or VMCS region is 4096, therefore
     // unconditionally allocating a page is adequate.
-    if (pmm_alloc_page(0, &pa_) == nullptr)
-        return ZX_ERR_NO_MEMORY;
-
-    memset(VirtualAddress(), fill, PAGE_SIZE);
-    return ZX_OK;
+    return hypervisor::Page::Alloc(fill);
 }
 
-paddr_t VmxPage::PhysicalAddress() const {
-    DEBUG_ASSERT(pa_ != 0);
-    return pa_;
-}
-
-void* VmxPage::VirtualAddress() const {
-    DEBUG_ASSERT(pa_ != 0);
-    return paddr_to_kvaddr(pa_);
-}
-
-static zx_status_t vmxon_task(void* context, uint cpu_num) {
+static zx_status_t vmxon_task(void* context, cpu_num_t cpu_num) {
     auto pages = static_cast<fbl::Array<VmxPage>*>(context);
     VmxPage& page = (*pages)[cpu_num];
 
@@ -138,17 +107,8 @@ static zx_status_t vmxon_task(void* context, uint cpu_num) {
     if (!ept_info.write_back)
         return ZX_ERR_NOT_SUPPORTED;
 
-    // Check that accessed and dirty flags for EPT are supported.
-    if (!ept_info.ept_flags)
-        return ZX_ERR_NOT_SUPPORTED;
-
     // Check that the INVEPT instruction is supported.
     if (!ept_info.invept)
-        return ZX_ERR_NOT_SUPPORTED;
-
-    // Check that wait for startup IPI is a supported activity state.
-    MiscInfo misc_info;
-    if (!misc_info.wait_for_sipi)
         return ZX_ERR_NOT_SUPPORTED;
 
     // Enable VMXON, if required.
@@ -197,68 +157,46 @@ static void vmxoff_task(void* arg) {
         return;
     }
 
-    // Disable VZX.
+    // Disable VMX.
     x86_set_cr4(x86_get_cr4() & ~X86_CR4_VMXE);
 }
 
-// static
-zx_status_t VmxCpuState::Create(fbl::unique_ptr<VmxCpuState>* out) {
-    fbl::AllocChecker ac;
-    fbl::unique_ptr<VmxCpuState> cpu_state(new (&ac) VmxCpuState);
-    if (!ac.check())
-        return ZX_ERR_NO_MEMORY;
-    zx_status_t status = cpu_state->Init();
-    if (status != ZX_OK)
-        return status;
+zx_status_t alloc_vmx_state() {
+    fbl::AutoLock lock(&guest_mutex);
+    if (num_guests == 0) {
+        fbl::AllocChecker ac;
+        size_t num_cpus = arch_max_num_cpus();
+        VmxPage* pages_ptr = new (&ac) VmxPage[num_cpus];
+        if (!ac.check())
+            return ZX_ERR_NO_MEMORY;
+        fbl::Array<VmxPage> pages(pages_ptr, num_cpus);
+        VmxInfo vmx_info;
+        for (auto& page : pages) {
+            zx_status_t status = page.Alloc(vmx_info, 0);
+            if (status != ZX_OK)
+                return status;
+        }
 
-    // Allocate a VMXON page for each CPU.
-    size_t num_cpus = arch_max_num_cpus();
-    VmxPage* pages = new (&ac) VmxPage[num_cpus];
-    if (!ac.check())
-        return ZX_ERR_NO_MEMORY;
-    fbl::Array<VmxPage> vmxon_pages(pages, num_cpus);
-    VmxInfo vmx_info;
-    for (auto& page : vmxon_pages) {
-        zx_status_t status = page.Alloc(vmx_info, 0);
-        if (status != ZX_OK)
-            return status;
+        // Enable VMX for all online CPUs.
+        cpu_mask_t cpu_mask = percpu_exec(vmxon_task, &pages);
+        if (cpu_mask != mp_get_online_mask()) {
+            mp_sync_exec(MP_IPI_TARGET_MASK, cpu_mask, vmxoff_task, nullptr);
+            return ZX_ERR_NOT_SUPPORTED;
+        }
+
+        vmxon_pages = fbl::move(pages);
     }
-
-    // Enable VMX for all online CPUs.
-    mp_cpu_mask_t cpu_mask = percpu_exec(vmxon_task, &vmxon_pages);
-    if (cpu_mask != mp_get_online_mask()) {
-        mp_sync_exec(MP_IPI_TARGET_MASK, cpu_mask, vmxoff_task, nullptr);
-        return ZX_ERR_NOT_SUPPORTED;
-    }
-
-    cpu_state->vmxon_pages_ = fbl::move(vmxon_pages);
-    *out = fbl::move(cpu_state);
+    num_guests++;
     return ZX_OK;
 }
 
-VmxCpuState::~VmxCpuState() {
-    mp_sync_exec(MP_IPI_TARGET_ALL, 0, vmxoff_task, nullptr);
-}
-
-zx_status_t alloc_vpid(uint16_t* vpid) {
-    fbl::AutoLock lock(&vmx_mutex);
-    if (num_vcpus == 0) {
-        zx_status_t status = VmxCpuState::Create(&vmx_cpu_state);
-        if (status != ZX_OK)
-            return status;
+zx_status_t free_vmx_state() {
+    fbl::AutoLock lock(&guest_mutex);
+    num_guests--;
+    if (num_guests == 0) {
+        mp_sync_exec(MP_IPI_TARGET_ALL, 0, vmxoff_task, nullptr);
+        vmxon_pages.reset();
     }
-    num_vcpus++;
-    return vmx_cpu_state->AllocId(vpid);
-}
-
-zx_status_t free_vpid(uint16_t vpid) {
-    fbl::AutoLock lock(&vmx_mutex);
-    zx_status_t status = vmx_cpu_state->FreeId(vpid);
-    if (status != ZX_OK)
-        return status;
-    num_vcpus--;
-    if (num_vcpus == 0)
-        vmx_cpu_state.reset();
     return ZX_OK;
 }
 

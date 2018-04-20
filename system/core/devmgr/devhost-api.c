@@ -19,6 +19,10 @@
 
 // LibDriver Device Interface
 
+#define ALLOWED_FLAGS (\
+    DEVICE_ADD_NON_BINDABLE | DEVICE_ADD_INSTANCE |\
+    DEVICE_ADD_MUST_ISOLATE | DEVICE_ADD_INVISIBLE)
+
 __EXPORT zx_status_t device_add_from_driver(zx_driver_t* drv, zx_device_t* parent,
                                             device_add_args_t* args, zx_device_t** out) {
     zx_status_t r;
@@ -33,10 +37,11 @@ __EXPORT zx_status_t device_add_from_driver(zx_driver_t* drv, zx_device_t* paren
     if (!args->ops || args->ops->version != DEVICE_OPS_VERSION) {
         return ZX_ERR_INVALID_ARGS;
     }
-    if (args->flags & ~(DEVICE_ADD_NON_BINDABLE | DEVICE_ADD_INSTANCE | DEVICE_ADD_MUST_ISOLATE)) {
+    if (args->flags & ~ALLOWED_FLAGS) {
         return ZX_ERR_INVALID_ARGS;
     }
-    if ((args->flags & DEVICE_ADD_INSTANCE) && (args->flags & DEVICE_ADD_MUST_ISOLATE)) {
+    if ((args->flags & DEVICE_ADD_INSTANCE) &&
+        (args->flags & (DEVICE_ADD_MUST_ISOLATE | DEVICE_ADD_INVISIBLE))) {
         return ZX_ERR_INVALID_ARGS;
     }
 
@@ -53,6 +58,9 @@ __EXPORT zx_status_t device_add_from_driver(zx_driver_t* drv, zx_device_t* paren
     if (args->flags & DEVICE_ADD_NON_BINDABLE) {
         dev->flags |= DEV_FLAG_UNBINDABLE;
     }
+    if (args->flags & DEVICE_ADD_INVISIBLE) {
+        dev->flags |= DEV_FLAG_INVISIBLE;
+    }
 
     // out must be set before calling devhost_device_add().
     // devhost_device_add() may result in child devices being created before it returns,
@@ -62,13 +70,12 @@ __EXPORT zx_status_t device_add_from_driver(zx_driver_t* drv, zx_device_t* paren
     }
 
     if (args->flags & DEVICE_ADD_MUST_ISOLATE) {
-        r = devhost_device_add(dev, parent, args->props, args->prop_count, args->busdev_args,
-                               args->rsrc);
+        r = devhost_device_add(dev, parent, args->props, args->prop_count, args->proxy_args);
     } else if (args->flags & DEVICE_ADD_INSTANCE) {
         dev->flags |= DEV_FLAG_INSTANCE | DEV_FLAG_UNBINDABLE;
-        r = devhost_device_add(dev, parent, NULL, 0, NULL, ZX_HANDLE_INVALID);
+        r = devhost_device_add(dev, parent, NULL, 0, NULL);
     } else {
-        r = devhost_device_add(dev, parent, args->props, args->prop_count, NULL, ZX_HANDLE_INVALID);
+        r = devhost_device_add(dev, parent, args->props, args->prop_count, NULL);
     }
     if (r != ZX_OK) {
         if (out) {
@@ -89,18 +96,18 @@ __EXPORT zx_status_t device_remove(zx_device_t* dev) {
     return r;
 }
 
-__EXPORT void device_unbind(zx_device_t* dev) {
-    DM_LOCK();
-    devhost_device_unbind(dev);
-    DM_UNLOCK();
-}
-
 __EXPORT zx_status_t device_rebind(zx_device_t* dev) {
     zx_status_t r;
     DM_LOCK();
     r = devhost_device_rebind(dev);
     DM_UNLOCK();
     return r;
+}
+
+__EXPORT void device_make_visible(zx_device_t* dev) {
+    DM_LOCK();
+    devhost_make_visible(dev);
+    DM_UNLOCK();
 }
 
 
@@ -130,15 +137,6 @@ __EXPORT zx_status_t device_get_protocol(zx_device_t* dev, uint32_t proto_id, vo
     return ZX_ERR_NOT_SUPPORTED;
 }
 
-__EXPORT zx_handle_t device_get_resource(zx_device_t* dev) {
-    zx_handle_t h;
-    if (zx_handle_duplicate(dev->resource, ZX_RIGHT_SAME_RIGHTS, &h) < 0) {
-        return ZX_HANDLE_INVALID;
-    } else {
-        return h;
-    }
-}
-
 __EXPORT void device_state_clr_set(zx_device_t* dev, zx_signals_t clearflag, zx_signals_t setflag) {
     zx_object_signal(dev->event, clearflag, setflag);
 }
@@ -163,15 +161,6 @@ __EXPORT zx_status_t device_ioctl(zx_device_t* dev, uint32_t op,
                                   void* out_buf, size_t out_len,
                                   size_t* out_actual) {
     return dev->ops->ioctl(dev->ctx, op, in_buf, in_len, out_buf, out_len, out_actual);
-}
-
-__EXPORT zx_status_t device_iotxn_queue(zx_device_t* dev, iotxn_t* txn) {
-    if (dev->ops->iotxn_queue != NULL) {
-        dev->ops->iotxn_queue(dev->ctx, txn);
-        return ZX_OK;
-    } else {
-        return ZX_ERR_NOT_SUPPORTED;
-    }
 }
 
 // LibDriver Misc Interfaces

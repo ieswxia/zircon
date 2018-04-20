@@ -25,37 +25,36 @@ typedef struct pci_sdhci_device {
     volatile sdhci_regs_t* regs;
     uint64_t regs_size;
     zx_handle_t regs_handle;
+    zx_handle_t bti_handle;
 } pci_sdhci_device_t;
 
-static zx_handle_t pci_sdhci_get_interrupt(void* ctx) {
+static zx_status_t pci_sdhci_get_interrupt(void* ctx, zx_handle_t* handle_out) {
     pci_sdhci_device_t* dev = ctx;
     // select irq mode
-    zx_status_t status = dev->pci.ops->set_irq_mode(dev->pci.ctx, ZX_PCIE_IRQ_MODE_MSI, 1);
+    zx_status_t status = pci_set_irq_mode(&dev->pci, ZX_PCIE_IRQ_MODE_MSI, 1);
     if (status < 0) {
-        status = dev->pci.ops->set_irq_mode(dev->pci.ctx, ZX_PCIE_IRQ_MODE_LEGACY, 1);
+        status = pci_set_irq_mode(&dev->pci, ZX_PCIE_IRQ_MODE_LEGACY, 1);
         if (status < 0) {
             printf("pci-sdhci: error %d setting irq mode\n", status);
             return status;
         }
         printf("pci-sdhci: selected legacy irq mode\n");
     }
-    zx_handle_t irq_handle = ZX_HANDLE_INVALID;
     // get irq handle
-    status = dev->pci.ops->map_interrupt(dev->pci.ctx, 0, &irq_handle);
+    status = pci_map_interrupt(&dev->pci, 0, handle_out);
     if (status != ZX_OK) {
         printf("pci-sdhci: error %d getting irq handle\n", status);
         return status;
     } else {
-        return irq_handle;
+        return ZX_OK;
     }
 }
 
 static zx_status_t pci_sdhci_get_mmio(void* ctx, volatile sdhci_regs_t** out) {
     pci_sdhci_device_t* dev = ctx;
     if (dev->regs == NULL) {
-        zx_status_t status = dev->pci.ops->map_resource(dev->pci.ctx, PCI_RESOURCE_BAR_0,
-                ZX_CACHE_POLICY_UNCACHED_DEVICE, (void**)&dev->regs,
-                &dev->regs_size, &dev->regs_handle);
+        zx_status_t status = pci_map_bar(&dev->pci, 0u, ZX_CACHE_POLICY_UNCACHED_DEVICE,
+                (void**)&dev->regs, &dev->regs_size, &dev->regs_handle);
         if (status != ZX_OK) {
             printf("pci-sdhci: error %d mapping register window\n", status);
             return status;
@@ -65,16 +64,23 @@ static zx_status_t pci_sdhci_get_mmio(void* ctx, volatile sdhci_regs_t** out) {
     return ZX_OK;
 }
 
+static zx_status_t pci_sdhci_get_bti(void* ctx, uint32_t index, zx_handle_t* out_handle) {
+    pci_sdhci_device_t* dev = ctx;
+    if (dev->bti_handle == ZX_HANDLE_INVALID) {
+        zx_status_t st = pci_get_bti(&dev->pci, index, &dev->bti_handle);
+        if (st != ZX_OK) {
+            return st;
+        }
+    }
+    return zx_handle_duplicate(dev->bti_handle, ZX_RIGHT_SAME_RIGHTS, out_handle);
+}
+
 static uint32_t pci_sdhci_get_base_clock(void* ctx) {
     return 0;
 }
 
-static zx_paddr_t pci_sdhci_get_dma_offset(void* ctx) {
-    return 0;
-}
-
 static uint64_t pci_sdhci_get_quirks(void* ctx) {
-    return 0;
+    return SDHCI_QUIRK_STRIP_RESPONSE_CRC_PRESERVE_ORDER;
 }
 
 static void pci_sdhci_hw_reset(void* ctx) {
@@ -96,8 +102,8 @@ static void pci_sdhci_hw_reset(void* ctx) {
 static sdhci_protocol_ops_t pci_sdhci_sdhci_proto = {
     .get_interrupt = pci_sdhci_get_interrupt,
     .get_mmio = pci_sdhci_get_mmio,
+    .get_bti = pci_sdhci_get_bti,
     .get_base_clock = pci_sdhci_get_base_clock,
-    .get_dma_offset = pci_sdhci_get_dma_offset,
     .get_quirks = pci_sdhci_get_quirks,
     .hw_reset = pci_sdhci_hw_reset,
 };
@@ -112,6 +118,7 @@ static void pci_sdhci_release(void* ctx) {
     if (dev->regs != NULL) {
         zx_handle_close(dev->regs_handle);
     }
+    zx_handle_close(dev->bti_handle);
     free(dev);
 }
 
@@ -121,7 +128,7 @@ static zx_protocol_device_t pci_sdhci_device_proto = {
     .release = pci_sdhci_release,
 };
 
-static zx_status_t pci_sdhci_bind(void* ctx, zx_device_t* parent, void** cookie) {
+static zx_status_t pci_sdhci_bind(void* ctx, zx_device_t* parent) {
     printf("pci-sdhci: bind\n");
     pci_sdhci_device_t* dev = calloc(1, sizeof(pci_sdhci_device_t));
     if (!dev) {

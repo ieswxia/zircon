@@ -34,13 +34,7 @@ typedef struct zx_driver_ops {
 
     // Requests that the driver bind to the provided device,
     // initialize it, and publish and children.
-    // On success, the cookie is remembered and passed back on unbind.
-    zx_status_t (*bind)(void* ctx, zx_device_t* device, void** cookie);
-
-    // Notifies driver that the device which the driver bound to
-    // is being removed.  Called after the unbind() op of any devices
-    // that are children of that device.
-    void (*unbind)(void* ctx, zx_device_t* device, void* cookie);
+    zx_status_t (*bind)(void* ctx, zx_device_t* device);
 
     // Only provided by bus manager drivers, create() is invoked to
     // instantiate a bus device instance in a new device host process
@@ -56,35 +50,55 @@ typedef struct zx_driver_ops {
 #define DEVICE_ADD_ARGS_VERSION 0x96a64134d56e88e3
 
 enum {
+    // Do not attempt to bind drivers to this device automatically
     DEVICE_ADD_NON_BINDABLE = (1 << 0),
+
+    // This is a device instance (not visible in devfs or eligible for binding)
     DEVICE_ADD_INSTANCE     = (1 << 1),
+
+    // Children of this device will be loaded in their own devhost process,
+    // behind a proxy of this device
     DEVICE_ADD_MUST_ISOLATE = (1 << 2),
+
+    // This device will not be visible in devfs or available for binding
+    // until device_make_visible() is called on it.
+    DEVICE_ADD_INVISIBLE    = (1 << 3),
 };
 
 // Device Manager API
 typedef struct device_add_args {
-    uint64_t version;   // DEVICE_ADD_ARGS_VERSION
-    // driver name is copied to internal structure
+    // DEVICE_ADD_ARGS_VERSION
+    uint64_t version;
+
+    // Driver name is copied to internal structure
     // max length is ZX_DEVICE_NAME_MAX
     const char* name;
-    // context pointer for use by the driver
+
+    // Context pointer for use by the driver
     // and passed to driver in all zx_protocol_device_t callbacks
     void* ctx;
-    // pointer to device's device protocol operations
+
+    // Pointer to device's device protocol operations
     zx_protocol_device_t* ops;
-    // optional list of device properties
+
+    // Optional list of device properties
     zx_device_prop_t* props;
-    // number of device properties
+
+    // Number of device properties
     uint32_t prop_count;
-    // optional custom protocol for this device
+
+    // Optional custom protocol for this device
     uint32_t proto_id;
-    // optional custom protocol operations for this device
+
+    // Optional custom protocol operations for this device
     void* proto_ops;
-    // arguments used with DEVICE_ADD_BUSDEV
-    const char* busdev_args;
-    // resource handle used with DEVICE_ADD_BUSDEV
-     zx_handle_t rsrc;
-    // one or more of DEVICE_ADD_*
+
+    // Arguments used with DEVICE_ADD_MUST_ISOLATE
+    // these will be passed to the create() driver op of
+    // the proxy device in the new devhost
+    const char* proxy_args;
+
+    // One or more of DEVICE_ADD_*
     uint32_t flags;
 } device_add_args_t;
 
@@ -114,8 +128,7 @@ static inline zx_status_t device_add(zx_device_t* parent, device_add_args_t* arg
 
 zx_status_t device_remove(zx_device_t* device);
 zx_status_t device_rebind(zx_device_t* device);
-
-void device_unbind(zx_device_t* dev);
+void device_make_visible(zx_device_t* device);
 
 #define ROUNDUP(a, b)   (((a) + ((b)-1)) & ~((b)-1))
 #define ROUNDDOWN(a, b) ((a) & ~((b)-1))

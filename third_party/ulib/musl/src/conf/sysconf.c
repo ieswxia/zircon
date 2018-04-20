@@ -2,7 +2,8 @@
 #include <errno.h>
 #include <limits.h>
 #include <signal.h>
-#include <sys/resource.h>
+#include <stdint.h>
+#include <threads.h>
 #include <unistd.h>
 
 #include <zircon/syscalls.h>
@@ -18,16 +19,15 @@
 #define JT_PHYS_PAGES JT(8)
 #define JT_AVPHYS_PAGES JT(9)
 #define JT_ZERO JT(10)
-
-#define RLIM(x) (-32768 | (RLIMIT_##x))
+#define JT_CHILD_MAX JT(11)
 
 long sysconf(int name) {
     static const short values[] = {
             [_SC_ARG_MAX] = JT_ARG_MAX,
-            [_SC_CHILD_MAX] = RLIM(NPROC),
+            [_SC_CHILD_MAX] = JT_CHILD_MAX,
             [_SC_CLK_TCK] = 100,
             [_SC_NGROUPS_MAX] = 32,
-            [_SC_OPEN_MAX] = RLIM(NOFILE),
+            [_SC_OPEN_MAX] = 256,
             [_SC_STREAM_MAX] = -1,
             [_SC_TZNAME_MAX] = TZNAME_MAX,
             [_SC_JOB_CONTROL] = 1,
@@ -81,7 +81,7 @@ long sysconf(int name) {
             [_SC_GETPW_R_SIZE_MAX] = -1,
             [_SC_LOGIN_NAME_MAX] = 256,
             [_SC_TTY_NAME_MAX] = TTY_NAME_MAX,
-            [_SC_THREAD_DESTRUCTOR_ITERATIONS] = PTHREAD_DESTRUCTOR_ITERATIONS,
+            [_SC_THREAD_DESTRUCTOR_ITERATIONS] = TSS_DTOR_ITERATIONS,
             [_SC_THREAD_KEYS_MAX] = PTHREAD_KEYS_MAX,
             [_SC_THREAD_STACK_MIN] = PTHREAD_STACK_MIN,
             [_SC_THREAD_THREADS_MAX] = -1,
@@ -165,15 +165,11 @@ long sysconf(int name) {
             [_SC_THREAD_ROBUST_PRIO_PROTECT] = -1,
     };
 
-    if (name >= sizeof(values) / sizeof(values[0]) || !values[name]) {
+    if (name < 0 || (size_t)name >= sizeof(values) / sizeof(values[0]) || !values[name]) {
         errno = EINVAL;
         return -1;
     } else if (values[name] >= -1) {
         return values[name];
-    } else if (values[name] < -256) {
-        struct rlimit lim;
-        getrlimit(values[name] & 16383, &lim);
-        return lim.rlim_cur > LONG_MAX ? LONG_MAX : lim.rlim_cur;
     }
 
     switch ((unsigned char)values[name]) {
@@ -208,6 +204,8 @@ long sysconf(int name) {
         return -1;
     case JT_ZERO & 255:
         return 0;
+    case JT_CHILD_MAX & 255:
+        return UINT32_MAX;
     }
     return values[name];
 }

@@ -10,10 +10,10 @@ MODULE_TYPE := userlib
 MODULE_GROUP := test
 
 MODULE_SRCS += \
-    $(LOCAL_DIR)/all-tests.c \
-    $(LOCAL_DIR)/crash-handler.c \
-    $(LOCAL_DIR)/crash-list.c \
-    $(LOCAL_DIR)/unittest.c \
+    $(LOCAL_DIR)/all-tests.cpp \
+    $(LOCAL_DIR)/crash-handler.cpp \
+    $(LOCAL_DIR)/crash-list.cpp \
+    $(LOCAL_DIR)/unittest.cpp \
 
 MODULE_SO_NAME := unittest
 
@@ -22,6 +22,8 @@ MODULE_LIBS := system/ulib/c system/ulib/zircon
 
 MODULE_STATIC_LIBS := system/ulib/pretty
 
+MODULE_PACKAGE := src
+
 include make/module.mk
 
 MODULE := $(LOCAL_DIR).hostlib
@@ -29,8 +31,8 @@ MODULE := $(LOCAL_DIR).hostlib
 MODULE_TYPE := hostlib
 
 MODULE_SRCS += \
-    $(LOCAL_DIR)/all-tests.c \
-    $(LOCAL_DIR)/unittest.c \
+    $(LOCAL_DIR)/all-tests.cpp \
+    $(LOCAL_DIR)/unittest.cpp \
 
 MODULE_HOST_LIBS := system/ulib/pretty
 

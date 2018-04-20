@@ -5,10 +5,10 @@
 #include "ethertap.h"
 
 #include <ddk/debug.h>
-#include <zircon/compiler.h>
 #include <fbl/auto_lock.h>
 #include <fbl/type_support.h>
 #include <pretty/hexdump.h>
+#include <zircon/compiler.h>
 
 #include <stdio.h>
 #include <string.h>
@@ -16,7 +16,7 @@
 // This macro allows for per-device tracing rather than enabling tracing for the whole driver
 // TODO(tkilbourn): decide whether this is worth the effort
 #define ethertap_trace(args...) \
-  do { if (unlikely(options_ & ETHERTAP_OPT_TRACE)) dprintf(INFO, "ethertap: " args); } while (0)
+  do { if (unlikely(options_ & ETHERTAP_OPT_TRACE)) zxlogf(INFO, "ethertap: " args); } while (0)
 
 namespace eth {
 
@@ -35,14 +35,21 @@ zx_status_t TapCtl::DdkIoctl(uint32_t op, const void* in_buf, size_t in_len, voi
             return ZX_ERR_INVALID_ARGS;
         }
 
+        ethertap_ioctl_config_t config;
+        memcpy(&config, in_buf, in_len);
+
+        if (config.mtu > ETHERTAP_MAX_MTU) {
+            return ZX_ERR_INVALID_ARGS;
+        }
+
         zx::socket local, remote;
-        zx_status_t status = zx::socket::create(ZX_SOCKET_DATAGRAM, &local, &remote);
+        uint32_t sockopt = ZX_SOCKET_DATAGRAM |
+                           ((config.options & ETHERTAP_OPT_REPORT_PARAM) ? ZX_SOCKET_HAS_CONTROL : 0);
+        zx_status_t status = zx::socket::create(sockopt, &local, &remote);
         if (status != ZX_OK) {
             return status;
         }
 
-        ethertap_ioctl_config_t config;
-        memcpy(&config, in_buf, in_len);
         config.name[ETHERTAP_MAX_NAME_LEN] = '\0';
 
         auto tap = fbl::unique_ptr<eth::TapDevice>(
@@ -50,15 +57,15 @@ zx_status_t TapCtl::DdkIoctl(uint32_t op, const void* in_buf, size_t in_len, voi
 
         status = tap->DdkAdd(config.name);
         if (status != ZX_OK) {
-            dprintf(ERROR, "tapctl: could not add tap device: %d\n", status);
+            zxlogf(ERROR, "tapctl: could not add tap device: %d\n", status);
         } else {
             // devmgr owns the memory until release is called
-            tap.release();
+            __UNUSED auto ptr = tap.release();
 
             zx_handle_t* out = reinterpret_cast<zx_handle_t*>(out_buf);
             *out = remote.release();
             *out_actual = sizeof(zx_handle_t);
-            dprintf(INFO, "tapctl: created ethertap device '%s'\n", config.name);
+            zxlogf(INFO, "tapctl: created ethertap device '%s'\n", config.name);
         }
         return status;
     }
@@ -82,6 +89,7 @@ TapDevice::TapDevice(zx_device_t* device, const ethertap_ioctl_config* config, z
     data_(fbl::move(data)) {
     ZX_DEBUG_ASSERT(data_.is_valid());
     memcpy(mac_, config->mac, 6);
+
     int ret = thrd_create_with_name(&thread_, tap_device_thread, reinterpret_cast<void*>(this),
                                     "ethertap-thread");
     ZX_DEBUG_ASSERT(ret == thrd_success);
@@ -128,17 +136,79 @@ zx_status_t TapDevice::EthmacStart(fbl::unique_ptr<ddk::EthmacIfcProxy> proxy) {
     return ZX_OK;
 }
 
-void TapDevice::EthmacSend(uint32_t options, void* data, size_t length) {
+zx_status_t TapDevice::EthmacQueueTx(uint32_t options, ethmac_netbuf_t* netbuf) {
+    fbl::AutoLock lock(&lock_);
+    if (dead_) {
+        return ZX_ERR_PEER_CLOSED;
+    }
+    uint8_t temp_buf[ETHERTAP_MAX_MTU + sizeof(ethertap_socket_header_t)];
+    auto header = reinterpret_cast<ethertap_socket_header*>(temp_buf);
+    uint8_t* data = temp_buf + sizeof(ethertap_socket_header_t);
+    size_t length = netbuf->len;
     ZX_DEBUG_ASSERT(length <= mtu_);
+    memcpy(data, netbuf->data, length);
+    header->type = ETHERTAP_MSG_PACKET;
+
     if (unlikely(options_ & ETHERTAP_OPT_TRACE_PACKETS)) {
-        fbl::AutoLock lock(&lock_);
         ethertap_trace("sending %zu bytes\n", length);
         hexdump8_ex(data, length, 0);
     }
-    zx_status_t status = data_.write(0u, data, length, nullptr);
+    zx_status_t status = data_.write(0u, temp_buf, length + sizeof(ethertap_socket_header_t),
+                                     nullptr);
     if (status != ZX_OK) {
-        dprintf(ERROR, "ethertap: EthmacSend error writing: %d\n", status);
+        zxlogf(ERROR, "ethertap: EthmacQueueTx error writing: %d\n", status);
     }
+    // returning ZX_ERR_SHOULD_WAIT indicates that we will call complete_tx(), which we will not
+    return status == ZX_ERR_SHOULD_WAIT ? ZX_ERR_UNAVAILABLE : status;
+}
+
+zx_status_t TapDevice::EthmacSetParam(uint32_t param, int32_t value, void* data) {
+    fbl::AutoLock lock(&lock_);
+    if (!(options_ & ETHERTAP_OPT_REPORT_PARAM) || dead_) {
+        return ZX_ERR_NOT_SUPPORTED;
+    }
+
+    struct {
+        ethertap_socket_header_t header;
+        ethertap_setparam_report_t report;
+    } send_buf = {};
+
+    send_buf.header.type = ETHERTAP_MSG_PARAM_REPORT;
+    send_buf.report.param = param;
+    send_buf.report.value = value;
+    send_buf.report.data_length = 0;
+    switch (param) {
+    case ETHMAC_SETPARAM_MULTICAST_FILTER:
+        if (value == ETHMAC_MULTICAST_FILTER_OVERFLOW) {
+            break;
+        }
+        // Send the final byte of each address, sorted lowest-to-highest.
+        uint32_t i;
+        for (i = 0; i < static_cast<uint32_t>(value) && i < sizeof(send_buf.report.data); i++) {
+            send_buf.report.data[i] = static_cast<uint8_t*>(data)[i * ETH_MAC_SIZE + 5];
+        }
+        send_buf.report.data_length = i;
+        qsort(send_buf.report.data, send_buf.report.data_length, 1,
+              [](const void* ap, const void* bp) {
+                  int a = *static_cast<const uint8_t*>(ap);
+                  int b = *static_cast<const uint8_t*>(bp);
+                  return a < b ? -1 : (a > 1 ? 1 : 0);
+              });
+        break;
+    default:
+        break;
+    }
+    zx_status_t status = data_.write(0, &send_buf, sizeof(send_buf), nullptr);
+    if (status != ZX_OK) {
+        ethertap_trace("error writing SetParam info to socket: %d\n", status);
+    }
+    // A failure of data_.write is not a simulated failure of hardware under test, so log it but
+    // don't report failure on the SetParam attempt.
+    return ZX_OK;
+}
+
+zx_handle_t TapDevice::EthmacGetBti() {
+    return ZX_HANDLE_INVALID;
 }
 
 int TapDevice::Thread() {
@@ -150,13 +220,13 @@ int TapDevice::Thread() {
     const zx_signals_t wait = ZX_SOCKET_READABLE | ZX_SOCKET_PEER_CLOSED | ETHERTAP_SIGNAL_ONLINE
         | ETHERTAP_SIGNAL_OFFLINE | TAP_SHUTDOWN;
     while (true) {
-        status = data_.wait_one(wait, ZX_TIME_INFINITE, &pending);
+        status = data_.wait_one(wait, zx::time::infinite(), &pending);
         if (status != ZX_OK) {
             ethertap_trace("error waiting on data: %d\n", status);
             break;
         }
 
-        if (pending & (ETHERTAP_SIGNAL_OFFLINE|ETHERTAP_SIGNAL_ONLINE)) {
+        if (pending & (ETHERTAP_SIGNAL_OFFLINE | ETHERTAP_SIGNAL_ONLINE)) {
             status = UpdateLinkStatus(pending);
             if (status != ZX_OK) {
                 break;
@@ -178,9 +248,12 @@ int TapDevice::Thread() {
             break;
         }
     }
-
-    dprintf(INFO, "ethertap: device '%s' destroyed\n", name());
-    data_.reset();
+    {
+        fbl::AutoLock lock(&lock_);
+        dead_ = true;
+        zxlogf(INFO, "ethertap: device '%s' destroyed\n", name());
+        data_.reset();
+    }
     DdkRemove();
 
     return static_cast<int>(status);
@@ -199,7 +272,7 @@ zx_status_t TapDevice::UpdateLinkStatus(zx_signals_t observed) {
     zx_signals_t clear = 0;
 
     if (observed_online(observed) && observed_offline(observed)) {
-        dprintf(ERROR, "ethertap: error asserting both online and offline\n");
+        zxlogf(ERROR, "ethertap: error asserting both online and offline\n");
         return ZX_ERR_BAD_STATE;
     }
 
@@ -224,7 +297,7 @@ zx_status_t TapDevice::UpdateLinkStatus(zx_signals_t observed) {
     if (clear) {
         zx_status_t status = data_.signal(clear, 0);
         if (status != ZX_OK) {
-            dprintf(ERROR, "ethertap: could not clear status signals: %d\n", status);
+            zxlogf(ERROR, "ethertap: could not clear status signals: %d\n", status);
             return status;
         }
     }
@@ -235,7 +308,7 @@ zx_status_t TapDevice::Recv(uint8_t* buffer, uint32_t capacity) {
     size_t actual = 0;
     zx_status_t status = data_.read(0u, buffer, capacity, &actual);
     if (status != ZX_OK) {
-        dprintf(ERROR, "ethertap: error reading data: %d\n", status);
+        zxlogf(ERROR, "ethertap: error reading data: %d\n", status);
         return status;
     }
 
@@ -256,10 +329,10 @@ extern "C" zx_status_t tapctl_bind(void* ctx, zx_device_t* device, void** cookie
     auto dev = fbl::unique_ptr<eth::TapCtl>(new eth::TapCtl(device));
     zx_status_t status = dev->DdkAdd("tapctl");
     if (status != ZX_OK) {
-        dprintf(ERROR, "%s: could not add device: %d\n", __func__, status);
+        zxlogf(ERROR, "%s: could not add device: %d\n", __func__, status);
     } else {
         // devmgr owns the memory now
-        dev.release();
+        __UNUSED auto ptr = dev.release();
     }
     return status;
 }

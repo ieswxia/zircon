@@ -55,8 +55,9 @@ typedef struct __attribute__((packed)) intel_serialio_i2c_regs {
 _Static_assert(sizeof(intel_serialio_i2c_regs) <= 0x200, "bad struct");
 
 enum {
-    I2C_MAX_FAST_SPEED_HZ = 400000,
-    I2C_MAX_STANDARD_SPEED_HZ = 100000,
+    I2C_MAX_FAST_PLUS_SPEED_HZ = 1000000,
+    I2C_MAX_FAST_SPEED_HZ      = 400000,
+    I2C_MAX_STANDARD_SPEED_HZ  = 100000,
 };
 
 enum {
@@ -139,6 +140,18 @@ typedef struct intel_serialio_i2c_device {
 
     uint32_t controller_freq;
     uint32_t bus_freq;
+
+    // Bus parameters
+    uint16_t sda_hold;
+    // Standard speed parameters
+    uint16_t ss_scl_hcnt;
+    uint16_t ss_scl_lcnt;
+    // Fast mode speed parameters
+    uint16_t fs_scl_hcnt;
+    uint16_t fs_scl_lcnt;
+    // Fast mode plus speed parameters
+    uint16_t fmp_scl_hcnt;
+    uint16_t fmp_scl_lcnt;
 
     struct list_node slave_list;
 

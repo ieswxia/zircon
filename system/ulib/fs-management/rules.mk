@@ -9,14 +9,19 @@ MODULE := $(LOCAL_DIR)
 MODULE_TYPE := userlib
 
 MODULE_SRCS += \
-    $(LOCAL_DIR)/fsck.c \
-    $(LOCAL_DIR)/launch.c \
-    $(LOCAL_DIR)/mkfs.c \
-    $(LOCAL_DIR)/mount.c \
-    $(LOCAL_DIR)/ramdisk.c \
+    $(LOCAL_DIR)/fsck.cpp \
+    $(LOCAL_DIR)/launch.cpp \
+    $(LOCAL_DIR)/mkfs.cpp \
+    $(LOCAL_DIR)/mount.cpp \
+    $(LOCAL_DIR)/ram-nand.cpp \
+    $(LOCAL_DIR)/ramdisk.cpp \
 
 MODULE_STATIC_LIBS := \
+    system/ulib/fbl \
+    system/ulib/ddk \
     system/ulib/fs \
+    system/ulib/zx \
+    system/ulib/zxcpp \
 
 MODULE_LIBS := \
     system/ulib/launchpad \

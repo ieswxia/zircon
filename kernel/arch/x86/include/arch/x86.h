@@ -9,13 +9,16 @@
 
 #pragma once
 
-#include <zircon/compiler.h>
 #include <sys/types.h>
 #include <stdlib.h>
 #include <stdbool.h>
+#include <zircon/compiler.h>
+#include <zircon/types.h>
 
 #include <arch/x86/general_regs.h>
 #include <arch/x86/registers.h>
+#include <syscalls/syscalls.h>
+#include <zircon/compiler.h>
 
 __BEGIN_CDECLS
 
@@ -33,7 +36,7 @@ struct x86_64_iframe {
 typedef struct x86_64_iframe x86_iframe_t;
 
 void x86_exception_handler(x86_iframe_t *frame);
-enum handler_return platform_irq(x86_iframe_t *frame);
+void platform_irq(x86_iframe_t *frame);
 
 struct arch_exception_context {
     bool is_page_fault;
@@ -49,20 +52,9 @@ struct x86_64_context_switch_frame {
     uint64_t rip;
 };
 
-struct x86_64_syscall_result {
-    // The assembler relies on the fact that the ABI will return this in
-    // rax,rdx so we use plain types here to ensure this.
-    uint64_t status;
-    // Non-zero if thread was signaled.
-    uint64_t is_signaled;
-};
-
 void x86_64_context_switch(vaddr_t *oldsp, vaddr_t newsp);
 void x86_uspace_entry(uintptr_t arg1, uintptr_t arg2, uintptr_t sp,
                       uintptr_t pc, uint64_t rflags) __NO_RETURN;
-
-struct x86_64_syscall_result unknown_syscall(
-    uint64_t syscall_num, uint64_t ip);
 
 void x86_syscall(void);
 
@@ -93,7 +85,7 @@ void x86_init_smp(uint32_t *apic_ids, uint32_t num_cpus);
  * @return ZX_ERR_BAD_STATE if one of the targets is currently online
  * @return ZX_ERR_TIMED_OUT if one of the targets failed to launch
  */
-status_t x86_bringup_aps(uint32_t *apic_ids, uint32_t count);
+zx_status_t x86_bringup_aps(uint32_t *apic_ids, uint32_t count);
 
 #define IO_BITMAP_BITS      65536
 #define IO_BITMAP_BYTES     (IO_BITMAP_BITS/8)
@@ -353,7 +345,20 @@ static inline uint64_t read_msr (uint32_t msr_id)
     return ((uint64_t)msr_read_val_hi << 32) | msr_read_val_lo;
 }
 
-status_t read_msr_safe(uint32_t msr_id, uint64_t *val);
+static inline uint32_t read_msr32 (uint32_t msr_id)
+{
+    uint32_t msr_read_val;
+
+    __asm__ __volatile__ (
+        "rdmsr \n\t"
+        : "=a" (msr_read_val)
+        : "c" (msr_id)
+        : "rdx");
+
+    return msr_read_val;
+}
+
+zx_status_t read_msr_safe(uint32_t msr_id, uint64_t *val);
 
 static inline void write_msr (uint32_t msr_id, uint64_t msr_write_val)
 {
@@ -510,5 +515,9 @@ static inline void outpdrep(uint16_t _port, uint32_t *_buffer,
                           "S" (_buffer),
                           "c" (_writes));
 }
+
+void x86_monitor(volatile void* addr);
+void x86_mwait(void);
+void x86_idle(void);
 
 __END_CDECLS

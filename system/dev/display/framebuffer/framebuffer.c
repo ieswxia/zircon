@@ -15,7 +15,6 @@
 #include <zircon/listnode.h>
 #include <zircon/process.h>
 
-#include <zircon/device/console.h>
 #include <zircon/device/display.h>
 
 typedef struct fbi fbi_t;
@@ -103,16 +102,11 @@ static zx_status_t fbi_ioctl(void* ctx, uint32_t op,
     fbi_t* fbi = ctx;
     fb_t* fb = fbi->fb;
     zx_status_t r;
+    if (!fb->zxdev) {
+        return ZX_ERR_PEER_CLOSED;
+    }
 
     switch (op) {
-    case IOCTL_DISPLAY_SET_FULLSCREEN:
-        //TODO: remove compat stub once no longer needed
-        return ZX_OK;
-
-    case IOCTL_CONSOLE_SET_ACTIVE_VC:
-        //TODO: remove compat stub once no longer needed
-        return ZX_OK;
-
     case IOCTL_DISPLAY_FLUSH_FB_REGION: {
         if (in_len != sizeof(ioctl_display_region_t)) {
             return ZX_ERR_INVALID_ARGS;
@@ -126,6 +120,10 @@ static zx_status_t fbi_ioctl(void* ctx, uint32_t op,
         }
         uint32_t linesize = fb->info.stride * fb->info.pixelsize;
         mtx_lock(&fb->lock);
+        if (!fb->zxdev) {
+            mtx_unlock(&fb->lock);
+            return ZX_ERR_PEER_CLOSED;
+        }
         if ((fb->active == fbi->group) && (fbi->buffer != NULL)) {
             memcpy(fb->buffer + y * linesize, fbi->buffer + y * linesize, h * linesize);
             FB_FLUSH(fb);
@@ -135,6 +133,10 @@ static zx_status_t fbi_ioctl(void* ctx, uint32_t op,
     }
     case IOCTL_DISPLAY_FLUSH_FB:
         mtx_lock(&fb->lock);
+        if (!fb->zxdev) {
+            mtx_unlock(&fb->lock);
+            return ZX_ERR_PEER_CLOSED;
+        }
         if ((fb->active == fbi->group) && (fbi->buffer != NULL)) {
             memcpy(fb->buffer, fbi->buffer, fb->bufsz);
             FB_FLUSH(fb);
@@ -185,6 +187,10 @@ static zx_status_t fbi_ioctl(void* ctx, uint32_t op,
             return ZX_OK;
         }
         mtx_lock(&fb->lock);
+        if (!fb->zxdev) {
+            mtx_unlock(&fb->lock);
+            return ZX_ERR_PEER_CLOSED;
+        }
         if ((*n == GROUP_VIRTCON) || (fb->fullscreen == NULL)) {
             fb->active = GROUP_VIRTCON;
             zx_object_signal(fb->event, ZX_USER_SIGNAL_1, ZX_USER_SIGNAL_0);
@@ -206,7 +212,7 @@ static zx_status_t fbi_ioctl(void* ctx, uint32_t op,
             return ZX_ERR_INVALID_ARGS;
         }
         zx_handle_t* out = (zx_handle_t*) out_buf;
-        if ((r = zx_handle_duplicate(fb->event, ZX_RIGHT_READ | ZX_RIGHT_TRANSFER | ZX_RIGHT_DUPLICATE, out)) < 0) {
+        if ((r = zx_handle_duplicate(fb->event, ZX_RIGHTS_BASIC | ZX_RIGHT_READ, out)) < 0) {
             return r;
         } else {
             *out_actual = sizeof(zx_handle_t);
@@ -253,6 +259,9 @@ zx_protocol_device_t fbi_ops = {
 
 static zx_status_t fb_open_at(void* ctx, zx_device_t** out, const char* path, uint32_t flags) {
     fb_t* fb = ctx;
+    if (!fb->zxdev) {
+        return ZX_ERR_PEER_CLOSED;
+    }
 
     uint32_t group;
     if (!strcmp(path, "virtcon")) {
@@ -282,6 +291,10 @@ static zx_status_t fb_open_at(void* ctx, zx_device_t** out, const char* path, ui
     // otherwise the fullscreen client becomes active
     if (!FB_HAS_GPU(fb)) {
         mtx_lock(&fb->lock);
+        if (!fb->zxdev) {
+            mtx_unlock(&fb->lock);
+            return ZX_ERR_PEER_CLOSED;
+        }
         if (fbi->group == GROUP_FULLSCREEN) {
             if (fb->fullscreen != NULL) {
                 mtx_unlock(&fb->lock);
@@ -308,6 +321,15 @@ static zx_status_t fb_open(void* ctx, zx_device_t** out, uint32_t flags) {
     return fb_open_at(ctx, out, "", flags);
 }
 
+static void fb_unbind(void* ctx) {
+    fb_t* fb = ctx;
+    zx_device_t* dev = fb->zxdev;
+    mtx_lock(&fb->lock);
+    fb->zxdev = NULL;
+    mtx_unlock(&fb->lock);
+    device_remove(dev);
+}
+
 static void fb_release(void* ctx) {
     fb_t* fb = ctx;
     zx_handle_close(fb->event);
@@ -318,10 +340,11 @@ static zx_protocol_device_t fb_ops = {
     .version = DEVICE_OPS_VERSION,
     .open = fb_open,
     .open_at = fb_open_at,
+    .unbind = fb_unbind,
     .release = fb_release,
 };
 
-static zx_status_t fb_bind(void* ctx, zx_device_t* dev, void** cookie) {
+static zx_status_t fb_bind(void* ctx, zx_device_t* dev) {
     fb_t* fb;
     if ((fb = calloc(1, sizeof(fb_t))) == NULL) {
         return ZX_ERR_NO_MEMORY;
@@ -346,23 +369,7 @@ static zx_status_t fb_bind(void* ctx, zx_device_t* dev, void** cookie) {
     }
     zx_object_signal(fb->event, 0, ZX_USER_SIGNAL_0);
 
-    // Our display drivers do not initialize pixelsize
-    // Determine it based on pixel format
-    switch (fb->info.format) {
-    case ZX_PIXEL_FORMAT_RGB_565:
-        fb->info.pixelsize = 2;
-        break;
-    case ZX_PIXEL_FORMAT_RGB_x888:
-    case ZX_PIXEL_FORMAT_ARGB_8888:
-        fb->info.pixelsize = 4;
-        break;
-    case ZX_PIXEL_FORMAT_RGB_332:
-        fb->info.pixelsize = 1;
-        break;
-    case ZX_PIXEL_FORMAT_RGB_2220:
-        fb->info.pixelsize = 1;
-        break;
-    default:
+    if ((fb->info.pixelsize = ZX_PIXEL_FORMAT_BYTES(fb->info.format)) == 0) {
         printf("fb: unknown format %u\n", fb->info.format);
         r = ZX_ERR_NOT_SUPPORTED;
         goto fail;

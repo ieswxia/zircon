@@ -4,15 +4,15 @@
 
 #include "ethernet.h"
 
+#include <assert.h>
+#include <limits.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 
+#include <ddk/debug.h>
 #include <ddk/io-buffer.h>
 #include <ddk/protocol/ethernet.h>
-#include <zircon/assert.h>
-#include <zircon/status.h>
-#include <zircon/types.h>
 #include <fbl/algorithm.h>
 #include <fbl/alloc_checker.h>
 #include <fbl/auto_call.h>
@@ -21,6 +21,9 @@
 #include <pretty/hexdump.h>
 #include <virtio/net.h>
 #include <virtio/virtio.h>
+#include <zircon/assert.h>
+#include <zircon/status.h>
+#include <zircon/types.h>
 
 #include "ring.h"
 #include "trace.h"
@@ -45,7 +48,7 @@ const size_t kL1EthHdrLen = 26;
 // The goal here is to allocate single-page I/O buffers.
 const size_t kFrameSize = sizeof(virtio_net_hdr_t) + kL1EthHdrLen + kVirtioMtu;
 const size_t kFramesInBuf = PAGE_SIZE / kFrameSize;
-const size_t kNumIoBufs = fbl::roundup(kBacklog * 2, kFramesInBuf) / kFramesInBuf;
+const size_t kNumIoBufs = fbl::round_up(kBacklog * 2, kFramesInBuf) / kFramesInBuf;
 
 const uint16_t kRxId = 0u;
 const uint16_t kTxId = 1u;
@@ -74,7 +77,6 @@ zx_protocol_device_t kDeviceOps = {
     virtio_net_release,
     nullptr, // read
     nullptr, // write
-    nullptr, // iotxn_queue
     nullptr, // get_size
     nullptr, // ioctl
     nullptr, // suspend
@@ -98,31 +100,39 @@ zx_status_t virtio_net_start(void* ctx, ethmac_ifc_t* ifc, void* cookie) {
     return eth->Start(ifc, cookie);
 }
 
-void virtio_net_send(void* ctx, uint32_t options, void* data, size_t length) {
+zx_status_t virtio_net_queue_tx(void* ctx, uint32_t options, ethmac_netbuf_t* netbuf) {
     virtio::EthernetDevice* eth = static_cast<virtio::EthernetDevice*>(ctx);
-    eth->Send(options, data, length);
+    return eth->QueueTx(options, netbuf);
+}
+
+static zx_status_t virtio_set_param(void* ctx, uint32_t param, int32_t value, void* data) {
+    return ZX_ERR_NOT_SUPPORTED;
 }
 
 ethmac_protocol_ops_t kProtoOps = {
-    virtio_net_query, virtio_net_stop, virtio_net_start, virtio_net_send,
-    nullptr, // queue_rx
-    nullptr, // queue_tx
+    virtio_net_query,
+    virtio_net_stop,
+    virtio_net_start,
+    virtio_net_queue_tx,
+    virtio_set_param,
+    NULL, // get_bti not implemented because we don't have FEATURE_DMA
 };
 
 // I/O buffer helpers
-zx_status_t InitBuffers(fbl::unique_ptr<io_buffer_t[]>* out) {
+zx_status_t InitBuffers(const zx::bti& bti, fbl::unique_ptr<io_buffer_t[]>* out) {
     zx_status_t rc;
     fbl::AllocChecker ac;
     fbl::unique_ptr<io_buffer_t[]> bufs(new (&ac) io_buffer_t[kNumIoBufs]);
     if (!ac.check()) {
-        VIRTIO_ERROR("out of memory!\n");
+        zxlogf(ERROR, "out of memory!\n");
         return ZX_ERR_NO_MEMORY;
     }
     memset(bufs.get(), 0, sizeof(io_buffer_t) * kNumIoBufs);
     size_t buf_size = kFrameSize * kFramesInBuf;
     for (uint16_t id = 0; id < kNumIoBufs; ++id) {
-        if ((rc = io_buffer_init(&bufs[id], buf_size, IO_BUFFER_RW | IO_BUFFER_CONTIG)) != ZX_OK) {
-            VIRTIO_ERROR("failed to allocate I/O buffers: %s\n", zx_status_get_string(rc));
+        if ((rc = io_buffer_init(&bufs[id], bti.get(), buf_size,
+                                 IO_BUFFER_RW | IO_BUFFER_CONTIG)) != ZX_OK) {
+            zxlogf(ERROR, "failed to allocate I/O buffers: %s\n", zx_status_get_string(rc));
             return rc;
         }
     }
@@ -163,19 +173,16 @@ virtio_net_hdr_t* GetFrameHdr(io_buffer_t* bufs, uint16_t ring_id, uint16_t desc
     return reinterpret_cast<virtio_net_hdr_t*>(GetFrameVirt(bufs, ring_id, desc_id));
 }
 
-uint8_t* GetFrameData(io_buffer_t* bufs, uint16_t ring_id, uint16_t desc_id) {
+uint8_t* GetFrameData(io_buffer_t* bufs, uint16_t ring_id, uint16_t desc_id, size_t hdr_size) {
     uintptr_t vaddr = reinterpret_cast<uintptr_t>(GetFrameHdr(bufs, ring_id, desc_id));
-    return reinterpret_cast<uint8_t*>(vaddr + sizeof(virtio_net_hdr_t));
+    return reinterpret_cast<uint8_t*>(vaddr + hdr_size);
 }
 
 } // namespace
 
-EthernetDevice::EthernetDevice(zx_device_t* bus_device)
-    : Device(bus_device), rx_(this), tx_(this), bufs_(nullptr), unkicked_(0), ifc_(nullptr),
-      cookie_(nullptr) {
-    LTRACE_ENTRY;
-    // VirtIO spec 1.0, section 4.1.4.8
-    bar0_size_ = VIRTIO_PCI_CONFIG_OFFSET_NOMSI + sizeof(config_);
+EthernetDevice::EthernetDevice(zx_device_t* bus_device, zx::bti bti, fbl::unique_ptr<Backend> backend)
+    : Device(bus_device, fbl::move(bti), fbl::move(backend)), rx_(this), tx_(this), bufs_(nullptr),
+      unkicked_(0), ifc_(nullptr), cookie_(nullptr) {
 }
 
 EthernetDevice::~EthernetDevice() {
@@ -192,7 +199,7 @@ zx_status_t EthernetDevice::Init() {
     fbl::AutoLock lock(&state_lock_);
 
     // Reset the device and read our configuration
-    Reset();
+    DeviceReset();
     CopyDeviceConfig(&config_, sizeof(config_));
     LTRACEF("mac %02x:%02x:%02x:%02x:%02x:%02x\n", config_.mac[0], config_.mac[1], config_.mac[2],
             config_.mac[3], config_.mac[4], config_.mac[5]);
@@ -200,18 +207,35 @@ zx_status_t EthernetDevice::Init() {
     LTRACEF("max_virtqueue_pairs  %u\n", config_.max_virtqueue_pairs);
 
     // Ack and set the driver status bit
-    StatusAcknowledgeDriver();
+    DriverStatusAck();
 
-    // TODO(aarongreen): Check features bits and ack/nak them
+    virtio_hdr_len_ = sizeof(virtio_net_hdr_t);
+    if (DeviceFeatureSupported(VIRTIO_F_VERSION_1)) {
+      DriverFeatureAck(VIRTIO_F_VERSION_1);
+    } else {
+      // 5.1.6.1 Legacy Interface: Device Operation
+      //
+      // The legacy driver only presented num_buffers in the struct
+      // virtio_net_hdr when VIRTIO_NET_F_MRG_RXBUF was negotiated; without
+      // that feature the structure was 2 bytes shorter.
+      virtio_hdr_len_ -= 2;
+    }
+
+    // TODO(aarongreen): Check additional features bits and ack/nak them
+    rc = DeviceStatusFeaturesOk();
+    if (rc != ZX_OK) {
+        zxlogf(ERROR, "%s: Feature negotiation failed (%d)\n", tag(), rc);
+        return rc;
+    }
 
     // Plan to clean up unless everything goes right.
     auto cleanup = fbl::MakeAutoCall([this]() { Release(); });
 
     // Allocate I/O buffers and virtqueues.
     uint16_t num_descs = static_cast<uint16_t>(kBacklog & 0xffff);
-    if ((rc = InitBuffers(&bufs_)) != ZX_OK || (rc = rx_.Init(kRxId, num_descs)) != ZX_OK ||
+    if ((rc = InitBuffers(bti_, &bufs_)) != ZX_OK || (rc = rx_.Init(kRxId, num_descs)) != ZX_OK ||
         (rc = tx_.Init(kTxId, num_descs)) != ZX_OK) {
-        VIRTIO_ERROR("failed to allocate virtqueue: %s\n", zx_status_get_string(rc));
+        zxlogf(ERROR, "failed to allocate virtqueue: %s\n", zx_status_get_string(rc));
         return rc;
     }
 
@@ -249,10 +273,10 @@ zx_status_t EthernetDevice::Init() {
     args.name = "virtio-net";
     args.ctx = this;
     args.ops = &kDeviceOps;
-    args.proto_id = ZX_PROTOCOL_ETHERMAC;
+    args.proto_id = ZX_PROTOCOL_ETHERNET_IMPL;
     args.proto_ops = &kProtoOps;
     if ((rc = device_add(bus_device_, &args, &device_)) != ZX_OK) {
-        VIRTIO_ERROR("failed to add device: %s\n", zx_status_get_string(rc));
+        zxlogf(ERROR, "failed to add device: %s\n", zx_status_get_string(rc));
         return rc;
     }
     // Give the rx buffers to the host
@@ -260,7 +284,7 @@ zx_status_t EthernetDevice::Init() {
 
     // Woohoo! Driver should be ready.
     cleanup.cancel();
-    StatusDriverOK();
+    DriverStatusOk();
     return ZX_OK;
 }
 
@@ -294,8 +318,8 @@ void EthernetDevice::IrqRingUpdate() {
 
             // Transitional driver does not merge rx buffers.
             assert(used_elem->len < desc->len);
-            uint8_t* data = GetFrameData(bufs_.get(), kRxId, id);
-            size_t len = used_elem->len - sizeof(virtio_net_hdr_t);
+            uint8_t* data = GetFrameData(bufs_.get(), kRxId, id, virtio_hdr_len_);
+            size_t len = used_elem->len - virtio_hdr_len_;
             LTRACEF("Receiving %zu bytes:\n", len);
             LTRACE_DO(hexdump8_ex(data, len, 0));
 
@@ -371,12 +395,14 @@ zx_status_t EthernetDevice::Start(ethmac_ifc_t* ifc, void* cookie) {
     return ZX_OK;
 }
 
-void EthernetDevice::Send(uint32_t options, void* data, size_t length) {
+zx_status_t EthernetDevice::QueueTx(uint32_t options, ethmac_netbuf_t* netbuf) {
     LTRACE_ENTRY;
+    void* data = netbuf->data;
+    size_t length = netbuf->len;
     // First, validate the packet
-    if (!data || length > sizeof(virtio_net_hdr_t) + kVirtioMtu) {
+    if (!data || length > virtio_hdr_len_ + kVirtioMtu) {
         LTRACEF("dropping packet; invalid packet\n");
-        return;
+        return ZX_ERR_INVALID_ARGS;
     }
 
     fbl::AutoLock lock(&tx_lock_);
@@ -400,15 +426,35 @@ void EthernetDevice::Send(uint32_t options, void* data, size_t length) {
     }
     if (!desc) {
         LTRACEF("dropping packet; out of descriptors\n");
-        return;
+        return ZX_ERR_NO_RESOURCES;
     }
 
     // Add the data to be sent
-    void* tx_hdr = GetFrameHdr(bufs_.get(), kTxId, id);
-    memset(tx_hdr, 0, sizeof(virtio_net_hdr_t));
-    void* tx_buf = GetFrameData(bufs_.get(), kTxId, id);
+    virtio_net_hdr_t* tx_hdr = GetFrameHdr(bufs_.get(), kTxId, id);
+    memset(tx_hdr, 0, virtio_hdr_len_);
+
+    // 5.1.6.2.1 Driver Requirements: Packet Transmission
+    //
+    // The driver MUST set num_buffers to zero.
+    //
+    // Implementation note: This field doesn't exist if neither
+    // |VIRTIO_F_VERSION_1| or |VIRTIO_F_MRG_RXBUF| have been negotiated. Since
+    // this field will be part of the payload without these features we elide
+    // the check as we know the memory is valid and will soon be overwritten
+    // with packet data.
+    tx_hdr->num_buffers = 0;
+
+    // If VIRTIO_NET_F_CSUM is not negotiated, the driver MUST set flags to
+    // zero and SHOULD supply a fully checksummed packet to the device.
+    tx_hdr->flags = 0;
+
+    // If none of the VIRTIO_NET_F_HOST_TSO4, TSO6 or UFO options have been
+    // negotiated, the driver MUST set gso_type to VIRTIO_NET_HDR_GSO_NONE.
+    tx_hdr->gso_type = VIRTIO_NET_HDR_GSO_NONE;
+
+    void* tx_buf = GetFrameData(bufs_.get(), kTxId, id, virtio_hdr_len_);
     memcpy(tx_buf, data, length);
-    desc->len = static_cast<uint32_t>(sizeof(virtio_net_hdr_t) + length);
+    desc->len = static_cast<uint32_t>(virtio_hdr_len_ + length);
 
     // Submit the descriptor and notify the back-end.
     LTRACE_DO(virtio_dump_desc(desc));
@@ -420,6 +466,7 @@ void EthernetDevice::Send(uint32_t options, void* data, size_t length) {
         tx_.Kick();
         unkicked_ = 0;
     }
+    return ZX_OK;
 }
 
 } // namespace virtio

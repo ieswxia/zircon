@@ -19,6 +19,9 @@ zx_status_t zx_vmo_create(uint64_t size, uint32_t options, zx_handle_t* out);
 a container of zero to *size* bytes of memory managed by the operating
 system.
 
+The size of the VMO will be rounded up to the next page size boundary.
+Use **vmo_get_size**() to return the current size of the VMO.
+
 One handle is returned on success, representing an object with the requested
 size.
 
@@ -44,6 +47,11 @@ The following rights will be set on the handle by default:
 
 The *options* field is currently unused and must be set to 0.
 
+The **ZX_VMO_ZERO_CHILDREN** signal is active on a newly created VMO. It becomes
+inactive whenever a clone of the VMO is created and becomes active again when
+all clones have been destroyed and no mappings of those clones into address
+spaces exist.
+
 ## RETURN VALUE
 
 **vmo_create**() returns **ZX_OK** on success. In the event
@@ -60,6 +68,7 @@ any value other than 0.
 
 [vmo_read](vmo_read.md),
 [vmo_write](vmo_write.md),
+[vmo_clone](vmo_clone.md),
 [vmo_set_size](vmo_set_size.md),
 [vmo_get_size](vmo_get_size.md),
 [vmo_op_range](vmo_op_range.md),

@@ -2,35 +2,21 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#include <ddk/driver.h>
+#include <ddk/protocol/gpio.h>
+#include <ddk/protocol/platform-defs.h>
 #include <hw/reg.h>
+#include <soc/hi3660/hi3660.h>
+#include <soc/hi3660/hi3660-regs.h>
+
 #include <stdio.h>
 
-#include "hi3660-bus.h"
-#include "hi3660-regs.h"
-
-zx_status_t hi3360_usb_init(hi3660_bus_t* bus) {
-    volatile void* usb3otg_bc = bus->usb3otg_bc.vaddr;
-    volatile void* peri_crg = bus->peri_crg.vaddr;
-    volatile void* pctrl = bus->pctrl.vaddr;
+zx_status_t hi3660_usb_init(hi3660_t* hi3660) {
+    volatile void* usb3otg_bc = io_buffer_virt(&hi3660->usb3otg_bc);
+    volatile void* peri_crg = io_buffer_virt(&hi3660->peri_crg);
+    volatile void* pctrl = io_buffer_virt(&hi3660->pctrl);
     uint32_t temp;
 
-/*
-    // this doesn't seem to be ncessesary now, but we might need to use these
-    // GPIOs when switching between host and device mode
-
-    gpio_protocol_t gpio;
-    if (pdev_get_protocol(&bus->pdev, ZX_PROTOCOL_GPIO, &gpio) != ZX_OK) {
-        printf("hi3360_usb_init: could not get GPIO protocol!\n");
-        return ZX_ERR_INTERNAL;
-    }
-
-    // disable host vbus
-    gpio_config(&gpio, 46, GPIO_DIR_OUT);
-    gpio_write(&gpio, 46, 0);
-    // enable type-c vbus
-    gpio_config(&gpio, 202, GPIO_DIR_OUT);
-    gpio_write(&gpio, 202, 1);
-*/
     writel(PERI_CRG_ISODIS_REFCLK_ISO_EN, peri_crg + PERI_CRG_ISODIS);
     writel(PCTRL_CTRL3_USB_TCXO_EN | (PCTRL_CTRL3_USB_TCXO_EN << PCTRL_CTRL3_MSK_START),
            pctrl + PCTRL_CTRL3);

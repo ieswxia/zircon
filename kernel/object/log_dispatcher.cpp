@@ -30,7 +30,7 @@ zx_status_t LogDispatcher::Create(uint32_t flags, fbl::RefPtr<Dispatcher>* dispa
 }
 
 LogDispatcher::LogDispatcher(uint32_t flags)
-    : flags_(flags), state_tracker_(ZX_LOG_WRITABLE) {
+    : SoloDispatcher(ZX_LOG_WRITABLE), flags_(flags) {
 }
 
 LogDispatcher::~LogDispatcher() {
@@ -42,8 +42,7 @@ LogDispatcher::~LogDispatcher() {
 void LogDispatcher::Signal() {
     canary_.Assert();
 
-    fbl::AutoLock lock(&lock_);
-    state_tracker_.UpdateState(0, ZX_CHANNEL_READABLE);
+    UpdateState(0, ZX_CHANNEL_READABLE);
 }
 
 // static
@@ -64,11 +63,11 @@ zx_status_t LogDispatcher::Read(uint32_t flags, void* ptr, size_t len, size_t* a
     if (!(flags_ & ZX_LOG_FLAG_READABLE))
         return ZX_ERR_BAD_STATE;
 
-    fbl::AutoLock lock(&lock_);
+    fbl::AutoLock lock(get_lock());
 
     zx_status_t status = dlog_read(&reader_, 0, ptr, len, actual);
     if (status == ZX_ERR_SHOULD_WAIT) {
-        state_tracker_.UpdateState(ZX_CHANNEL_READABLE, 0);
+        UpdateStateLocked(ZX_CHANNEL_READABLE, 0);
     }
 
     return status;

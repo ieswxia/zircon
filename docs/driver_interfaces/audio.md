@@ -66,13 +66,12 @@ space of the application and used to send or receive audio data as appropriate.
 Generally, the operations conducted over the ring buffer channel include...
  * Requesting a shared buffer
  * Starting and Stopping stream playback/capture
- * Watchdog-style automatic stream shutdown
  * Receiving notifications of playback/capture progress
  * Receiving notifications of error conditions such as HW FIFO under/overflow,
    bus transaction failure, etc...
  * Receiving clock recovery information in the case that the audio output clock
    is based on a different oscillator than the oscillator which backs
-   [zx_ticks_get()](../syscalls/ticks_get.md)
+   [ZX_CLOCK_MONOTONIC](../syscalls/clock_get.md)
 
 ## Operational Details
 
@@ -142,9 +141,9 @@ may be sent to the driver using the
 [zx_channel_write(...)](../syscalls/channel_write.md) syscall.  If a response is
 expected, it may be read using the
 [zx_channel_read(...)](../syscalls/channel_read.md) syscall.  Best practice,
-however, is to bind your [channel(s)](../objects/channel.md) to a
+however, is to queue packets for your [channel(s)](../objects/channel.md)
 [port](../objects/port.md) using the
-[zx_port_bind(...)](../syscalls/port_bind.md) syscall, and use the
+[zx_port_queue(...)](../syscalls/port_queue.md) syscall, and use the
 [zx_port_wait(...)](../syscalls/port_wait.md) syscall to determine when your set
 of channels have messages (either expected responses or asynchronous
 notifications) to be read.
@@ -459,9 +458,24 @@ respond with a message indicating the success or failure of the operation as
 well as the current gain/mute status of the system (regardless of whether the
 request was a success).
 
-## Determining outboard latency
+## Determining external latency
 
-> TODO: specify how this is done
+The external latency of an audio stream is defined as the amount of time it
+takes outbound audio to travel from the system's interconnect to the speakers
+themselves, or inbound audio to travel from the microphone to the system's
+interconnect.  For example, if an external codec connected to the system using a
+TDM interconnect introduced a 4 frame delay between reception of a TDM frame and
+rendering of the frame at the speakers themselves, the external delay of this
+audio path would be 4 audio frames.
+
+External delay is reported in the `external_delay_nsec` field of a successful
+`AUDIO_STREAM_CMD_SET_FORMAT` response as a non-negative number of nanoseconds.
+Drivers **should** make their best attempt to accurately report the total of all
+of the sources of delay the driver knows about.  Information about this delay
+can frequently be found in codec data sheets, dynamically reported as properties
+of codecs using protocols such as Intel HDA or the USB Audio specifications, or
+reported by down stream devices using mechanisms such as EDID when using HDMI or
+DisplayPort interconnects.
 
 ## Plug Detection
 
@@ -484,7 +498,7 @@ In order to determine a stream's plug detection capabilities, current plug
 state, and to enable or disable for asynchronous plug detection notifications,
 applications send a `AUDIO_STREAM_CMD_PLUG_DETECT` command over the stream
 channel.  Drivers respond with a set of `audio_pd_notify_flags_t`, along with a
-timestamp referenced from ZX_CLOCK_MONOTONIC indicating the last time the plug
+timestamp referenced from `ZX_CLOCK_MONOTONIC` indicating the last time the plug
 state changed.
 
 Three valid flags are currently defined.
@@ -641,7 +655,13 @@ Upon succeeding, the driver **must** return a handle to a
 [VMO](../objects/vm_object.md) with permissions which allow applications to map
 the VMO into their address space using [zx_vmar_map](../syscalls/vmar_map.md),
 and to read/write data in the buffer in the case of readback, or simply read the
-data in the buffer in the case of capture.
+data in the buffer in the case of capture.  Additionally, the driver **must**
+report the actual number of frames of audio it will use in the buffer via the
+`num_ring_buffer_frames` field of the `audio_rb_cmd_get_buffer_resp_t` message.
+This number **may** be larger than the `min_ring_buffer_frames` request from the
+client but **must not** be either smaller than this number, nor larger than the
+size (when converted to bytes) of the VMO as reported by
+[zx_vmo_get_size()](../syscalls/vmo_get_size.md)
 
 ### Starting and Stopping the ring-buffer
 
@@ -655,21 +675,22 @@ been established using the `GET_BUFFER` operation.
 
 Upon successfully starting a stream, drivers **must** provide their best
 estimate of the time at which their hardware began to transmit or capture the
-stream in the `start_ticks` field of the response.  This time stamp **must** be
-taken from the clock exposed via the [zx_ticks_get()](../syscalls/ticks_get.md)
-syscall.  Along with with the FIFO depth property of the ring buffer, this
-timestamp allows applications to send or receive stream data without the need
-for periodic position updates from the driver.  Along with the outboard latency
-estimate provided by the stream channel, this timestamp allows applications to
-synchronize presentation of audio information across multiple streams, or even
-multiple devices (provided that an external time synchronization protocol is
-used to synchronize the [zx_ticks_get()](../syscalls/ticks_get.md) timelines
-across the cohort of synchronized devices).
+stream in the `start_time` field of the response.  This time stamp **must** be
+taken from the clock exposed via the
+[ZX_CLOCK_MONOTONIC](../syscalls/clock_get.md) syscall.  Along with with the FIFO
+depth property of the ring buffer, this timestamp allows applications to send or
+receive stream data without the need for periodic position updates from the
+driver.  Along with the outboard latency estimate provided by the stream
+channel, this timestamp allows applications to synchronize presentation of audio
+information across multiple streams, or even multiple devices (provided that an
+external time synchronization protocol is used to synchronize the
+[ZX_CLOCK_MONOTONIC](../syscalls/clock_get.md) timelines across the cohort of
+synchronized devices).
 
 > TODO: Redefine `start_time` to allow it to be an arbitrary 'audio stream
-> clock' instead of the zx_ticks_get() clock.  If the stream clock is made to
-> count in audio frames since start, then this start_ticks can be replaced with
-> the terms for a segment of a piecewise linear transformation which can be
+> clock' instead of the `ZX_CLOCK_MONOTONIC` clock.  If the stream clock is made
+> to count in audio frames since start, then this `start_time` can be replaced
+> with the terms for a segment of a piecewise linear transformation which can be
 > subsequently updated via notifications sent by the driver in the case that the
 > audio hardware clock is rooted in a different oscillator from the system's
 > tick counter.  Clients can then use this transformation either to control the
@@ -717,18 +738,25 @@ quickly enough that aliasing does not occur.
 > TODO: define these and what the behavior of drivers should be in case they
 > occur.
 
-### Automatic shutdown
+### Unexpected application termination
 
-> TODO: define a mechanism by which the application may inform the driver that
-> it will periodically indicate that it is still alive and producing data.  For
-> output streams, this allows the driver to cleanly shutdown without looping an
-> audio buffer forever in the case that a client application wedges.
+If the other side of a ring buffer control channel is closed for any reason,
+drivers **must** immediately close the control channel, and shut down the ring
+buffer such that playback ring buffers begin to produce silence.  While drivers
+are encouraged to do so in a way which produces a graceful transition to
+silence, the requirement is that the audio stream go silent instead of looping.
+Once the transition to silence is complete, the resources associated with
+playback may be released and reused by the driver.
+
+This way, if an application teminates unexpectedly, the kernel will close the
+application's channels and cause audio playback to stop instead of continuing to
+loop.
 
 ### Clock recovery
 
 > TODO: define a way that clock recovery information can be sent to clients in
 > the case that the audio output oscillator is not derived from the
-> zx_ticks_get() oscillator.  In addition, if the oscillator is slew-able in
+> `ZX_CLOCK_MONOTONIC` oscillator.  In addition, if the oscillator is slew-able in
 > hardware, provide the ability to discover this capability and control the slew
 > rate.  Given the fact that this oscillator is likely to be shared by multiple
 > streams, it might be best to return some form of system wide clock identifier

@@ -18,7 +18,6 @@ typedef struct fdio fdio_t;
 
 // Utilities to help assemble handles for a new process
 // may return up to FDIO_MAX_HANDLES
-zx_status_t fdio_clone_root(zx_handle_t* handles, uint32_t* types);
 zx_status_t fdio_clone_cwd(zx_handle_t* handles, uint32_t* types);
 zx_status_t fdio_clone_fd(int fd, int newfd, zx_handle_t* handles, uint32_t* types);
 zx_status_t fdio_pipe_pair_raw(zx_handle_t* handles, uint32_t* types);
@@ -35,24 +34,6 @@ zx_status_t fdio_transfer_fd(int fd, int newfd, zx_handle_t* handles, uint32_t* 
 // This function transfers ownership of handles to the fd on success, and
 // closes them on failure.
 zx_status_t fdio_create_fd(zx_handle_t* handles, uint32_t* types, size_t hcount, int* fd_out);
-
-typedef struct bootfs_entry bootfs_entry_t;
-
-typedef struct bootfs {
-    zx_handle_t vmo;
-    uint32_t dirsize;
-    void* dir;
-} bootfs_t;
-
-zx_status_t bootfs_create(bootfs_t* bfs, zx_handle_t vmo);
-void bootfs_destroy(bootfs_t* bfs);
-zx_status_t bootfs_open(bootfs_t* bfs, const char* name, zx_handle_t* vmo);
-zx_status_t bootfs_parse(bootfs_t* bfs,
-                         zx_status_t (*cb)(void* cookie, const bootfs_entry_t* entry),
-                         void* cookie);
-
-// used for bootstrap
-void fdio_install_root(fdio_t* root);
 
 // attempt to install a fdio in the unistd fd table
 // if fd >= 0, request a specific fd, and starting_fd is ignored
@@ -104,9 +85,19 @@ zx_status_t fdio_service_connect(const char* svcpath, zx_handle_t h);
 // an error is returned and the handle is closed.
 zx_status_t fdio_service_connect_at(zx_handle_t dir, const char* path, zx_handle_t h);
 
+// As above but allows the passing of flags
+zx_status_t fdio_open_at(zx_handle_t dir, const char* path, uint32_t zxflags, zx_handle_t h);
+
 // Attempt to clone a sevice handle by doing a pipelined
 // CLONE operation, returning the new channel endpoint,
 // or ZX_HANDLE_INVALID.
 zx_handle_t fdio_service_clone(zx_handle_t h);
+
+// Attempt to clone a sevice handle by doing a pipelined
+// CLONE operation, using the provided serving channel.
+// On success srv is bound to a clone of h.  On failure
+// an error is returned and srv is closed.
+// Takes ownership of srv.
+zx_status_t fdio_service_clone_to(zx_handle_t h, zx_handle_t srv);
 
 __END_CDECLS

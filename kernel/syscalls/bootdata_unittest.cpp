@@ -10,11 +10,11 @@
 //                the method that it tests lives inside syscalls_system.cpp
 
 #include <assert.h>
-#include <zircon/boot/bootdata.h>
-#include <zircon/types.h>
+#include <lib/unittest/unittest.h>
 #include <mexec.h>
 #include <stddef.h>
-#include <unittest.h>
+#include <zircon/boot/bootdata.h>
+#include <zircon/types.h>
 
 const size_t kBootdataSentinelLen = 64;
 const uint8_t kBootdataSentinelByte = 0xA5;
@@ -42,7 +42,7 @@ static bool sentinel_integrity_okay(const uint8_t* sentinel, const size_t len) {
 }
 
 // Try to overflow the bootdata buffer.
-static bool bootdata_overflow_test(void* context) {
+static bool bootdata_overflow_test() {
     BEGIN_TEST;
 
     const size_t kBootdataBufferLen = 64;
@@ -69,7 +69,7 @@ static bool bootdata_overflow_test(void* context) {
 }
 
 // Fill the entire boot
-static bool bootdata_fill_test(void* context) {
+static bool bootdata_fill_test() {
     BEGIN_TEST;
 
     // The bootdata buffer the Global Bootdata Header + The Section Header + the Section Contents
@@ -106,4 +106,4 @@ UNITTEST_START_TESTCASE(bootdata_tests)
 BOOTDATA_UNITTEST(bootdata_overflow_test)
 BOOTDATA_UNITTEST(bootdata_fill_test)
 
-UNITTEST_END_TESTCASE(bootdata_tests, "bootdata", "bootdata packing tests", nullptr, nullptr);
+UNITTEST_END_TESTCASE(bootdata_tests, "bootdata", "bootdata packing tests");

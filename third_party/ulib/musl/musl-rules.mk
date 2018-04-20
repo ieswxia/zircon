@@ -7,7 +7,7 @@ LOCAL_COMPILEFLAGS := \
 
 ifeq ($(ARCH),arm64)
 MUSL_ARCH := aarch64
-else ifeq ($(SUBARCH),x86-64)
+else ifeq ($(ARCH),x86)
 MUSL_ARCH := x86_64
 else
 $(error Unsupported architecture $(ARCH) for musl build!)
@@ -30,16 +30,10 @@ LOCAL_CFLAGS := \
     -D_XOPEN_SOURCE=700 \
     -U_ALL_SOURCE \
     -Wno-sign-compare \
-    -Wno-missing-braces \
+    -Werror=incompatible-pointer-types \
 
 ifeq ($(call TOBOOL,$(USE_CLANG)),true)
 LOCAL_COMPILEFLAGS += -fno-stack-protector
-
-# TODO(kulakowski) This is needed because clang, as an assembler,
-# yells loudly about ununused options such as -finline which are
-# currently unconditionally added to COMPILEFLAGS. Ideally these
-# arguments would only be added to C or C++ targets.
-LOCAL_COMPILEFLAGS += -Qunused-arguments
 
 endif
 
@@ -51,6 +45,7 @@ LOCAL_CFLAGS += -ffreestanding
 
 LOCAL_SRCS := \
     $(LOCAL_DIR)/zircon/get_startup_handle.c \
+    $(LOCAL_DIR)/zircon/getentropy.c \
     $(LOCAL_DIR)/zircon/internal.c \
     $(LOCAL_DIR)/zircon/thrd_get_zx_handle.c \
     $(LOCAL_DIR)/pthread/allocate.c \
@@ -60,10 +55,7 @@ LOCAL_SRCS := \
     $(LOCAL_DIR)/pthread/pthread_attr_init.c \
     $(LOCAL_DIR)/pthread/pthread_attr_setdetachstate.c \
     $(LOCAL_DIR)/pthread/pthread_attr_setguardsize.c \
-    $(LOCAL_DIR)/pthread/pthread_attr_setinheritsched.c \
     $(LOCAL_DIR)/pthread/pthread_attr_setschedparam.c \
-    $(LOCAL_DIR)/pthread/pthread_attr_setschedpolicy.c \
-    $(LOCAL_DIR)/pthread/pthread_attr_setscope.c \
     $(LOCAL_DIR)/pthread/pthread_attr_setstacksize.c \
     $(LOCAL_DIR)/pthread/pthread_barrier_destroy.c \
     $(LOCAL_DIR)/pthread/pthread_barrier_init.c \
@@ -86,10 +78,9 @@ LOCAL_SRCS := \
     $(LOCAL_DIR)/pthread/pthread_getattr_np.c \
     $(LOCAL_DIR)/pthread/pthread_getconcurrency.c \
     $(LOCAL_DIR)/pthread/pthread_getcpuclockid.c \
-    $(LOCAL_DIR)/pthread/pthread_getschedparam.c \
     $(LOCAL_DIR)/pthread/pthread_getspecific.c \
     $(LOCAL_DIR)/pthread/pthread_join.c \
-    $(LOCAL_DIR)/pthread/pthread_key_create.c \
+    $(LOCAL_DIR)/pthread/pthread_key.c \
     $(LOCAL_DIR)/pthread/pthread_kill.c \
     $(LOCAL_DIR)/pthread/pthread_mutex_consistent.c \
     $(LOCAL_DIR)/pthread/pthread_mutex_destroy.c \
@@ -121,8 +112,6 @@ LOCAL_SRCS := \
     $(LOCAL_DIR)/pthread/pthread_setcancelstate.c \
     $(LOCAL_DIR)/pthread/pthread_setcanceltype.c \
     $(LOCAL_DIR)/pthread/pthread_setconcurrency.c \
-    $(LOCAL_DIR)/pthread/pthread_setschedparam.c \
-    $(LOCAL_DIR)/pthread/pthread_setschedprio.c \
     $(LOCAL_DIR)/pthread/pthread_setspecific.c \
     $(LOCAL_DIR)/pthread/pthread_sigmask.c \
     $(LOCAL_DIR)/pthread/pthread_spin_destroy.c \
@@ -282,21 +271,15 @@ LOCAL_SRCS := \
     $(LOCAL_DIR)/src/ldso/dlerror.c \
     $(LOCAL_DIR)/src/ldso/dlinfo.c \
     $(LOCAL_DIR)/src/legacy/cuserid.c \
-    $(LOCAL_DIR)/src/legacy/daemon.c \
     $(LOCAL_DIR)/src/legacy/err.c \
     $(LOCAL_DIR)/src/legacy/euidaccess.c \
     $(LOCAL_DIR)/src/legacy/futimes.c \
     $(LOCAL_DIR)/src/legacy/getdtablesize.c \
-    $(LOCAL_DIR)/src/legacy/getloadavg.c \
     $(LOCAL_DIR)/src/legacy/getpagesize.c \
     $(LOCAL_DIR)/src/legacy/getpass.c \
-    $(LOCAL_DIR)/src/legacy/getusershell.c \
     $(LOCAL_DIR)/src/legacy/isastream.c \
     $(LOCAL_DIR)/src/legacy/lutimes.c \
-    $(LOCAL_DIR)/src/legacy/ulimit.c \
-    $(LOCAL_DIR)/src/legacy/utmpx.c \
     $(LOCAL_DIR)/src/linux/adjtime.c \
-    $(LOCAL_DIR)/src/linux/cache.c \
     $(LOCAL_DIR)/src/linux/flock.c \
     $(LOCAL_DIR)/src/linux/sethostname.c \
     $(LOCAL_DIR)/src/linux/settimeofday.c \
@@ -304,12 +287,10 @@ LOCAL_SRCS := \
     $(LOCAL_DIR)/src/linux/utimes.c \
     $(LOCAL_DIR)/src/locale/__lctrans.c \
     $(LOCAL_DIR)/src/locale/__mo_lookup.c \
-    $(LOCAL_DIR)/src/locale/bind_textdomain_codeset.c \
     $(LOCAL_DIR)/src/locale/c_locale.c \
     $(LOCAL_DIR)/src/locale/catclose.c \
     $(LOCAL_DIR)/src/locale/catgets.c \
     $(LOCAL_DIR)/src/locale/catopen.c \
-    $(LOCAL_DIR)/src/locale/dcngettext.c \
     $(LOCAL_DIR)/src/locale/duplocale.c \
     $(LOCAL_DIR)/src/locale/freelocale.c \
     $(LOCAL_DIR)/src/locale/iconv.c \
@@ -322,7 +303,6 @@ LOCAL_SRCS := \
     $(LOCAL_DIR)/src/locale/strcoll.c \
     $(LOCAL_DIR)/src/locale/strfmon.c \
     $(LOCAL_DIR)/src/locale/strxfrm.c \
-    $(LOCAL_DIR)/src/locale/textdomain.c \
     $(LOCAL_DIR)/src/locale/uselocale.c \
     $(LOCAL_DIR)/src/locale/wcscoll.c \
     $(LOCAL_DIR)/src/locale/wcsxfrm.c \
@@ -447,28 +427,21 @@ LOCAL_SRCS := \
     $(LOCAL_DIR)/src/misc/ffs.c \
     $(LOCAL_DIR)/src/misc/ffsl.c \
     $(LOCAL_DIR)/src/misc/ffsll.c \
-    $(LOCAL_DIR)/src/misc/forkpty.c \
     $(LOCAL_DIR)/src/misc/get_current_dir_name.c \
     $(LOCAL_DIR)/src/misc/getauxval.c \
     $(LOCAL_DIR)/src/misc/getdomainname.c \
     $(LOCAL_DIR)/src/misc/gethostid.c \
     $(LOCAL_DIR)/src/misc/getopt.c \
     $(LOCAL_DIR)/src/misc/getopt_long.c \
-    $(LOCAL_DIR)/src/misc/getpriority.c \
-    $(LOCAL_DIR)/src/misc/getrlimit.c \
-    $(LOCAL_DIR)/src/misc/getrusage.c \
     $(LOCAL_DIR)/src/misc/getsubopt.c \
     $(LOCAL_DIR)/src/misc/initgroups.c \
     $(LOCAL_DIR)/src/misc/issetugid.c \
     $(LOCAL_DIR)/src/misc/lockf.c \
-    $(LOCAL_DIR)/src/misc/login_tty.c \
     $(LOCAL_DIR)/src/misc/mntent.c \
     $(LOCAL_DIR)/src/misc/openpty.c \
     $(LOCAL_DIR)/src/misc/ptsname.c \
     $(LOCAL_DIR)/src/misc/pty.c \
     $(LOCAL_DIR)/src/misc/setdomainname.c \
-    $(LOCAL_DIR)/src/misc/setpriority.c \
-    $(LOCAL_DIR)/src/misc/setrlimit.c \
     $(LOCAL_DIR)/src/misc/syslog.c \
     $(LOCAL_DIR)/src/misc/wordexp.c \
     $(LOCAL_DIR)/src/mman/madvise.c \
@@ -509,9 +482,7 @@ LOCAL_SRCS := \
     $(LOCAL_DIR)/src/network/dns_parse.c \
     $(LOCAL_DIR)/src/network/ent.c \
     $(LOCAL_DIR)/src/network/ether.c \
-    $(LOCAL_DIR)/src/network/freeaddrinfo.c \
     $(LOCAL_DIR)/src/network/gai_strerror.c \
-    $(LOCAL_DIR)/src/network/getaddrinfo.c \
     $(LOCAL_DIR)/src/network/gethostbyaddr.c \
     $(LOCAL_DIR)/src/network/gethostbyaddr_r.c \
     $(LOCAL_DIR)/src/network/gethostbyname.c \
@@ -542,7 +513,6 @@ LOCAL_SRCS := \
     $(LOCAL_DIR)/src/network/inet_ntop.c \
     $(LOCAL_DIR)/src/network/inet_pton.c \
     $(LOCAL_DIR)/src/network/lookup_ipliteral.c \
-    $(LOCAL_DIR)/src/network/lookup_name.c \
     $(LOCAL_DIR)/src/network/lookup_serv.c \
     $(LOCAL_DIR)/src/network/netlink.c \
     $(LOCAL_DIR)/src/network/netname.c \
@@ -619,7 +589,6 @@ LOCAL_SRCS := \
     $(LOCAL_DIR)/src/process/posix_spawnattr_setsigmask.c \
     $(LOCAL_DIR)/src/process/posix_spawnp.c \
     $(LOCAL_DIR)/src/process/system.c \
-    $(LOCAL_DIR)/src/process/vfork.c \
     $(LOCAL_DIR)/src/process/wait.c \
     $(LOCAL_DIR)/src/process/waitid.c \
     $(LOCAL_DIR)/src/process/waitpid.c \
@@ -698,8 +667,6 @@ LOCAL_SRCS := \
     $(LOCAL_DIR)/src/stdio/asprintf.c \
     $(LOCAL_DIR)/src/stdio/clearerr.c \
     $(LOCAL_DIR)/src/stdio/dprintf.c \
-    $(LOCAL_DIR)/src/stdio/ext.c \
-    $(LOCAL_DIR)/src/stdio/ext2.c \
     $(LOCAL_DIR)/src/stdio/fclose.c \
     $(LOCAL_DIR)/src/stdio/feof.c \
     $(LOCAL_DIR)/src/stdio/ferror.c \
@@ -854,8 +821,7 @@ LOCAL_SRCS := \
     $(LOCAL_DIR)/src/thread/thrd_join.c \
     $(LOCAL_DIR)/src/thread/thrd_sleep.c \
     $(LOCAL_DIR)/src/thread/thrd_yield.c \
-    $(LOCAL_DIR)/src/thread/tss_create.c \
-    $(LOCAL_DIR)/src/thread/tss_delete.c \
+    $(LOCAL_DIR)/src/thread/tss.c \
     $(LOCAL_DIR)/src/thread/tss_set.c \
     $(LOCAL_DIR)/src/time/__asctime.c \
     $(LOCAL_DIR)/src/time/__map_file.c \
@@ -896,11 +862,9 @@ LOCAL_SRCS := \
     $(LOCAL_DIR)/src/unistd/acct.c \
     $(LOCAL_DIR)/src/unistd/alarm.c \
     $(LOCAL_DIR)/src/unistd/ctermid.c \
-    $(LOCAL_DIR)/src/unistd/fchdir.c \
     $(LOCAL_DIR)/src/unistd/gethostname.c \
     $(LOCAL_DIR)/src/unistd/getlogin.c \
     $(LOCAL_DIR)/src/unistd/getlogin_r.c \
-    $(LOCAL_DIR)/src/unistd/nice.c \
     $(LOCAL_DIR)/src/unistd/pause.c \
     $(LOCAL_DIR)/src/unistd/posix_close.c \
     $(LOCAL_DIR)/src/unistd/setpgrp.c \
@@ -1042,7 +1006,7 @@ LOCAL_SRCS += \
     $(LOCAL_DIR)/third_party/math/log2l.c \
     $(LOCAL_DIR)/third_party/math/logl.c \
 
-else ifeq ($(SUBARCH),x86-64)
+else ifeq ($(ARCH),x86)
 LOCAL_SRCS += \
     $(LOCAL_DIR)/src/fenv/x86_64/fenv.c \
     $(LOCAL_DIR)/src/ldso/x86_64/tlsdesc.S \
@@ -1099,7 +1063,9 @@ MODULE_CFLAGS := $(LOCAL_CFLAGS)
 MODULE_SRCS := $(LOCAL_SRCS)
 
 MODULE_LIBS := system/ulib/zircon
-MODULE_STATIC_LIBS := system/ulib/runtime
+MODULE_STATIC_LIBS := \
+    system/ulib/ldmsg \
+    system/ulib/runtime \
 
 # At link time and in DT_SONAME, musl is known as libc.so.  But the
 # (only) place it needs to be installed at runtime is where the
@@ -1138,13 +1104,13 @@ MODULE_TYPE := userlib
 MODULE_COMPILEFLAGS := $(LOCAL_COMPILEFLAGS)
 MODULE_CFLAGS := $(LOCAL_CFLAGS)
 
-MODULE_SRCS := $(LOCAL_DIR)/arch/$(MUSL_ARCH)/crt1.S
+MODULE_SRCS := $(LOCAL_DIR)/arch/$(MUSL_ARCH)/Scrt1.S
 
 # where our object files will end up
 LOCAL_OUT := $(BUILDDIR)/system/ulib/c.crt/$(LOCAL_DIR)
-LOCAL_CRT1_OBJ := $(LOCAL_OUT)/arch/$(MUSL_ARCH)/crt1.S.o
+LOCAL_SCRT1_OBJ := $(LOCAL_OUT)/arch/$(MUSL_ARCH)/Scrt1.S.o
 
 # install it globally
-$(call copy-dst-src,$(USER_CRT1_OBJ),$(LOCAL_CRT1_OBJ))
+$(call copy-dst-src,$(USER_SCRT1_OBJ),$(LOCAL_SCRT1_OBJ))
 
 include make/module.mk

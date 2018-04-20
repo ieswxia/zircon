@@ -16,7 +16,7 @@
 #include <list.h>
 #include <arch/ops.h>
 #include <kernel/spinlock.h>
-#include <kernel/vm.h>
+#include <vm/vm.h>
 #include <vm/pmm.h>
 #include <lib/cmpctmalloc.h>
 #include <lib/console.h>
@@ -189,6 +189,7 @@ usage:
         if (!(flags & CMD_FLAG_PANIC)) {
             printf("\t%s trace\n", argv[0].str);
             printf("\t%s trim\n", argv[0].str);
+            printf("\t%s test\n", argv[0].str);
             printf("\t%s alloc <size> [alignment]\n", argv[0].str);
             printf("\t%s realloc <ptr> <size>\n", argv[0].str);
             printf("\t%s free <address>\n", argv[0].str);

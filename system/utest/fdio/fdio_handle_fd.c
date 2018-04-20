@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <threads.h>
 #include <unistd.h>
 
 #include <zircon/syscalls.h>
@@ -86,6 +87,69 @@ bool pipe_test(void) {
     END_TEST;
 }
 
+int write_thread(void* arg) {
+    // Sleep to try to ensure the write happens after the poll.
+    zx_nanosleep(ZX_MSEC(5));
+    int message[2] = {-6, 1};
+    ssize_t written = write(*(int*)arg, message, sizeof(message));
+    ASSERT_GE(written, 0, "write() failed");
+    ASSERT_EQ((uint32_t)written, sizeof(message),
+              "write() should have written the whole message.");
+    return 0;
+}
+
+bool ppoll_test_handler(struct timespec* timeout) {
+    BEGIN_TEST;
+
+    int fds[2];
+    int status = pipe(fds);
+    ASSERT_EQ(status, 0, "pipe() failed");
+
+    thrd_t t;
+    int thrd_create_result = thrd_create(&t, write_thread, &fds[1]);
+    ASSERT_EQ(thrd_create_result, thrd_success, "create blocking send thread");
+
+    struct pollfd poll_fds[1] = {{fds[0], POLLIN, 0}};
+    int ppoll_result = ppoll(poll_fds, 1, timeout, NULL);
+
+    EXPECT_EQ(1, ppoll_result, "didn't read anything");
+
+    ASSERT_EQ(thrd_join(t, NULL), thrd_success, "join blocking send thread");
+
+    END_TEST;
+}
+
+bool ppoll_negative_test(void) {
+    struct timespec timeout_ts = {-1, -1};
+    return ppoll_test_handler(&timeout_ts);
+}
+
+bool ppoll_null_test(void) {
+    return ppoll_test_handler(NULL);
+}
+
+bool ppoll_overflow_test(void) {
+    unsigned int nanoseconds_in_seconds = 1000000000;
+    struct timespec timeout_ts = {UINT64_MAX / nanoseconds_in_seconds, UINT64_MAX % nanoseconds_in_seconds};
+    return ppoll_test_handler(&timeout_ts);
+}
+
+bool ppoll_immediate_timeout_test(void) {
+    BEGIN_TEST;
+
+    int fds[2];
+    int status = pipe(fds);
+    ASSERT_EQ(status, 0, "pipe() failed");
+
+    struct timespec timeout = {0, 0};
+    struct pollfd poll_fds[1] = {{fds[0], POLLIN, 0}};
+    int ppoll_result = ppoll(poll_fds, 1, &timeout, NULL);
+
+    EXPECT_EQ(0, ppoll_result, "no fds should be readable");
+
+    END_TEST;
+}
+
 bool transfer_fd_test(void) {
     BEGIN_TEST;
 
@@ -127,8 +191,34 @@ bool transfer_fd_test(void) {
     END_TEST;
 }
 
+bool transfer_device_test(void) {
+    BEGIN_TEST;
+
+    int fd = open("/dev/zero", O_RDONLY);
+    ASSERT_GE(fd, 0, "Failed to open /dev/zero");
+
+    // fd --> handles
+    zx_handle_t handles[FDIO_MAX_HANDLES];
+    uint32_t types[FDIO_MAX_HANDLES];
+    zx_status_t r = fdio_transfer_fd(fd, 0, handles, types);
+    ASSERT_GT(r, 0, "failed to transfer fds to handles");
+
+    // handles --> fd
+    ASSERT_EQ(fdio_create_fd(handles, types, r, &fd), ZX_OK,
+              "failed to transfer handles to fds");
+
+    ASSERT_EQ(close(fd), 0, "Failed to close fd");
+
+    END_TEST;
+}
+
 BEGIN_TEST_CASE(fdio_handle_fd_test)
 RUN_TEST(close_test);
 RUN_TEST(pipe_test);
+RUN_TEST(ppoll_negative_test);
+RUN_TEST(ppoll_null_test);
+RUN_TEST(ppoll_overflow_test);
+RUN_TEST(ppoll_immediate_timeout_test);
 RUN_TEST(transfer_fd_test);
+RUN_TEST(transfer_device_test);
 END_TEST_CASE(fdio_handle_fd_test)

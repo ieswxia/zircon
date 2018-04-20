@@ -11,6 +11,7 @@
 #include <fbl/auto_lock.h>
 #include <object/thread_dispatcher.h>
 #include <trace.h>
+#include <zircon/types.h>
 
 using fbl::AutoLock;
 
@@ -28,14 +29,12 @@ FutexContext::~FutexContext() {
     DEBUG_ASSERT(futex_table_.is_empty());
 }
 
-zx_status_t FutexContext::FutexWait(user_ptr<int> value_ptr, int current_value, zx_time_t deadline) {
+zx_status_t FutexContext::FutexWait(user_in_ptr<const int> value_ptr, int current_value, zx_time_t deadline) {
     LTRACE_ENTRY;
 
     uintptr_t futex_key = reinterpret_cast<uintptr_t>(value_ptr.get());
     if (futex_key % sizeof(int))
         return ZX_ERR_INVALID_ARGS;
-
-    FutexNode* node;
 
     // FutexWait() checks that the address value_ptr still contains
     // current_value, and if so it sleeps awaiting a FutexWake() on value_ptr.
@@ -56,17 +55,16 @@ zx_status_t FutexContext::FutexWait(user_ptr<int> value_ptr, int current_value, 
         return ZX_ERR_BAD_STATE;
     }
 
-    ThreadDispatcher* thread = ThreadDispatcher::GetCurrent();
-    node = thread->futex_node();
-    node->set_hash_key(futex_key);
-    node->SetAsSingletonList();
+    FutexNode node;
+    node.set_hash_key(futex_key);
+    node.SetAsSingletonList();
 
-    QueueNodesLocked(node);
+    QueueNodesLocked(&node);
 
     // Block current thread.  This releases lock_ and does not reacquire it.
-    result = node->BlockThread(&lock_, deadline);
+    result = node.BlockThread(&lock_, deadline);
     if (result == ZX_OK) {
-        DEBUG_ASSERT(!node->IsInQueue());
+        DEBUG_ASSERT(!node.IsInQueue());
         // All the work necessary for removing us from the hash table was done by FutexWake()
         return ZX_OK;
     }
@@ -78,7 +76,7 @@ zx_status_t FutexContext::FutexWait(user_ptr<int> value_ptr, int current_value, 
     // We need to ensure that the thread's node is removed from the wait
     // queue, because FutexWake() probably didn't do that.
     AutoLock lock(&lock_);
-    if (UnqueueNodeLocked(node)) {
+    if (UnqueueNodeLocked(&node)) {
         return result;
     }
     // The current thread was not found on the wait queue.  This means
@@ -103,7 +101,7 @@ zx_status_t FutexContext::FutexWait(user_ptr<int> value_ptr, int current_value, 
     return ZX_OK;
 }
 
-zx_status_t FutexContext::FutexWake(user_ptr<const int> value_ptr,
+zx_status_t FutexContext::FutexWake(user_in_ptr<const int> value_ptr,
                                     uint32_t count) {
     LTRACE_ENTRY;
 
@@ -139,8 +137,8 @@ zx_status_t FutexContext::FutexWake(user_ptr<const int> value_ptr,
     return ZX_OK;
 }
 
-zx_status_t FutexContext::FutexRequeue(user_ptr<int> wake_ptr, uint32_t wake_count, int current_value,
-                                       user_ptr<int> requeue_ptr, uint32_t requeue_count) {
+zx_status_t FutexContext::FutexRequeue(user_in_ptr<const int> wake_ptr, uint32_t wake_count, int current_value,
+                                       user_in_ptr<const int> requeue_ptr, uint32_t requeue_count) {
     LTRACE_ENTRY;
 
     if ((requeue_ptr.get() == nullptr) && requeue_count)

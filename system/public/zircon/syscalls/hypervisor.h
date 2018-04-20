@@ -6,34 +6,31 @@
 
 #include <assert.h>
 
-#include <zircon/types.h>
 #include <zircon/compiler.h>
+#include <zircon/types.h>
 
 __BEGIN_CDECLS
 
+// clang-format off
 enum {
-    ZX_GUEST_TRAP_MEM = 0,
-    ZX_GUEST_TRAP_IO  = 1,
+    ZX_GUEST_TRAP_BELL  = 0,
+    ZX_GUEST_TRAP_MEM   = 1,
+    ZX_GUEST_TRAP_IO    = 2,
 };
 
-// Structure to create a VCPU for a guest.
-typedef struct zx_vcpu_create_args {
-    zx_vaddr_t ip;
-#if __x86_64__
-    zx_vaddr_t cr3;
-    zx_handle_t apic_vmo;
-#endif // __x86_64__
-} zx_vcpu_create_args_t;
-
 enum {
-    ZX_VCPU_STATE   = 0,
-    ZX_VCPU_IO      = 1,
+    ZX_VCPU_STATE       = 0,
+    ZX_VCPU_IO          = 1,
 };
+// clang-format on
 
 // Structure to read and write VCPU state.
 typedef struct zx_vcpu_state {
 #if __aarch64__
-    uint64_t r[31];
+    uint64_t x[31];
+    uint64_t sp;
+    // Contains only the user-controllable upper 4-bits (NZCV).
+    uint32_t cpsr;
 #elif __x86_64__
     uint64_t rax;
     uint64_t rcx;
@@ -51,8 +48,8 @@ typedef struct zx_vcpu_state {
     uint64_t r13;
     uint64_t r14;
     uint64_t r15;
-    // Only the user-controllable lower 32-bits of the flags register.
-    uint32_t flags;
+    // Contains only the user-controllable lower 32-bits.
+    uint64_t rflags;
 #endif
 } zx_vcpu_state_t;
 

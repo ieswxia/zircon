@@ -27,7 +27,7 @@ const uint ARCH_MMU_FLAG_NS = (1u << 6);      // NON-SECURE
 const uint ARCH_MMU_FLAG_INVALID = (1u << 7); // Indicates that flags are not specified
 
 const uint ARCH_ASPACE_FLAG_KERNEL = (1u << 0);
-const uint ARCH_ASPACE_FLAG_GUEST_PASPACE = (1u << 1);
+const uint ARCH_ASPACE_FLAG_GUEST = (1u << 1);
 
 // per arch base class api to encapsulate the mmu routines on an aspace
 class ArchVmAspaceInterface {
@@ -39,11 +39,21 @@ public:
     virtual zx_status_t Destroy() = 0;
 
     // main methods
-    virtual zx_status_t Map(vaddr_t vaddr, paddr_t paddr, size_t count,
+
+    // Map a physically contiguous region into the virtual address space
+    virtual zx_status_t MapContiguous(vaddr_t vaddr, paddr_t paddr, size_t count,
+                                      uint mmu_flags, size_t* mapped) = 0;
+    // Map the given array of pages into the virtual address space starting at
+    // |vaddr|, in the order they appear in |phys|.
+    // If any address in the range [vaddr, vaddr + count * PAGE_SIZE) is already
+    // mapped when this is called, this returns ZX_ERR_ALREADY_EXISTS.
+    virtual zx_status_t Map(vaddr_t vaddr, paddr_t* phys, size_t count,
                             uint mmu_flags, size_t* mapped) = 0;
 
+    // Unmap the given virtual address range
     virtual zx_status_t Unmap(vaddr_t vaddr, size_t count, size_t* unmapped) = 0;
 
+    // Change the page protections on the given virtual address range
     virtual zx_status_t Protect(vaddr_t vaddr, size_t count, uint mmu_flags) = 0;
 
     virtual zx_status_t Query(vaddr_t vaddr, paddr_t* paddr, uint* mmu_flags) = 0;

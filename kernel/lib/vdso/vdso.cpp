@@ -7,16 +7,18 @@
 #include <lib/vdso.h>
 #include <lib/vdso-constants.h>
 
-#include <kernel/cmdline.h>
-#include <kernel/vm.h>
-#include <vm/pmm.h>
-#include <vm/vm_aspace.h>
-#include <vm/vm_object.h>
 #include <fbl/alloc_checker.h>
 #include <fbl/type_support.h>
-#include <object/handles.h>
+#include <kernel/cmdline.h>
+#include <object/handle.h>
 #include <platform.h>
+#include <vm/pmm.h>
+#include <vm/vm.h>
+#include <vm/vm_aspace.h>
+#include <vm/vm_object.h>
+#include <zircon/types.h>
 
+#include "config-buildid.h"
 #include "vdso-code.h"
 
 // This is defined in assembly by vdso-image.S; vdso-code.h
@@ -181,7 +183,7 @@ private:
         code_window.blacklist(address, size);                           \
     } while (0)
 
-// Random attributes in syscalls.sysgen become "categories" of syscalls.
+// Random attributes in syscalls.abigen become "categories" of syscalls.
 // For each category, define a function blacklist_<category> to blacklist
 // all the syscalls in that category.  These functions can be used in
 // VDso::CreateVariant (below) to blacklist a category of syscalls for
@@ -219,7 +221,7 @@ const VDso* VDso::Create() {
                   "gen-rodso-code.sh is suspect");
     KernelVmoWindow<vdso_constants> constants_window(
         "vDSO constants", vdso->vmo()->vmo(), VDSO_DATA_CONSTANTS);
-    uint64_t per_second = ticks_per_second();
+    zx_ticks_t per_second = ticks_per_second();
 
     // Initialize the constants that should be visible to the vDSO.
     // Rather than assigning each member individually, do this with
@@ -227,10 +229,12 @@ const VDso* VDso::Create() {
     // can warn if the initializer list omits any member.
     *constants_window.data() = (vdso_constants) {
         arch_max_num_cpus(),
+        {arch_cpu_features()},
         arch_dcache_line_size(),
         arch_icache_line_size(),
         per_second,
         pmm_count_total_bytes(),
+        BUILDID,
     };
 
     // If ticks_per_second has not been calibrated, it will return 0. In this
@@ -264,8 +268,7 @@ HandleOwner VDso::vmo_handle(Variant variant) const {
         return RoDso::vmo_handle();
 
     DEBUG_ASSERT(!(vmo_rights() & ZX_RIGHT_WRITE));
-    return HandleOwner(MakeHandle(variant_vmo_[variant_index(variant)],
-                                  vmo_rights()));
+    return Handle::Make(variant_vmo_[variant_index(variant)], vmo_rights());
 }
 
 // Each vDSO variant VMO is made via a COW clone of the main/default vDSO

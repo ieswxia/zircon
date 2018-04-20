@@ -78,9 +78,6 @@ void* pmm_alloc_kpage(paddr_t* pa, vm_page_t** p);
 
 size_t pmm_free_kpages(void* ptr, size_t count);
 
-// physical to virtual
-void* paddr_to_kvaddr(paddr_t pa);
-
 // virtual to physical
 paddr_t vaddr_to_paddr(const void* va);
 

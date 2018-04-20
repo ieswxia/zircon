@@ -18,14 +18,14 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include <zircon/boot/netboot.h>
 #include <tftp/tftp.h>
+#include <zircon/boot/netboot.h>
 
 #include "bootserver.h"
 
 // Point to user-selected values (or NULL if no values selected)
-uint16_t *tftp_block_size;
-uint16_t *tftp_window_size;
+uint16_t* tftp_block_size;
+uint16_t* tftp_window_size;
 
 typedef struct {
     int fd;
@@ -78,7 +78,8 @@ tftp_status file_read(void* data, size_t* length, off_t offset, void* cookie) {
         }
         *length = bytes_read;
     }
-    update_status(offset);
+
+    update_status(offset + *length);
     return TFTP_NO_ERROR;
 }
 
@@ -99,7 +100,7 @@ typedef struct {
 
 #define SEND_TIMEOUT_US 1000
 
-int transport_send(void* data, size_t len, void* cookie) {
+tftp_status transport_send(void* data, size_t len, void* cookie) {
     transport_state* state = cookie;
     ssize_t send_result;
     do {
@@ -120,10 +121,11 @@ int transport_send(void* data, size_t len, void* cookie) {
     } while ((send_result < 0) &&
              ((errno == EAGAIN) || (errno == EWOULDBLOCK) || (errno == ENOBUFS)));
     if (send_result < 0) {
-        fprintf(stderr, "\n%s: Send failed with errno = %d\n", appname, (int)errno);
+        fprintf(stderr, "\n%s: Attempted to send %zu bytes\n", appname, len);
+        fprintf(stderr, "%s: Send failed with errno = %d (%s)\n", appname, errno, strerror(errno));
         return TFTP_ERR_IO;
     }
-    return (int)send_result;
+    return TFTP_NO_ERROR;
 }
 
 int transport_recv(void* data, size_t len, bool block, void* cookie) {
@@ -219,7 +221,7 @@ int tftp_xfer(struct sockaddr_in6* addr, const char* fn, const char* name) {
     tftp_session* session = NULL;
     size_t session_data_sz = tftp_sizeof_session();
 
-    if (!(session_data = calloc(session_data_sz, 1))  ||
+    if (!(session_data = calloc(session_data_sz, 1)) ||
         !(inbuf = malloc(TFTP_BUF_SZ)) ||
         !(outbuf = malloc(TFTP_BUF_SZ))) {
         fprintf(stderr, "%s: error: Unable to allocate memory\n", appname);
@@ -257,14 +259,17 @@ int tftp_xfer(struct sockaddr_in6* addr, const char* fn, const char* name) {
     opts.block_size = tftp_block_size;
     opts.window_size = tftp_window_size;
 
-    tftp_status status = tftp_push_file(session, &ts, &xd, fn, name, &opts);
-
-    if (status < 0) {
-        fprintf(stderr, "%s: %s (status = %d)\n", appname, opts.err_msg, (int)status);
-        goto done;
+    tftp_status status;
+    if ((status = tftp_push_file(session, &ts, &xd, fn, name, &opts)) < 0) {
+        if (status == TFTP_ERR_SHOULD_WAIT) {
+            result = -EAGAIN;
+        } else {
+            fprintf(stderr, "%s: %s (status = %d)\n", appname, opts.err_msg, (int)status);
+            result = -1;
+        }
+    } else {
+        result = 0;
     }
-
-    result = 0;
 
 done:
     if (session_data) {
@@ -274,7 +279,7 @@ done:
         free(inbuf);
     }
     if (outbuf) {
-        free (outbuf);
+        free(outbuf);
     }
     file_close(&xd);
     return result;

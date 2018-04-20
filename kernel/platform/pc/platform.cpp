@@ -7,36 +7,40 @@
 // license that can be found in the LICENSE file or at
 // https://opensource.org/licenses/MIT
 
-#include <err.h>
-#include <trace.h>
+#include "platform_p.h"
+#include <arch/mmu.h>
+#include <arch/mp.h>
 #include <arch/ops.h>
+#include <arch/x86.h>
 #include <arch/x86/apic.h>
 #include <arch/x86/cpu_topology.h>
 #include <arch/x86/mmu.h>
+#include <assert.h>
 #include <dev/pcie_bus_driver.h>
 #include <dev/uart.h>
-#include <platform.h>
+#include <err.h>
+#include <fbl/alloc_checker.h>
+#include <kernel/cmdline.h>
+#include <lk/init.h>
 #include <mexec.h>
-#include "platform_p.h"
+#include <platform.h>
+#include <platform/console.h>
+#include <platform/keyboard.h>
 #include <platform/pc.h>
 #include <platform/pc/acpi.h>
 #include <platform/pc/bootloader.h>
 #include <platform/pc/memory.h>
-#include <platform/console.h>
-#include <platform/keyboard.h>
-#include <zircon/boot/bootdata.h>
-#include <zircon/boot/multiboot.h>
-#include <arch/mmu.h>
-#include <arch/mp.h>
-#include <arch/x86.h>
-#include <malloc.h>
+#include <platform/pc/smbios.h>
 #include <string.h>
-#include <assert.h>
-#include <lk/init.h>
-#include <kernel/cmdline.h>
-#include <vm/initial_map.h>
+#include <trace.h>
+#include <vm/bootreserve.h>
+#include <vm/physmap.h>
 #include <vm/pmm.h>
 #include <vm/vm_aspace.h>
+#include <zircon/boot/bootdata.h>
+#include <zircon/boot/multiboot.h>
+#include <zircon/pixelformat.h>
+#include <zircon/types.h>
 
 #include <lib/cksum.h>
 
@@ -57,28 +61,27 @@ extern bootdata_t* _bootdata_base;
 
 pc_bootloader_info_t bootloader;
 
-struct mmu_initial_mapping mmu_initial_mappings[] = {
-    /* 64GB of memory mapped where the kernel lives */
-    {
-        .phys = MEMBASE,
-        .virt = KERNEL_ASPACE_BASE,
-        .size = 64ULL*GB, /* x86-64 maps first 64GB by default */
-        .flags = 0,
-        .name = "memory"
-    },
-    /* KERNEL_SIZE of memory mapped where the kernel lives.
-     * On x86-64, this only sticks around until the VM is brought up, after
-     * that this will be replaced with mappings of the correct privileges. */
-    {
-        .phys = MEMBASE,
-        .virt = KERNEL_BASE,
-        .size = KERNEL_SIZE, /* x86 maps first KERNEL_SIZE by default */
-        .flags = MMU_INITIAL_MAPPING_TEMPORARY,
-        .name = "kernel_temp"
-    },
-    /* null entry to terminate the list */
-    {}
-};
+// Stashed values from BOOTDATA_LAST_CRASHLOG if we saw it
+static const void* last_crashlog = nullptr;
+static size_t last_crashlog_len = 0;
+
+// convert from legacy format
+static unsigned pixel_format_fixup(unsigned pf) {
+    switch (pf) {
+    case 1:
+        return ZX_PIXEL_FORMAT_RGB_565;
+    case 2:
+        return ZX_PIXEL_FORMAT_RGB_332;
+    case 3:
+        return ZX_PIXEL_FORMAT_RGB_2220;
+    case 4:
+        return ZX_PIXEL_FORMAT_ARGB_8888;
+    case 5:
+        return ZX_PIXEL_FORMAT_RGB_x888;
+    default:
+        return pf;
+    }
+}
 
 static bool early_console_disabled;
 
@@ -89,21 +92,27 @@ static int process_bootitem(bootdata_t* bd, void* item) {
             bootloader.acpi_rsdp = *((uint64_t*)item);
         }
         break;
+    case BOOTDATA_SMBIOS:
+        if (bd->length >= sizeof(uint64_t)) {
+            bootloader.smbios = *((uint64_t*)item);
+        }
+        break;
     case BOOTDATA_EFI_SYSTEM_TABLE:
         if (bd->length >= sizeof(uint64_t)) {
-            bootloader.efi_system_table = (void*) *((uint64_t*)item);
+            bootloader.efi_system_table = (void*)*((uint64_t*)item);
         }
         break;
     case BOOTDATA_FRAMEBUFFER: {
         if (bd->length >= sizeof(bootdata_swfb_t)) {
             memcpy(&bootloader.fb, item, sizeof(bootdata_swfb_t));
         }
+        bootloader.fb.format = pixel_format_fixup(bootloader.fb.format);
         break;
     }
     case BOOTDATA_CMDLINE:
         if (bd->length > 0) {
-            ((char*) item)[bd->length - 1] = 0;
-            cmdline_append((char*) item);
+            ((char*)item)[bd->length - 1] = 0;
+            cmdline_append((char*)item);
         }
         break;
     case BOOTDATA_EFI_MEMORY_MAP:
@@ -115,7 +124,7 @@ static int process_bootitem(bootdata_t* bd, void* item) {
         bootloader.e820_count = bd->length / sizeof(e820entry_t);
         break;
     case BOOTDATA_LASTLOG_NVRAM2:
-        // fallthrough: this is a legacy/typo variant
+    // fallthrough: this is a legacy/typo variant
     case BOOTDATA_LASTLOG_NVRAM:
         if (bd->length >= sizeof(bootdata_nvram_t)) {
             memcpy(&bootloader.nvram, item, sizeof(bootdata_nvram_t));
@@ -126,33 +135,33 @@ static int process_bootitem(bootdata_t* bd, void* item) {
             memcpy(&bootloader.uart, item, sizeof(bootdata_uart_t));
         }
         break;
+    case BOOTDATA_LAST_CRASHLOG:
+        last_crashlog = item;
+        last_crashlog_len = bd->length;
+        break;
     case BOOTDATA_IGNORE:
         break;
     }
     return 0;
 }
 
-extern "C" void *boot_alloc_mem(size_t len);
+extern "C" void* boot_alloc_mem(size_t len);
 extern "C" void boot_alloc_reserve(uintptr_t phys, size_t _len);
 
 static void process_bootdata(bootdata_t* hdr, uintptr_t phys, bool verify) {
     if ((hdr->type != BOOTDATA_CONTAINER) ||
-        (hdr->extra != BOOTDATA_MAGIC)) {
+        (hdr->extra != BOOTDATA_MAGIC) ||
+        !(hdr->flags & BOOTDATA_FLAG_V2)) {
         printf("bootdata: invalid %08x %08x %08x %08x\n",
                hdr->type, hdr->length, hdr->extra, hdr->flags);
         return;
     }
 
-    size_t hsz = sizeof(bootdata_t);
-    if (hdr->flags & BOOTDATA_FLAG_EXTRA) {
-        hsz += sizeof(bootextra_t);
-    }
-
-    size_t total_len = hdr->length + hsz;
+    size_t total_len = hdr->length + sizeof(bootdata_t);
 
     printf("bootdata: @ %p (%zu bytes)\n", hdr, total_len);
 
-    bootdata_t* bd = reinterpret_cast<bootdata_t*>(reinterpret_cast<char*>(hdr) + hsz);
+    bootdata_t* bd = hdr + 1;
 
     size_t remain = hdr->length;
     while (remain > sizeof(bootdata_t)) {
@@ -172,19 +181,9 @@ static void process_bootdata(bootdata_t* hdr, uintptr_t phys, bool verify) {
                bd, bd->type, tag, bd->length, bd->extra, bd->flags);
 #endif
 
-        // check for extra header and process if it exists
-        if (bd->flags & BOOTDATA_FLAG_EXTRA) {
-            if (remain < sizeof(bootextra_t)) {
-                printf("bootdata: truncated header\n");
-                break;
-            }
-            bootextra_t* extra = reinterpret_cast<bootextra_t*>(item);
-            item += sizeof(bootextra_t);
-            remain -= sizeof(bootextra_t);
-            if (extra->magic != BOOTITEM_MAGIC) {
-                printf("bootdata: bad magic\n");
-                break;
-            }
+        if (hdr->magic != BOOTITEM_MAGIC) {
+            printf("bootdata: bad magic\n");
+            break;
         }
 
         size_t advance = BOOTDATA_ALIGN(bd->length);
@@ -194,18 +193,12 @@ static void process_bootdata(bootdata_t* hdr, uintptr_t phys, bool verify) {
         }
 #if DEBUG_BOOT_DATA
         if (verify && (bd->flags & BOOTDATA_FLAG_CRC32)) {
-            if (!(bd->flags & BOOTDATA_FLAG_EXTRA)) {
-                printf("bootdata: crc flag set but no extra data!\n");
-                break;
-            }
-            bootextra_t* extra = reinterpret_cast<bootextra_t*>(item - sizeof(bootextra_t));
             uint32_t crc = 0;
-            uint32_t tmp = extra->crc32;
-            extra->crc32 = 0;
+            uint32_t tmp = hdr->crc32;
+            hdr->crc32 = 0;
             crc = crc32(crc, reinterpret_cast<uint8_t*>(bd), sizeof(bootdata_t));
-            crc = crc32(crc, reinterpret_cast<uint8_t*>(extra), sizeof(bootextra_t));
             crc = crc32(crc, reinterpret_cast<uint8_t*>(item), bd->length);
-            extra->crc32 = tmp;
+            hdr->crc32 = tmp;
             printf("bootdata: crc %08x, computed %08x: %s\n", tmp, crc,
                    (tmp == crc) ? "OKAY" : "FAIL");
         }
@@ -230,16 +223,16 @@ extern bool halt_on_panic;
 
 static void platform_save_bootloader_data(bool verify) {
     if (_multiboot_info != NULL) {
-        multiboot_info_t* mi = (multiboot_info_t*) X86_PHYS_TO_VIRT(_multiboot_info);
+        multiboot_info_t* mi = (multiboot_info_t*)X86_PHYS_TO_VIRT(_multiboot_info);
         printf("multiboot: info @ %p flags %#x\n", mi, mi->flags);
 
         if ((mi->flags & MB_INFO_CMD_LINE) && mi->cmdline && (!verify)) {
-            const char* cmdline = (const char*) X86_PHYS_TO_VIRT(mi->cmdline);
+            const char* cmdline = (const char*)X86_PHYS_TO_VIRT(mi->cmdline);
             printf("multiboot: cmdline @ %p\n", cmdline);
             cmdline_append(cmdline);
         }
         if ((mi->flags & MB_INFO_MODS) && mi->mods_addr) {
-            module_t* mod = (module_t*) X86_PHYS_TO_VIRT(mi->mods_addr);
+            module_t* mod = (module_t*)X86_PHYS_TO_VIRT(mi->mods_addr);
             if (mi->mods_count > 0) {
                 printf("multiboot: ramdisk @ %08x..%08x\n", mod->mod_start, mod->mod_end);
                 process_bootdata(reinterpret_cast<bootdata_t*>(X86_PHYS_TO_VIRT(mod->mod_start)),
@@ -248,8 +241,8 @@ static void platform_save_bootloader_data(bool verify) {
         }
     }
     if (_bootdata_base != NULL) {
-        bootdata_t* bd = (bootdata_t*) X86_PHYS_TO_VIRT(_bootdata_base);
-        process_bootdata(bd, (uintptr_t) _bootdata_base, verify);
+        bootdata_t* bd = (bootdata_t*)X86_PHYS_TO_VIRT(_bootdata_base);
+        process_bootdata(bd, (uintptr_t)_bootdata_base, verify);
     }
 
     halt_on_panic = cmdline_get_bool("kernel.halt-on-panic", false);
@@ -265,24 +258,16 @@ static void platform_preserve_ramdisk(void) {
     if (bootloader.ramdisk_base == 0) {
         return;
     }
-    struct list_node list = LIST_INITIAL_VALUE(list);
+
     size_t pages = ROUNDUP_PAGE_SIZE(bootloader.ramdisk_size) / PAGE_SIZE;
-    size_t actual = pmm_alloc_range(bootloader.ramdisk_base, pages, &list);
-    if (actual != pages) {
-        panic("unable to reserve ramdisk memory range\n");
-    }
-
-    // mark all of the pages we allocated as WIRED
-    vm_page_t *p;
-    list_for_every_entry(&list, p, vm_page_t, free.node) {
-        p->state = VM_PAGE_STATE_WIRED;
-    }
-
-    ramdisk_base = paddr_to_kvaddr(bootloader.ramdisk_base);
+    ramdisk_base = paddr_to_physmap(bootloader.ramdisk_base);
     ramdisk_size = pages * PAGE_SIZE;
+
+    // add the ramdisk to the boot reserve list
+    boot_reserve_add_range(bootloader.ramdisk_base, ramdisk_size);
 }
 
-void* platform_get_ramdisk(size_t *size) {
+void* platform_get_ramdisk(size_t* size) {
     if (ramdisk_base) {
         *size = ramdisk_size;
         return ramdisk_base;
@@ -295,13 +280,13 @@ void* platform_get_ramdisk(size_t *size) {
 #include <dev/display.h>
 #include <lib/gfxconsole.h>
 
-status_t display_get_info(struct display_info *info) {
+zx_status_t display_get_info(struct display_info* info) {
     return gfxconsole_display_get_info(info);
 }
 
 static void platform_early_display_init(void) {
     struct display_info info;
-    void *bits;
+    void* bits;
 
     if (bootloader.fb.base == 0) {
         return;
@@ -314,7 +299,7 @@ static void platform_early_display_init(void) {
 
     // allocate an offscreen buffer of worst-case size, page aligned
     bits = boot_alloc_mem(8192 + bootloader.fb.height * bootloader.fb.stride * 4);
-    bits = (void*) ((((uintptr_t) bits) + 4095) & (~4095));
+    bits = (void*)((((uintptr_t)bits) + 4095) & (~4095));
 
     memset(&info, 0, sizeof(info));
     info.format = bootloader.fb.format;
@@ -322,7 +307,7 @@ static void platform_early_display_init(void) {
     info.height = bootloader.fb.height;
     info.stride = bootloader.fb.stride;
     info.flags = DISPLAY_FLAG_HW_FRAMEBUFFER;
-    info.framebuffer = (void*) X86_PHYS_TO_VIRT(bootloader.fb.base);
+    info.framebuffer = (void*)X86_PHYS_TO_VIRT(bootloader.fb.base);
 
     gfxconsole_bind_display(&info, bits);
 }
@@ -331,8 +316,7 @@ static void platform_early_display_init(void) {
  * Some system firmware has the MTRRs for the framebuffer set to Uncached.
  * Since dealing with MTRRs is rather complicated, we wait for the VMM to
  * come up so we can use PAT to manage the memory types. */
-static void platform_ensure_display_memtype(uint level)
-{
+static void platform_ensure_display_memtype(uint level) {
     if (bootloader.fb.base == 0) {
         return;
     }
@@ -347,16 +331,16 @@ static void platform_ensure_display_memtype(uint level)
     info.stride = bootloader.fb.stride;
     info.flags = DISPLAY_FLAG_HW_FRAMEBUFFER;
 
-    void *addr = NULL;
-    status_t status = VmAspace::kernel_aspace()->AllocPhysical(
-            "boot_fb",
-            ROUNDUP(info.stride * info.height * 4, PAGE_SIZE),
-            &addr,
-            PAGE_SIZE_SHIFT,
-            bootloader.fb.base,
-            0 /* vmm flags */,
-            ARCH_MMU_FLAG_WRITE_COMBINING | ARCH_MMU_FLAG_PERM_READ |
-                ARCH_MMU_FLAG_PERM_WRITE);
+    void* addr = NULL;
+    zx_status_t status = VmAspace::kernel_aspace()->AllocPhysical(
+        "boot_fb",
+        ROUNDUP(info.stride * info.height * 4, PAGE_SIZE),
+        &addr,
+        PAGE_SIZE_SHIFT,
+        bootloader.fb.base,
+        0 /* vmm flags */,
+        ARCH_MMU_FLAG_WRITE_COMBINING | ARCH_MMU_FLAG_PERM_READ |
+            ARCH_MMU_FLAG_PERM_WRITE);
     if (status != ZX_OK) {
         TRACEF("Failed to map boot_fb: %d\n", status);
         return;
@@ -383,7 +367,7 @@ typedef struct {
 
 static size_t nvram_stow_crashlog(void* log, size_t len) {
     size_t max = bootloader.nvram.length - sizeof(log_hdr_t);
-    void* nvram = paddr_to_kvaddr(bootloader.nvram.base);
+    void* nvram = paddr_to_physmap(bootloader.nvram.base);
     if (nvram == NULL) {
         return 0;
     }
@@ -410,7 +394,7 @@ static size_t nvram_stow_crashlog(void* log, size_t len) {
 static size_t nvram_recover_crashlog(size_t len, void* cookie,
                                      void (*func)(const void* data, size_t, size_t len, void* cookie)) {
     size_t max = bootloader.nvram.length - sizeof(log_hdr_t);
-    void* nvram = paddr_to_kvaddr(bootloader.nvram.base);
+    void* nvram = paddr_to_physmap(bootloader.nvram.base);
     if (nvram == NULL) {
         return 0;
     }
@@ -456,13 +440,13 @@ void platform_init_crashlog(void) {
         //TODO: get more precise about this.  This gets the job done on
         //      the platforms we're working on right now, but is probably
         //      not entirely correct.
-        void* ptr = (void*) 0;
-        zx_status_t r = efi_aspace->AllocPhysical("1:1", 16*1024*1024*1024UL, &ptr,
+        void* ptr = (void*)0;
+        zx_status_t r = efi_aspace->AllocPhysical("1:1", 16 * 1024 * 1024 * 1024UL, &ptr,
                                                   PAGE_SIZE_SHIFT, 0,
                                                   VmAspace::VMM_FLAG_VALLOC_SPECIFIC,
                                                   ARCH_MMU_FLAG_PERM_READ |
-                                                  ARCH_MMU_FLAG_PERM_WRITE |
-                                                  ARCH_MMU_FLAG_PERM_EXECUTE);
+                                                      ARCH_MMU_FLAG_PERM_WRITE |
+                                                      ARCH_MMU_FLAG_PERM_EXECUTE);
 
         if (r != ZX_OK) {
             efi_aspace.reset();
@@ -508,9 +492,13 @@ size_t platform_recover_crashlog(size_t len, void* cookie,
                                  void (*func)(const void* data, size_t, size_t len, void* cookie)) {
     if (bootloader.nvram.base != 0) {
         return nvram_recover_crashlog(len, cookie, func);
-    } else {
-        return 0;
+    } else if (last_crashlog != nullptr) {
+        if (len != 0) {
+            func(last_crashlog, 0, last_crashlog_len, cookie);
+        }
+        return last_crashlog_len;
     }
+    return 0;
 }
 
 typedef struct e820_walk_ctx {
@@ -559,41 +547,101 @@ zx_status_t platform_mexec_patch_bootdata(uint8_t* bootdata, const size_t len) {
 
     zx_status_t ret = enumerate_e820(e820_entry_walk, &ctx);
 
-    if (ret != ZX_OK)
+    if (ret != ZX_OK) {
+        printf("mexec: enumerate_e820 failed. Retcode = %d\n", ret);
         return ret;
+    }
 
-    if (ctx.ret != ZX_OK)
+    if (ctx.ret != ZX_OK) {
+        printf("mexec: error while enumerating e820 map. Retcode = %d\n",
+               ctx.ret);
         return ctx.ret;
+    }
 
     uint32_t section_length = (uint32_t)(sizeof(e820buf) - ctx.len);
 
     ret = bootdata_append_section(bootdata, len, e820buf, section_length,
                                   BOOTDATA_E820_TABLE, 0, 0);
 
-    if (ret != ZX_OK)
+    if (ret != ZX_OK) {
+        printf("mexec: Failed to append e820 map to bootdata. len = %lu, "
+               "section length = %u, retcode = %d\n",
+               len, section_length,
+               ret);
         return ret;
+    }
 
     // Append information about the framebuffer to the bootdata
     if (bootloader.fb.base) {
         ret = bootdata_append_section(bootdata, len, (uint8_t*)&bootloader.fb,
                                       sizeof(bootloader.fb), BOOTDATA_FRAMEBUFFER, 0, 0);
-        if (ret != ZX_OK)
+        if (ret != ZX_OK) {
+            printf("mexec: Failed to append framebuffer data to bootdata. len = %lu, "
+                   "section length = %lu, retcode = %d\n",
+                   len,
+                   sizeof(bootloader.fb), ret);
             return ret;
+        }
     }
 
     if (bootloader.efi_system_table) {
         ret = bootdata_append_section(bootdata, len, (uint8_t*)&bootloader.efi_system_table,
                                       sizeof(bootloader.efi_system_table),
                                       BOOTDATA_EFI_SYSTEM_TABLE, 0, 0);
-        if (ret != ZX_OK)
+        if (ret != ZX_OK) {
+            printf("mexec: Failed to append efi sys table data to bootdata. len = %lu, "
+                   "section length = %lu, retcode = %d\n",
+                   len,
+                   sizeof(bootloader.efi_system_table), ret);
             return ret;
+        }
     }
 
     if (bootloader.acpi_rsdp) {
         ret = bootdata_append_section(bootdata, len, (uint8_t*)&bootloader.acpi_rsdp,
                                       sizeof(bootloader.acpi_rsdp), BOOTDATA_ACPI_RSDP, 0, 0);
-        if (ret != ZX_OK)
+        if (ret != ZX_OK) {
+            printf("mexec: Failed to append acpi rsdp data to bootdata. len = %lu, "
+                   "section length = %lu, retcode = %d\n",
+                   len,
+                   sizeof(bootloader.acpi_rsdp), ret);
             return ret;
+        }
+    }
+
+    if (bootloader.smbios) {
+        ret = bootdata_append_section(bootdata, len, (uint8_t*)&bootloader.smbios,
+                                      sizeof(bootloader.smbios), BOOTDATA_SMBIOS, 0, 0);
+        if (ret != ZX_OK) {
+            printf("mexec: Failed to append smbios data to bootdata. len = %lu, "
+                   "section length = %lu, retcode = %d\n", len,
+                   sizeof(bootloader.smbios), ret);
+            return ret;
+        }
+    }
+
+    if (bootloader.uart.type != BOOTDATA_UART_NONE) {
+        ret = bootdata_append_section(bootdata, len, (uint8_t*)&bootloader.uart,
+                                      sizeof(bootloader.uart), BOOTDATA_DEBUG_UART, 0, 0);
+        if (ret != ZX_OK) {
+            printf("mexec: Failed to append uart data to bootdata. len = %lu, "
+                   "section length = %lu, retcode = %d\n",
+                   len,
+                   sizeof(bootloader.uart), ret);
+            return ret;
+        }
+    }
+
+    if (bootloader.nvram.base) {
+        ret = bootdata_append_section(bootdata, len, (uint8_t*)&bootloader.nvram,
+                                      sizeof(bootloader.nvram), BOOTDATA_LASTLOG_NVRAM2, 0, 0);
+        if (ret != ZX_OK) {
+            printf("mexec: Failed to append nvram data to bootdata. len = %lu, "
+                   "section length = %lu, retcode = %d\n",
+                   len,
+                   sizeof(bootloader.nvram), ret);
+            return ret;
+        }
     }
 
     return ZX_OK;
@@ -628,18 +676,24 @@ static void alloc_pages_greater_than(paddr_t lower_bound, size_t count, paddr_t*
     }
 
     // mark all of the pages we allocated as WIRED
-    vm_page_t *p;
-    list_for_every_entry(&list, p, vm_page_t, free.node) {
+    vm_page_t* p;
+    list_for_every_entry (&list, p, vm_page_t, free.node) {
         p->state = VM_PAGE_STATE_WIRED;
     }
 }
 
 void platform_mexec(mexec_asm_func mexec_assembly, memmov_ops_t* ops,
-                    uintptr_t new_bootimage_addr, size_t new_bootimage_len) {
+                    uintptr_t new_bootimage_addr, size_t new_bootimage_len,
+                    uintptr_t entry64_addr) {
 
     // A hacky way to handle disabling all PCI devices until we have devhost
-    // lifecycles implemented
-    PcieBusDriver::GetDriver()->DisableBus();
+    // lifecycles implemented.
+    // Leaving PCI running will also leave DMA running which may cause memory
+    // corruption after boot.
+    // Disabling PCI may cause devices to fail to enumerate after boot.
+    if (cmdline_get_bool("kernel.mexec-pci-shutdown", true)) {
+        PcieBusDriver::GetDriver()->DisableBus();
+    }
 
     // This code only handles one L3 and one L4 page table for now. Fail if
     // there are more L2 page tables than can fit in one L3 page table.
@@ -650,18 +704,18 @@ void platform_mexec(mexec_asm_func mexec_assembly, memmov_ops_t* ops,
 
     // Identity map the first 4GiB of RAM
     fbl::RefPtr<VmAspace> identity_aspace =
-            VmAspace::Create(VmAspace::TYPE_LOW_KERNEL, "x86-64 mexec 1:1");
+        VmAspace::Create(VmAspace::TYPE_LOW_KERNEL, "x86-64 mexec 1:1");
     DEBUG_ASSERT(identity_aspace);
 
-    const uint perm_flags_rwx = ARCH_MMU_FLAG_PERM_READ  |
+    const uint perm_flags_rwx = ARCH_MMU_FLAG_PERM_READ |
                                 ARCH_MMU_FLAG_PERM_WRITE |
                                 ARCH_MMU_FLAG_PERM_EXECUTE;
     void* identity_address = 0x0;
     paddr_t pa = 0;
     zx_status_t result = identity_aspace->AllocPhysical("1:1 mapping", kBytesToIdentityMap,
-                                            &identity_address, 0, pa,
-                                            VmAspace::VMM_FLAG_VALLOC_SPECIFIC,
-                                            perm_flags_rwx);
+                                                        &identity_address, 0, pa,
+                                                        VmAspace::VMM_FLAG_VALLOC_SPECIFIC,
+                                                        perm_flags_rwx);
     if (result != ZX_OK) {
         panic("failed to identity map low memory");
     }
@@ -673,8 +727,8 @@ void platform_mexec(mexec_asm_func mexec_assembly, memmov_ops_t* ops,
                              kTotalPageTableCount, safe_pages);
 
     size_t safe_page_id = 0;
-    volatile pt_entry_t* ptl4 = (pt_entry_t*)paddr_to_kvaddr(safe_pages[safe_page_id++]);
-    volatile pt_entry_t* ptl3 = (pt_entry_t*)paddr_to_kvaddr(safe_pages[safe_page_id++]);
+    volatile pt_entry_t* ptl4 = (pt_entry_t*)paddr_to_physmap(safe_pages[safe_page_id++]);
+    volatile pt_entry_t* ptl3 = (pt_entry_t*)paddr_to_physmap(safe_pages[safe_page_id++]);
 
     // Initialize these to 0
     for (size_t i = 0; i < NO_OF_PT_ENTRIES; i++) {
@@ -684,7 +738,7 @@ void platform_mexec(mexec_asm_func mexec_assembly, memmov_ops_t* ops,
 
     for (size_t i = 0; i < kNumL2PageTables; i++) {
         ptl3[i] = safe_pages[safe_page_id] | X86_KERNEL_PD_FLAGS;
-        volatile pt_entry_t* ptl2 = (pt_entry_t*)paddr_to_kvaddr(safe_pages[safe_page_id]);
+        volatile pt_entry_t* ptl2 = (pt_entry_t*)paddr_to_physmap(safe_pages[safe_page_id]);
 
         for (size_t j = 0; j < NO_OF_PT_ENTRIES; j++) {
             ptl2[j] = (2 * MB * (i * NO_OF_PT_ENTRIES + j)) | X86_KERNEL_PD_LP_FLAGS;
@@ -695,26 +749,29 @@ void platform_mexec(mexec_asm_func mexec_assembly, memmov_ops_t* ops,
 
     ptl4[0] = vaddr_to_paddr((void*)ptl3) | X86_KERNEL_PD_FLAGS;
 
-    mexec_assembly((uintptr_t)new_bootimage_addr, vaddr_to_paddr((void*)ptl4), 0, 0, ops, 0);
+    mexec_assembly((uintptr_t)new_bootimage_addr, vaddr_to_paddr((void*)ptl4),
+                   entry64_addr, 0, ops, 0);
 }
 
-void platform_halt_secondary_cpus(void)
-{
+void platform_halt_secondary_cpus(void) {
     // Migrate this thread to the boot cpu.
-    thread_migrate_cpu(BOOT_CPU_ID);
+    thread_migrate_to_cpu(BOOT_CPU_ID);
 
     // Send a shutdown interrupt to all the other cores.
     apic_send_broadcast_ipi(0x00, DELIVERY_MODE_INIT);
 }
 
-void platform_early_init(void)
-{
+void platform_early_init(void) {
+    /* call before bootloader data is populated, since we want to
+     * let the bootloader data override this */
+    pc_init_debug_default_early();
+
     /* extract bootloader data while still accessible */
     /* this includes debug uart config, etc. */
     platform_save_bootloader_data(false);
 
     /* get the debug output working */
-    platform_init_debug_early();
+    pc_init_debug_early();
 
 #if WITH_LEGACY_PC_CONSOLE
     /* get the text console working */
@@ -729,38 +786,45 @@ void platform_early_init(void)
     platform_save_bootloader_data(true);
 #endif
 
-    /* initialize physical memory arenas */
-    platform_mem_init();
+    /* initialize the boot memory reservation system */
+    boot_reserve_init();
 
+    /* add the ramdisk to the boot reserve list */
     platform_preserve_ramdisk();
+
+    /* initialize physical memory arenas */
+    pc_mem_init();
+
+    /* wire all of the reserved boot sections */
+    boot_reserve_wire();
 }
 
-static void platform_init_smp(void)
-{
+static void platform_init_smp(void) {
     uint32_t num_cpus = 0;
 
-    status_t status = platform_enumerate_cpus(NULL, 0, &num_cpus);
+    zx_status_t status = platform_enumerate_cpus(NULL, 0, &num_cpus);
     if (status != ZX_OK) {
         TRACEF("failed to enumerate CPUs, disabling SMP\n");
         return;
     }
 
     // allocate 2x the table for temporary work
-    uint32_t *apic_ids = static_cast<uint32_t *>(malloc(sizeof(*apic_ids) * num_cpus * 2));
-    if (!apic_ids) {
+    fbl::AllocChecker ac;
+    fbl::unique_ptr<uint32_t[]> apic_ids =
+        fbl::unique_ptr<uint32_t[]>(new (&ac) uint32_t[num_cpus * 2]);
+    if (!ac.check()) {
         TRACEF("failed to allocate apic_ids table, disabling SMP\n");
         return;
     }
 
     // a temporary list used before we filter out hyperthreaded pairs
-    uint32_t *apic_ids_temp = apic_ids + num_cpus;
+    uint32_t* apic_ids_temp = &apic_ids[num_cpus];
 
     // find the list of all cpu apic ids into a temporary list
     uint32_t real_num_cpus;
     status = platform_enumerate_cpus(apic_ids_temp, num_cpus, &real_num_cpus);
     if (status != ZX_OK || num_cpus != real_num_cpus) {
         TRACEF("failed to enumerate CPUs, disabling SMP\n");
-        free(apic_ids);
         return;
     }
 
@@ -769,6 +833,7 @@ static void platform_init_smp(void)
 
     // we're implicitly running on the BSP
     uint32_t bsp_apic_id = apic_local_id();
+    DEBUG_ASSERT(bsp_apic_id == apic_bsp_id());
 
     // iterate over all the cores and optionally disable some of them
     dprintf(INFO, "cpu topology:\n");
@@ -782,8 +847,8 @@ static void platform_init_smp(void)
         if (!use_ht && topo.smt_id != 0)
             keep = false;
 
-        dprintf(INFO, "\t%u: apic id 0x%x package %u core %u smt %u%s%s\n",
-                i, apic_ids_temp[i], topo.package_id, topo.core_id, topo.smt_id,
+        dprintf(INFO, "\t%u: apic id 0x%x package %u node %u core %u smt %u%s%s\n",
+                i, apic_ids_temp[i], topo.package_id, topo.node_id, topo.core_id, topo.smt_id,
                 (apic_ids_temp[i] == bsp_apic_id) ? " BSP" : "",
                 keep ? "" : " (not using)");
 
@@ -802,7 +867,7 @@ static void platform_init_smp(void)
         max_cpus = SMP_MAX_CPUS;
     }
 
-    dprintf(INFO, "Found %u cpu%c\n", num_cpus, (num_cpus > 1) ? 's': ' ');
+    dprintf(INFO, "Found %u cpu%c\n", num_cpus, (num_cpus > 1) ? 's' : ' ');
     if (num_cpus > max_cpus) {
         dprintf(INFO, "Clamping number of CPUs to %u\n", max_cpus);
         num_cpus = max_cpus;
@@ -821,30 +886,29 @@ static void platform_init_smp(void)
         ASSERT(found_bp);
     }
 
-    x86_init_smp(apic_ids, num_cpus);
+    x86_init_smp(apic_ids.get(), num_cpus);
 
     // trim the boot cpu out of the apic id list before passing to the AP booting routine
     for (uint i = 0; i < num_cpus - 1; ++i) {
         if (apic_ids[i] == bsp_apic_id) {
-            memmove(&apic_ids[i], &apic_ids[i+1], sizeof(*apic_ids) * (num_cpus - i - 1));
+            memmove(&apic_ids[i], &apic_ids[i + 1], sizeof(apic_ids[0]) * (num_cpus - i - 1));
             break;
         }
     }
 
-    x86_bringup_aps(apic_ids, num_cpus - 1);
-
-    free(apic_ids);
+    x86_bringup_aps(apic_ids.get(), num_cpus - 1);
 }
 
-status_t platform_mp_prep_cpu_unplug(uint cpu_id)
-{
+zx_status_t platform_mp_prep_cpu_unplug(uint cpu_id) {
     // TODO: Make sure the IOAPIC and PCI have nothing for this CPU
     return arch_mp_prep_cpu_unplug(cpu_id);
 }
 
-void platform_init(void)
-{
-    platform_init_debug();
+const char* manufacturer = "unknown";
+const char* product = "unknown";
+
+void platform_init(void) {
+    pc_init_debug();
 
     platform_init_crashlog();
 
@@ -853,4 +917,27 @@ void platform_init(void)
 #endif
 
     platform_init_smp();
+
+    pc_init_smbios();
+
+    SmbiosWalkStructs([](smbios::SpecVersion version, const smbios::Header* h,
+                         const smbios::StringTable& st, void* ctx) -> zx_status_t {
+        if (h->type == smbios::StructType::SystemInfo && version.IncludesVersion(2, 0)) {
+            auto entry = reinterpret_cast<const smbios::SystemInformationStruct2_0*>(h);
+            st.GetString(entry->manufacturer_str_idx, &manufacturer);
+            st.GetString(entry->product_name_str_idx, &product);
+        }
+        return ZX_OK;
+    }, nullptr);
+    printf("smbios: manufacturer=\"%s\" product=\"%s\"\n", manufacturer, product);
+}
+
+void platform_suspend(void) {
+    pc_prep_suspend_timer();
+    pc_suspend_debug();
+}
+
+void platform_resume(void) {
+    pc_resume_debug();
+    pc_resume_timer();
 }

@@ -8,6 +8,37 @@
 #include <zircon/device/ioctl.h>
 #include <zircon/types.h>
 
+// Rights
+// The file may be read.
+#define ZX_FS_RIGHT_READABLE      0x00000001
+// The file may be written.
+#define ZX_FS_RIGHT_WRITABLE      0x00000002
+// The connection can mount and unmount filesystems.
+#define ZX_FS_RIGHT_ADMIN         0x00000004
+#define ZX_FS_RIGHTS              0x0000FFFF
+
+// Flags
+// If the file does not exist, it will be created.
+#define ZX_FS_FLAG_CREATE         0x00010000
+// The file must not exist, otherwise an error will be returned.
+// Ignored without ZX_FS_FLAG_CREATE.
+#define ZX_FS_FLAG_EXCLUSIVE      0x00020000
+// Truncates the file before using it.
+#define ZX_FS_FLAG_TRUNCATE       0x00040000
+// Returns an error if the opened file is not a directory.
+#define ZX_FS_FLAG_DIRECTORY      0x00080000
+// The file is opened in append mode, seeking to the end of the file before each
+// write.
+#define ZX_FS_FLAG_APPEND         0x00100000
+// If the endpoint of this request refers to a mount point, open the local
+// directory, not the remote mount.
+#define ZX_FS_FLAG_NOREMOTE       0x00200000
+// The file underlying file should not be opened, just a reference to the file.
+#define ZX_FS_FLAG_VNODE_REF_ONLY 0x00400000
+// When the file has been opened, the server should transmit a description event.
+// This event will be transmitted either on success or failure.
+#define ZX_FS_FLAG_DESCRIBE       0x00800000
+
 #define MAX_FS_NAME_LEN 32
 
 #define IOCTL_VFS_MOUNT_FS \
@@ -21,9 +52,6 @@
 // the connection to the filesystem and return it.
 #define IOCTL_VFS_UNMOUNT_NODE \
     IOCTL(IOCTL_KIND_GET_HANDLE, IOCTL_FAMILY_VFS, 2)
-// Add a bootfs vmo to the system fs.
-#define IOCTL_VFS_MOUNT_BOOTFS_VMO \
-    IOCTL(IOCTL_KIND_SET_HANDLE, IOCTL_FAMILY_VFS, 3)
 // Determine which filesystem the vnode belongs to.
 #define IOCTL_VFS_QUERY_FS \
     IOCTL(IOCTL_KIND_DEFAULT, IOCTL_FAMILY_VFS, 4)
@@ -116,17 +144,22 @@ IOCTL_WRAPPER(ioctl_vfs_unmount_fs, IOCTL_VFS_UNMOUNT_FS);
 // ssize_t ioctl_vfs_unmount_node(int fd, zx_handle_t* out);
 IOCTL_WRAPPER_OUT(ioctl_vfs_unmount_node, IOCTL_VFS_UNMOUNT_NODE, zx_handle_t);
 
-// ssize_t ioctl_vfs_mount_bootfs_vmo(int fd, zx_handle_t* in);
-IOCTL_WRAPPER_IN(ioctl_vfs_mount_bootfs_vmo, IOCTL_VFS_MOUNT_BOOTFS_VMO, zx_handle_t);
-
 typedef struct vfs_query_info {
-    // these are the total/used # of data bytes, not # of entire disk bytes
+    // These are the total/used # of data bytes, not # of entire disk bytes.
     uint64_t total_bytes;
     uint64_t used_bytes;
     uint64_t total_nodes;
     uint64_t used_nodes;
-    char name[]; // Does not include null-terminator
+    uint64_t fs_id;     // An identifier suitable for statfs.
+    uint32_t block_size;
+    uint32_t max_filename_size;
+    uint32_t fs_type;   // An identifier suitable for statfs.
+    uint32_t padding;   // Required so that name has the correct offset.
+    char name[];        // Does not include null-terminator.
 } vfs_query_info_t;
+
+#define VFS_TYPE_BLOBFS 0x9e694d21
+#define VFS_TYPE_MINFS 0x6e694d21
 
 // ssize_t ioctl_vfs_query_fs(int fd, vfs_query_info_t* out, size_t out_len);
 IOCTL_WRAPPER_VAROUT(ioctl_vfs_query_fs, IOCTL_VFS_QUERY_FS, vfs_query_info_t);

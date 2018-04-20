@@ -17,7 +17,6 @@
 #include <ddk/device.h>
 #include <ddk/driver.h>
 
-#include <ddk/iotxn.h>
 #include <zircon/device/device.h>
 #include <zircon/device/vfs.h>
 
@@ -26,13 +25,42 @@
 #include <zircon/types.h>
 
 #include <fdio/debug.h>
+#include <fdio/io.fidl.h>
 #include <fdio/io.h>
 #include <fdio/vfs.h>
 
-#define MXDEBUG 0
+#define ZXDEBUG 0
 
-#define CAN_WRITE(ios) (((03 & ios->flags) == O_RDWR) || ((03 & ios->flags) == O_WRONLY))
-#define CAN_READ(ios) (((03 & ios->flags) == O_RDWR) || ((03 & ios->flags) == O_RDONLY))
+#define CAN_WRITE(ios) (ios->flags & ZX_FS_RIGHT_WRITABLE)
+#define CAN_READ(ios) (ios->flags & ZX_FS_RIGHT_READABLE)
+
+void describe_error(zx_handle_t h, zx_status_t status) {
+    zxrio_describe_t msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.op = ZXRIO_ON_OPEN;
+    msg.status = status;
+    zx_channel_write(h, 0, &msg, sizeof(msg), NULL, 0);
+    zx_handle_close(h);
+}
+
+static zx_status_t create_description(zx_device_t* dev, zxrio_describe_t* msg,
+                                      zx_handle_t* handle) {
+    memset(msg, 0, sizeof(*msg));
+    msg->op = ZXRIO_ON_OPEN;
+    msg->extra.tag = FDIO_PROTOCOL_DEVICE;
+    msg->status = ZX_OK;
+    *handle = ZX_HANDLE_INVALID;
+    if (dev->event != ZX_HANDLE_INVALID) {
+        //TODO: read only?
+        zx_status_t r;
+        if ((r = zx_handle_duplicate(dev->event, ZX_RIGHT_SAME_RIGHTS,
+                                     handle)) != ZX_OK) {
+            msg->status = r;
+            return r;
+        }
+    }
+    return ZX_OK;
+}
 
 devhost_iostate_t* create_devhost_iostate(zx_device_t* dev) {
     devhost_iostate_t* ios;
@@ -46,156 +74,80 @@ devhost_iostate_t* create_devhost_iostate(zx_device_t* dev) {
 static zx_status_t devhost_get_handles(zx_handle_t rh, zx_device_t* dev,
                                        const char* path, uint32_t flags) {
     zx_status_t r;
-    zxrio_object_t obj;
     devhost_iostate_t* newios;
+    // detect response directives and discard all other
+    // protocol flags
+    bool describe = flags & ZX_FS_FLAG_DESCRIBE;
+    flags &= (~ZX_FS_FLAG_DESCRIBE);
 
     if ((newios = create_devhost_iostate(dev)) == NULL) {
-        zx_handle_close(rh);
+        if (describe) {
+            describe_error(rh, ZX_ERR_NO_MEMORY);
+        }
         return ZX_ERR_NO_MEMORY;
     }
-
-    // detect pipeline directive and discard all other
-    // protocol flags
-    bool pipeline = flags & O_PIPELINE;
-    flags &= (~O_PIPELINE);
 
     newios->flags = flags;
 
     if ((r = device_open_at(dev, &dev, path, flags)) < 0) {
-        printf("devhost_get_handles(%p:%s) open path='%s', r=%d\n",
-               dev, dev->name, path ? path : "", r);
-        if (pipeline) {
-            goto fail_openat_pipelined;
-        } else {
-            goto fail_openat;
-        }
+        fprintf(stderr, "devhost_get_handles(%p:%s) open path='%s', r=%d\n",
+                dev, dev->name, path ? path : "", r);
+        goto fail;
     }
     newios->dev = dev;
 
-    if (!pipeline) {
-        if (dev->event > 0) {
-            //TODO: read only?
-            if ((r = zx_handle_duplicate(dev->event, ZX_RIGHT_SAME_RIGHTS, &obj.handle[0])) < 0) {
-                goto fail_duplicate;
+    if (describe) {
+        zxrio_describe_t info;
+        zx_handle_t handle;
+        if ((r = create_description(dev, &info, &handle)) != ZX_OK) {
+            goto fail_open;
+        }
+        uint32_t hcount = (handle != ZX_HANDLE_INVALID) ? 1 : 0;
+        r = zx_channel_write(rh, 0, &info, sizeof(info), &handle, hcount);
+        if (r != ZX_OK) {
+            if (hcount) {
+                zx_handle_close(handle);
             }
-            r = 1;
-        } else {
-            r = 0;
-        }
-        goto done;
-fail_duplicate:
-        device_close(dev, flags);
-fail_openat:
-        free(newios);
-done:
-        if (r < 0) {
-            obj.status = r;
-            obj.hcount = 0;
-        } else {
-            obj.status = ZX_OK;
-            obj.type = FDIO_PROTOCOL_REMOTE;
-            obj.hcount = r;
-        }
-        r = zx_channel_write(rh, 0, &obj, ZXRIO_OBJECT_MINSIZE,
-                             obj.handle, obj.hcount);
-
-        // Regardless of obj.status, if the zx_channel_write fails
-        // we must close the handles that didn't get transmitted.
-        if (r < 0) {
-            for (size_t i = 0; i < obj.hcount; i++) {
-                zx_handle_close(obj.handle[i]);
-            }
-        }
-
-        // If we were reporting an error, we've already closed
-        // the device and destroyed the iostate, so no matter
-        // what we close the handle and return
-        if (obj.status < 0) {
-            zx_handle_close(rh);
-            return obj.status;
-        }
-
-        // If we succeeded but the write failed, we have to
-        // tear down because the channel is now dead
-        if (r < 0) {
-            goto fail;
+            goto fail_open;
         }
     }
 
-    // Similarly, if we can't add the new ios and handle to the
-    // dispatcher our only option is to give up and tear down.
-    // In practice, this should never happen.
+    // If we can't add the new ios and handle to the dispatcher our only option
+    // is to give up and tear down.  In practice, this should never happen.
     if ((r = devhost_start_iostate(newios, rh)) < 0) {
-        printf("devhost_get_handles: failed to start iostate\n");
+        fprintf(stderr, "devhost_get_handles: failed to start iostate\n");
         goto fail;
     }
     return ZX_OK;
 
-fail:
+fail_open:
     device_close(dev, flags);
-fail_openat_pipelined:
+fail:
     free(newios);
-    zx_handle_close(rh);
+    if (describe) {
+        describe_error(rh, r);
+    } else {
+        zx_handle_close(rh);
+    }
     return r;
 }
 
-static void sync_io_complete(iotxn_t* txn, void* cookie) {
-    completion_signal((completion_t*)cookie);
-}
+#define DO_READ 0
+#define DO_WRITE 1
 
 static ssize_t do_sync_io(zx_device_t* dev, uint32_t opcode, void* buf, size_t count, zx_off_t off) {
-    if (dev->ops->iotxn_queue == NULL) {
-        size_t actual;
-        zx_status_t r;
-        if (opcode == IOTXN_OP_READ) {
-            r = dev_op_read(dev, buf, count, off, &actual);
-        } else {
-            r = dev_op_write(dev, buf, count, off, &actual);
-        }
-        if (r < 0) {
-            return r;
-        } else {
-            return actual;
-        }
+    size_t actual;
+    zx_status_t r;
+    if (opcode == DO_READ) {
+        r = dev_op_read(dev, buf, count, off, &actual);
+    } else {
+        r = dev_op_write(dev, buf, count, off, &actual);
     }
-    iotxn_t* txn;
-    zx_status_t status = iotxn_alloc(&txn, IOTXN_ALLOC_CONTIGUOUS | IOTXN_ALLOC_POOL, FDIO_CHUNK_SIZE);
-    if (status != ZX_OK) {
-        return status;
+    if (r < 0) {
+        return r;
+    } else {
+        return actual;
     }
-
-    assert(count <= FDIO_CHUNK_SIZE);
-
-    completion_t completion = COMPLETION_INIT;
-
-    txn->opcode = opcode;
-    txn->offset = off;
-    txn->length = count;
-    txn->complete_cb = sync_io_complete;
-    txn->cookie = &completion;
-
-    // if write, write the data to the iotxn
-    if (opcode == IOTXN_OP_WRITE) {
-        iotxn_copyto(txn, buf, txn->length, 0);
-    }
-
-    iotxn_queue(dev, txn);
-    completion_wait(&completion, ZX_TIME_INFINITE);
-
-    if (txn->status != ZX_OK) {
-        size_t txn_status = txn->status;
-        iotxn_release(txn);
-        return txn_status;
-    }
-
-    // if read, get the data
-    if (opcode == IOTXN_OP_READ) {
-        iotxn_copyfrom(txn, buf, txn->actual, 0);
-    }
-
-    ssize_t actual = txn->actual;
-    iotxn_release(txn);
-    return actual;
 }
 
 static ssize_t do_ioctl(zx_device_t* dev, uint32_t op, const void* in_buf, size_t in_len, void* out_buf, size_t out_len) {
@@ -214,7 +166,7 @@ static ssize_t do_ioctl(zx_device_t* dev, uint32_t op, const void* in_buf, size_
             return ZX_ERR_BUFFER_TOO_SMALL;
         }
         zx_handle_t* event = out_buf;
-        r = zx_handle_duplicate(dev->event, ZX_RIGHT_DUPLICATE | ZX_RIGHT_TRANSFER | ZX_RIGHT_READ, event);
+        r = zx_handle_duplicate(dev->event, ZX_RIGHTS_BASIC | ZX_RIGHT_READ, event);
         if (r == ZX_OK) {
             r = sizeof(zx_handle_t);
         }
@@ -267,6 +219,28 @@ static ssize_t do_ioctl(zx_device_t* dev, uint32_t op, const void* in_buf, size_
         memcpy(info->name, devhost_name, strlen(devhost_name));
         return sizeof(vfs_query_info_t) + strlen(devhost_name);
     }
+    case IOCTL_DEVICE_GET_DRIVER_LOG_FLAGS: {
+        if (!dev->driver) {
+            return ZX_ERR_UNAVAILABLE;
+        }
+        if (out_len < sizeof(uint32_t)) {
+            return ZX_ERR_BUFFER_TOO_SMALL;
+        }
+        *((uint32_t *)out_buf) = dev->driver->driver_rec->log_flags;
+        return sizeof(uint32_t);
+    }
+    case IOCTL_DEVICE_SET_DRIVER_LOG_FLAGS: {
+        if (!dev->driver) {
+            return ZX_ERR_UNAVAILABLE;
+        }
+        if (in_len < sizeof(driver_log_flags_t)) {
+            return ZX_ERR_BUFFER_TOO_SMALL;
+        }
+        driver_log_flags_t* flags = (driver_log_flags_t *)in_buf;
+        dev->driver->driver_rec->log_flags &= ~flags->clear;
+        dev->driver->driver_rec->log_flags |= flags->set;
+        return sizeof(driver_log_flags_t);
+    }
     default: {
         size_t actual = 0;
         r = dev_op_ioctl(dev, op, in_buf, in_len, out_buf, out_len, &actual);
@@ -278,20 +252,25 @@ static ssize_t do_ioctl(zx_device_t* dev, uint32_t op, const void* in_buf, size_
     return r;
 }
 
+static void discard_handles(zx_handle_t* handles, size_t count) {
+    while (count-- > 0) {
+        zx_handle_close(*handles++);
+    }
+}
+
 zx_status_t devhost_rio_handler(zxrio_msg_t* msg, void* cookie) {
     devhost_iostate_t* ios = cookie;
     zx_device_t* dev = ios->dev;
     uint32_t len = msg->datalen;
     int32_t arg = msg->arg;
-    msg->datalen = 0;
 
-    // ensure handle count specified by opcode matches reality
-    if (msg->hcount != ZXRIO_HC(msg->op)) {
-        return ZX_ERR_IO;
+    if (!ZXRIO_FIDL_MSG(msg->op)) {
+        msg->datalen = 0;
+        msg->hcount = 0;
     }
-    msg->hcount = 0;
 
     switch (ZXRIO_OP(msg->op)) {
+    case ZXFIDL_CLOSE:
     case ZXRIO_CLOSE:
         device_close(dev, ios->flags);
         // The ios released its reference to this device by calling device_close()
@@ -299,84 +278,201 @@ zx_status_t devhost_rio_handler(zxrio_msg_t* msg, void* cookie) {
         // attempts explode.
         ios->dev = (void*) 0xdead;
         return ZX_OK;
-    case ZXRIO_OPEN:
+    case ZXFIDL_OPEN:
+    case ZXRIO_OPEN: {
+        bool fidl = ZXRIO_FIDL_MSG(msg->op);
+        DirectoryOpenRequest* request = (DirectoryOpenRequest*) msg;
+        zx_handle_t h;
+        char* name;
+        uint32_t flags;
+
+        if (fidl) {
+            len = request->path.size;
+            h = request->object;
+            name = request->path.data;
+            flags = request->flags;
+        } else {
+            h = msg->handle[0];
+            name = (char*) msg->data;
+            flags = arg;
+        }
+
         if ((len < 1) || (len > 1024)) {
-            zx_handle_close(msg->handle[0]);
+            zx_handle_close(h);
             return ERR_DISPATCHER_INDIRECT;
         }
-        msg->data[len] = 0;
-        // fallthrough
-    case ZXRIO_CLONE: {
-        char* path = NULL;
-        uint32_t flags = arg;
-        if (ZXRIO_OP(msg->op) == ZXRIO_OPEN) {
-            xprintf("devhost_rio_handler() open dev %p name '%s' at '%s'\n",
-                    dev, dev->name, (char*) msg->data);
-            if (strcmp((char*)msg->data, ".")) {
-                path = (char*) msg->data;
-            }
-        } else {
-            xprintf("devhost_rio_handler() clone dev %p name '%s'\n", dev, dev->name);
-            flags = ios->flags | (flags & O_PIPELINE);
+        name[len] = 0;
+        if (!strcmp(name, ".")) {
+            name = NULL;
         }
-        devhost_get_handles(msg->handle[0], dev, path, flags);
+        devhost_get_handles(h, dev, name, flags);
         return ERR_DISPATCHER_INDIRECT;
     }
+    case ZXFIDL_CLONE:
+    case ZXRIO_CLONE: {
+        bool fidl = ZXRIO_FIDL_MSG(msg->op);
+        ObjectCloneRequest* request = (ObjectCloneRequest*) msg;
+        zx_handle_t h;
+        uint32_t flags;
+
+        if (fidl) {
+            h = request->object;
+            flags = request->flags;
+        } else {
+            h = msg->handle[0];
+            flags = arg;
+        }
+
+        flags = ios->flags | (flags & ZX_FS_FLAG_DESCRIBE);
+        devhost_get_handles(h, dev, NULL, flags);
+        return ERR_DISPATCHER_INDIRECT;
+    }
+    case ZXFIDL_READ:
     case ZXRIO_READ: {
         if (!CAN_READ(ios)) {
             return ZX_ERR_ACCESS_DENIED;
         }
-        zx_status_t r = do_sync_io(dev, IOTXN_OP_READ, msg->data, arg, ios->io_off);
+        bool fidl = ZXRIO_FIDL_MSG(msg->op);
+        FileReadRequest* request = (FileReadRequest*) msg;
+        FileReadResponse* response = (FileReadResponse*) msg;
+        void* data;
+        if (fidl) {
+            data = (void*)((uintptr_t)(response) + FIDL_ALIGN(sizeof(FileReadResponse)));
+            len = request->count;
+        } else {
+            data = msg->data;
+            len = arg;
+        }
+
+        zx_status_t r = do_sync_io(dev, DO_READ, data, len, ios->io_off);
         if (r >= 0) {
             ios->io_off += r;
-            msg->arg2.off = ios->io_off;
-            msg->datalen = r;
+            if (fidl) {
+                response->data.count = r;
+                r = ZX_OK;
+            } else {
+                msg->datalen = r;
+            }
         }
         return r;
     }
+    case ZXFIDL_READ_AT:
     case ZXRIO_READ_AT: {
         if (!CAN_READ(ios)) {
             return ZX_ERR_ACCESS_DENIED;
         }
-        zx_status_t r = do_sync_io(dev, IOTXN_OP_READ, msg->data, arg, msg->arg2.off);
-        if (r >= 0) {
-            msg->datalen = r;
+        bool fidl = ZXRIO_FIDL_MSG(msg->op);
+        FileReadAtRequest* request = (FileReadAtRequest*) msg;
+        FileReadAtResponse* response = (FileReadAtResponse*) msg;
+        void* data;
+        uint64_t offset;
+        if (fidl) {
+            data = (void*)((uintptr_t)(response) + FIDL_ALIGN(sizeof(FileReadAtResponse)));
+            len = request->count;
+            offset = request->offset;
+        } else {
+            data = msg->data;
+            len = arg;
+            offset = msg->arg2.off;
         }
-        return r;
+        zx_status_t r = do_sync_io(dev, DO_READ, data, len, offset);
+
+        if (fidl) {
+            response->data.count = r;
+            return r > 0 ? ZX_OK : r;
+        } else {
+            msg->datalen = r;
+            return r;
+        }
     }
+    case ZXFIDL_WRITE:
     case ZXRIO_WRITE: {
         if (!CAN_WRITE(ios)) {
             return ZX_ERR_ACCESS_DENIED;
         }
-        zx_status_t r = do_sync_io(dev, IOTXN_OP_WRITE, msg->data, len, ios->io_off);
+        bool fidl = ZXRIO_FIDL_MSG(msg->op);
+        FileWriteRequest* request = (FileWriteRequest*) msg;
+        FileWriteResponse* response = (FileWriteResponse*) msg;
+        void* data;
+        if (fidl) {
+            data = request->data.data;
+            len = request->data.count;
+        } else {
+            data = msg->data;
+        }
+
+        zx_status_t r = do_sync_io(dev, DO_WRITE, data, len, ios->io_off);
         if (r >= 0) {
             ios->io_off += r;
-            msg->arg2.off = ios->io_off;
+            if (fidl) {
+                response->actual = r;
+                r = ZX_OK;
+            }
         }
         return r;
     }
+    case ZXFIDL_WRITE_AT:
     case ZXRIO_WRITE_AT: {
         if (!CAN_WRITE(ios)) {
             return ZX_ERR_ACCESS_DENIED;
         }
-        zx_status_t r = do_sync_io(dev, IOTXN_OP_WRITE, msg->data, len, msg->arg2.off);
-        return r;
+        bool fidl = ZXRIO_FIDL_MSG(msg->op);
+        FileWriteAtRequest* request = (FileWriteAtRequest*) msg;
+        FileWriteAtResponse* response = (FileWriteAtResponse*) msg;
+        void* data;
+        uint64_t offset;
+        if (fidl) {
+            data = request->data.data;
+            len = request->data.count;
+            offset = request->offset;
+        } else {
+            data = msg->data;
+            offset = msg->arg2.off;
+        }
+
+        zx_status_t r = do_sync_io(dev, DO_WRITE, data, len, offset);
+
+        if (fidl) {
+            response->actual = r > 0 ? r : 0;
+            return r > 0 ? ZX_OK : r;
+        } else {
+            return r;
+        }
     }
+    case ZXFIDL_SEEK:
     case ZXRIO_SEEK: {
+        bool fidl = ZXRIO_FIDL_MSG(msg->op);
+        FileSeekRequest* request = (FileSeekRequest*) msg;
+        FileSeekResponse* response = (FileSeekResponse*) msg;
+
+        static_assert(SEEK_SET == SeekOrigin_Start, "");
+        static_assert(SEEK_CUR == SeekOrigin_Current, "");
+        static_assert(SEEK_END == SeekOrigin_End, "");
+
+        off_t offset;
+        int whence;
+        if (fidl) {
+            offset = request->offset;
+            whence = request->start;
+        } else {
+            offset = msg->arg2.off;
+            whence = arg;
+        }
+
         size_t end, n;
         end = dev_op_get_size(dev);
-        switch (arg) {
+        switch (whence) {
         case SEEK_SET:
-            if ((msg->arg2.off < 0) || ((size_t)msg->arg2.off > end)) {
+            if ((offset < 0) || ((size_t)offset > end)) {
                 return ZX_ERR_INVALID_ARGS;
             }
-            n = msg->arg2.off;
+            n = offset;
             break;
         case SEEK_CUR:
             // TODO: track seekability with flag, don't update off
             // at all on read/write if not seekable
-            n = ios->io_off + msg->arg2.off;
-            if (msg->arg2.off < 0) {
+            n = ios->io_off + offset;
+            if (offset < 0) {
                 // if negative seek
                 if (n > ios->io_off) {
                     // wrapped around
@@ -391,8 +487,8 @@ zx_status_t devhost_rio_handler(zxrio_msg_t* msg, void* cookie) {
             }
             break;
         case SEEK_END:
-            n = end + msg->arg2.off;
-            if (msg->arg2.off <= 0) {
+            n = end + offset;
+            if (offset <= 0) {
                 // if negative or exact-end seek
                 if (n > end) {
                     // wrapped around
@@ -413,10 +509,25 @@ zx_status_t devhost_rio_handler(zxrio_msg_t* msg, void* cookie) {
             return ZX_ERR_INVALID_ARGS;
         }
         ios->io_off = n;
-        msg->arg2.off = ios->io_off;
+        if (fidl) {
+            response->offset = ios->io_off;
+        } else {
+            msg->arg2.off = ios->io_off;
+        }
         return ZX_OK;
     }
+    case ZXFIDL_STAT:
     case ZXRIO_STAT: {
+        bool fidl = ZXRIO_FIDL_MSG(msg->op);
+        NodeGetAttrResponse* response = (NodeGetAttrResponse*) msg;
+        if (fidl) {
+            memset(&response->attributes, 0, sizeof(response->attributes));
+            response->attributes.mode = V_TYPE_CDEV | V_IRUSR | V_IWUSR;
+            response->attributes.content_size = dev_op_get_size(dev);
+            response->attributes.link_count = 1;
+            return ZX_OK;
+        }
+
         msg->datalen = sizeof(vnattr_t);
         vnattr_t* attr = (void*)msg->data;
         memset(attr, 0, sizeof(vnattr_t));
@@ -425,8 +536,75 @@ zx_status_t devhost_rio_handler(zxrio_msg_t* msg, void* cookie) {
         attr->nlink = 1;
         return msg->datalen;
     }
+    case ZXFIDL_SYNC:
     case ZXRIO_SYNC: {
         return do_ioctl(dev, IOCTL_DEVICE_SYNC, NULL, 0, NULL, 0);
+    }
+    case ZXFIDL_IOCTL: {
+        NodeIoctlRequest* request = (NodeIoctlRequest*) msg;
+        NodeIoctlResponse* response = (NodeIoctlResponse*) msg;
+
+        char in_buf[FDIO_IOCTL_MAX_INPUT];
+        size_t hsize = request->handles.count * sizeof(zx_handle_t);
+        if (hsize + request->in.count > FDIO_IOCTL_MAX_INPUT) {
+            discard_handles(request->handles.data, request->handles.count);
+            return ZX_ERR_INVALID_ARGS;
+        }
+        memcpy(in_buf, request->in.data, request->in.count);
+        memcpy(in_buf, request->handles.data, hsize);
+
+        uint32_t op = request->opcode;
+        void* secondary = (void*)((uintptr_t)(msg) + FIDL_ALIGN(sizeof(NodeIoctlResponse)));
+        zx_status_t r = do_ioctl(dev, op, in_buf, request->in.count,
+                                 secondary, request->max_out);
+        if (r >= 0) {
+            response->out.count = r;
+            r = ZX_OK;
+            switch (IOCTL_KIND(op)) {
+            case IOCTL_KIND_GET_HANDLE:
+                response->handles.count = 1;
+                break;
+            case IOCTL_KIND_GET_TWO_HANDLES:
+                response->handles.count = 2;
+                break;
+            case IOCTL_KIND_GET_THREE_HANDLES:
+                response->handles.count = 3;
+                break;
+            default:
+                response->handles.count = 0;
+                break;
+            }
+        }
+        response->handles.data = secondary;
+        response->out.data = secondary;
+        return r;
+    }
+    case ZXRIO_IOCTL_2H: {
+        if ((len > FDIO_IOCTL_MAX_INPUT) ||
+            (arg > (ssize_t)sizeof(msg->data)) ||
+            (IOCTL_KIND(msg->arg2.op) != IOCTL_KIND_SET_TWO_HANDLES)) {
+            zx_handle_close(msg->handle[0]);
+            zx_handle_close(msg->handle[1]);
+            return ZX_ERR_INVALID_ARGS;
+        }
+        size_t hsize = 2 * sizeof(zx_handle_t);
+        if (len < hsize) {
+            len = hsize;
+        }
+
+        char in_buf[FDIO_IOCTL_MAX_INPUT];
+        memcpy(in_buf, msg->handle, hsize);
+        memcpy(in_buf + hsize, msg->data + hsize, len - hsize);
+
+        zx_status_t r = do_ioctl(dev, msg->arg2.op, in_buf, len, msg->data, arg);
+
+        if (r == ZX_ERR_NOT_SUPPORTED) {
+            zx_handle_close(msg->handle[0]);
+            zx_handle_close(msg->handle[1]);
+        } else if (r >= 0) {
+            msg->datalen = r;
+        }
+        return r;
     }
     case ZXRIO_IOCTL_1H: {
         if ((len > FDIO_IOCTL_MAX_INPUT) ||

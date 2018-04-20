@@ -19,9 +19,9 @@
 #include <lib/console.h>
 #include <lib/vdso.h>
 #include <lk/init.h>
+#include <mexec.h>
 #include <object/channel_dispatcher.h>
-#include <object/handle_owner.h>
-#include <object/handles.h>
+#include <object/handle.h>
 #include <object/job_dispatcher.h>
 #include <object/message_packet.h>
 #include <object/process_dispatcher.h>
@@ -42,10 +42,6 @@ static const size_t stack_size = ZIRCON_DEFAULT_STACK_SIZE;
 #define STACK_VMO_NAME "userboot-initial-stack"
 #define RAMDISK_VMO_NAME "userboot-raw-ramdisk"
 #define CRASHLOG_VMO_NAME "crashlog"
-
-extern char __kernel_cmdline[CMDLINE_MAX];
-extern unsigned __kernel_cmdline_size;
-extern unsigned __kernel_cmdline_count;
 
 namespace {
 
@@ -118,7 +114,7 @@ static zx_status_t get_vmo_handle(fbl::RefPtr<VmObject> vmo, bool readonly,
         if (readonly)
             rights &= ~ZX_RIGHT_WRITE;
         if (ptr)
-            *ptr = MakeHandle(fbl::move(dispatcher), rights);
+            *ptr = Handle::Make(fbl::move(dispatcher), rights).release();
     }
     return result;
 }
@@ -129,7 +125,7 @@ static zx_status_t get_job_handle(Handle** ptr) {
     zx_status_t result = JobDispatcher::Create(
         0u, GetRootJobDispatcher(), &dispatcher, &rights);
     if (result == ZX_OK)
-        *ptr = MakeHandle(fbl::move(dispatcher), rights);
+        *ptr = Handle::Make(fbl::move(dispatcher), rights).release();
     return result;
 }
 
@@ -138,7 +134,8 @@ static zx_status_t get_resource_handle(Handle** ptr) {
     fbl::RefPtr<ResourceDispatcher> root;
     zx_status_t result = ResourceDispatcher::Create(&root, &rights, ZX_RSRC_KIND_ROOT, 0, 0);
     if (result == ZX_OK)
-        *ptr = MakeHandle(fbl::RefPtr<Dispatcher>(root.get()), rights);
+        *ptr = Handle::Make(fbl::RefPtr<Dispatcher>(root.get()),
+                            rights).release();
     return result;
 }
 
@@ -157,7 +154,7 @@ static zx_status_t make_bootstrap_channel(
         zx_status_t status = ChannelDispatcher::Create(&mpd0, &mpd1, &rights);
         if (status != ZX_OK)
             return status;
-        user_channel_handle.reset(MakeHandle(fbl::move(mpd0), rights));
+        user_channel_handle = Handle::Make(fbl::move(mpd0), rights);
         kernel_channel = DownCastDispatcher<ChannelDispatcher>(&mpd1);
     }
 
@@ -197,8 +194,8 @@ struct bootstrap_message {
 };
 
 static fbl::unique_ptr<MessagePacket> prepare_bootstrap_message() {
-    const uint32_t data_size =
-        static_cast<uint32_t>(offsetof(struct bootstrap_message, cmdline)) +
+    const size_t data_size =
+        offsetof(struct bootstrap_message, cmdline) +
         __kernel_cmdline_size;
     bootstrap_message* msg =
         static_cast<bootstrap_message*>(malloc(data_size));
@@ -210,7 +207,7 @@ static fbl::unique_ptr<MessagePacket> prepare_bootstrap_message() {
     msg->header.protocol = ZX_PROCARGS_PROTOCOL;
     msg->header.version = ZX_PROCARGS_VERSION;
     msg->header.environ_off = offsetof(struct bootstrap_message, cmdline);
-    msg->header.environ_num = __kernel_cmdline_count;
+    msg->header.environ_num = static_cast<uint32_t>(__kernel_cmdline_count);
     msg->header.handle_info_off =
         offsetof(struct bootstrap_message, handle_info);
     for (int i = 0; i < BOOTSTRAP_HANDLES; ++i) {
@@ -258,7 +255,7 @@ static fbl::unique_ptr<MessagePacket> prepare_bootstrap_message() {
     fbl::unique_ptr<MessagePacket> packet;
     uint32_t num_handles = BOOTSTRAP_HANDLES;
     zx_status_t status =
-        MessagePacket::Create(msg, data_size, num_handles, &packet);
+        MessagePacket::Create(msg, static_cast<uint32_t>(data_size), num_handles, &packet);
     free(msg);
     if (status != ZX_OK) {
         return nullptr;
@@ -268,8 +265,22 @@ static fbl::unique_ptr<MessagePacket> prepare_bootstrap_message() {
 
 static void clog_to_vmo(const void* data, size_t off, size_t len, void* cookie) {
     VmObject* vmo = static_cast<VmObject*>(cookie);
-    size_t actual;
-    vmo->Write(data, off, len, &actual);
+    vmo->Write(data, off, len);
+}
+
+// Converts platform crashlog into a VMO
+static zx_status_t crashlog_to_vmo(fbl::RefPtr<VmObject>* out) {
+    size_t size = platform_recover_crashlog(0, NULL, NULL);
+    fbl::RefPtr<VmObject> crashlog_vmo;
+    zx_status_t status = VmObjectPaged::Create(PMM_ALLOC_FLAG_ANY, size, &crashlog_vmo);
+    if (status != ZX_OK) {
+        return status;
+    }
+    platform_recover_crashlog(size, crashlog_vmo.get(), clog_to_vmo);
+    crashlog_vmo->set_name(CRASHLOG_VMO_NAME, sizeof(CRASHLOG_VMO_NAME) - 1);
+    mexec_stash_crashlog(crashlog_vmo);
+    *out = fbl::move(crashlog_vmo);
+    return ZX_OK;
 }
 
 static zx_status_t attempt_userboot() {
@@ -290,13 +301,10 @@ static zx_status_t attempt_userboot() {
         return status;
     rootfs_vmo->set_name(RAMDISK_VMO_NAME, sizeof(RAMDISK_VMO_NAME) - 1);
 
-    size_t size = platform_recover_crashlog(0, NULL, NULL);
     fbl::RefPtr<VmObject> crashlog_vmo;
-    status = VmObjectPaged::Create(PMM_ALLOC_FLAG_ANY, size, &crashlog_vmo);
+    status = crashlog_to_vmo(&crashlog_vmo);
     if (status != ZX_OK)
         return status;
-    platform_recover_crashlog(size, crashlog_vmo.get(), clog_to_vmo);
-    crashlog_vmo->set_name(CRASHLOG_VMO_NAME, sizeof(CRASHLOG_VMO_NAME) - 1);
 
     // Prepare the bootstrap message packet.  This puts its data (the
     // kernel command line) in place, and allocates space for its handles.
@@ -314,7 +322,7 @@ static zx_status_t attempt_userboot() {
         status = get_vmo_handle(stack_vmo, false, &stack_vmo_dispatcher,
                                 &handles[BOOTSTRAP_STACK]);
     if (status == ZX_OK)
-        status = get_vmo_handle(crashlog_vmo, false, nullptr,
+        status = get_vmo_handle(crashlog_vmo, true, nullptr,
                                 &handles[BOOTSTRAP_CRASHLOG]);
     if (status == ZX_OK)
         status = get_resource_handle(&handles[BOOTSTRAP_RESOURCE_ROOT]);
@@ -346,12 +354,12 @@ static zx_status_t attempt_userboot() {
     if (status < 0)
         return status;
 
-    handles[BOOTSTRAP_PROC] = MakeHandle(proc_disp, rights);
+    handles[BOOTSTRAP_PROC] = Handle::Make(proc_disp, rights).release();
 
     auto proc = DownCastDispatcher<ProcessDispatcher>(&proc_disp);
     ASSERT(proc);
 
-    handles[BOOTSTRAP_VMAR_ROOT] = MakeHandle(vmar, vmar_rights);
+    handles[BOOTSTRAP_VMAR_ROOT] = Handle::Make(vmar, vmar_rights).release();
 
     const VDso* vdso = VDso::Create();
     for (size_t i = BOOTSTRAP_VDSO; i <= BOOTSTRAP_VDSO_LAST_VARIANT; ++i) {
@@ -388,7 +396,7 @@ static zx_status_t attempt_userboot() {
         status = ThreadDispatcher::Create(proc, 0, "userboot", &ut_disp, &rights);
         if (status < 0)
             return status;
-        handles[BOOTSTRAP_THREAD] = MakeHandle(ut_disp, rights);
+        handles[BOOTSTRAP_THREAD] = Handle::Make(ut_disp, rights).release();
         thread = DownCastDispatcher<ThreadDispatcher>(&ut_disp);
     }
     DEBUG_ASSERT(thread);
@@ -402,7 +410,7 @@ static zx_status_t attempt_userboot() {
     dprintf(SPEW, "userboot: %-23s @ %#" PRIxPTR "\n", "entry point", entry);
 
     // Start the process's initial thread.
-    status = thread->Start(entry, sp, hv, vdso_base,
+    status = thread->Start(entry, sp, static_cast<uintptr_t>(hv), vdso_base,
                            /* initial_thread= */ true);
     if (status != ZX_OK) {
         printf("userboot: failed to start initial thread: %d\n", status);
@@ -413,12 +421,7 @@ static zx_status_t attempt_userboot() {
 }
 
 void userboot_init(uint level) {
-#if !WITH_APP_SHELL
-    dprintf(INFO, "userboot: console init\n");
-    console_init();
-#endif
-
     attempt_userboot();
 }
 
-LK_INIT_HOOK(userboot, userboot_init, LK_INIT_LEVEL_APPS - 1);
+LK_INIT_HOOK(userboot, userboot_init, LK_INIT_LEVEL_USER);

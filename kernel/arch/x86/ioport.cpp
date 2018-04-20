@@ -14,10 +14,10 @@
 #include <kernel/auto_lock.h>
 #include <kernel/mp.h>
 #include <kernel/thread.h>
-#include <kernel/vm.h>
-#include <vm/vm_aspace.h>
-#include <malloc.h>
 #include <string.h>
+#include <vm/vm.h>
+#include <vm/vm_aspace.h>
+#include <zircon/types.h>
 
 #include <fbl/alloc_checker.h>
 #include <fbl/unique_ptr.h>
@@ -42,7 +42,7 @@ static void x86_clear_tss_io_bitmap(const bitmap::RleBitmap& bitmap) {
 }
 
 void x86_clear_tss_io_bitmap(IoBitmap& io_bitmap) {
-    AutoSpinLock guard(&io_bitmap.lock_);
+    AutoSpinLockNoIrqSave guard(&io_bitmap.lock_);
     if (!io_bitmap.bitmap_)
         return;
 
@@ -61,7 +61,7 @@ static void x86_set_tss_io_bitmap(const bitmap::RleBitmap& bitmap) {
 }
 
 void x86_set_tss_io_bitmap(IoBitmap& io_bitmap) {
-    AutoSpinLock guard(&io_bitmap.lock_);
+    AutoSpinLockNoIrqSave guard(&io_bitmap.lock_);
     if (!io_bitmap.bitmap_)
         return;
 
@@ -73,7 +73,7 @@ IoBitmap& IoBitmap::GetCurrent() {
     return aspace->arch_aspace().io_bitmap();
 }
 
-IoBitmap::~IoBitmap() { }
+IoBitmap::~IoBitmap() {}
 
 struct ioport_update_context {
     // IoBitmap that we're trying to update
@@ -91,7 +91,7 @@ void IoBitmap::UpdateTask(void* raw_context) {
     }
 
     {
-        AutoSpinLock guard(&io_bitmap.lock_);
+        AutoSpinLockNoIrqSave guard(&io_bitmap.lock_);
         // This is overkill, but it's much simpler to reason about
         x86_reset_tss_io_bitmap();
         x86_set_tss_io_bitmap(*io_bitmap.bitmap_);
@@ -132,18 +132,16 @@ int IoBitmap::SetIoBitmap(uint32_t port, uint32_t len, bool enable) {
     spin_lock_saved_state_t state;
     arch_interrupt_save(&state, 0);
 
-    status_t status = ZX_OK;
+    zx_status_t status = ZX_OK;
     do {
-        AutoSpinLock guard(&lock_);
+        AutoSpinLockNoIrqSave guard(&lock_);
 
         if (!bitmap_) {
             bitmap_ = fbl::move(optimistic_bitmap);
         }
         DEBUG_ASSERT(bitmap_);
 
-        status = enable ?
-                bitmap_->SetNoAlloc(port, port + len, &bitmap_freelist) :
-                bitmap_->ClearNoAlloc(port, port + len, &bitmap_freelist);
+        status = enable ? bitmap_->SetNoAlloc(port, port + len, &bitmap_freelist) : bitmap_->ClearNoAlloc(port, port + len, &bitmap_freelist);
         if (status != ZX_OK) {
             break;
         }

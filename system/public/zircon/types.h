@@ -4,11 +4,11 @@
 
 #pragma once
 
-#include <zircon/compiler.h>
-#include <zircon/errors.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <zircon/compiler.h>
+#include <zircon/errors.h>
 #ifndef __cplusplus
 #ifndef _KERNEL
 // We don't want to include <stdatomic.h> from the kernel code because the
@@ -27,25 +27,26 @@ __BEGIN_CDECLS
 // ask clang format not to mess up the indentation:
 // clang-format off
 
-#ifdef _KERNEL
 typedef uint32_t zx_handle_t;
-#else
-typedef int32_t zx_handle_t;
-#endif
 
 #define ZX_HANDLE_INVALID         ((zx_handle_t)0)
 
-// Same as kernel status_t
+// See errors.h for the values zx_status_t can take.
 typedef int32_t zx_status_t;
 
 // absolute time in nanoseconds (generally with respect to the monotonic clock)
 typedef uint64_t zx_time_t;
 // a duration in nanoseconds
 typedef uint64_t zx_duration_t;
+// a duration in hardware ticks
+typedef uint64_t zx_ticks_t;
 #define ZX_TIME_INFINITE UINT64_MAX
+#define ZX_NSEC(n) ((zx_duration_t)(1ULL * (n)))
 #define ZX_USEC(n) ((zx_duration_t)(1000ULL * (n)))
 #define ZX_MSEC(n) ((zx_duration_t)(1000000ULL * (n)))
 #define ZX_SEC(n)  ((zx_duration_t)(1000000000ULL * (n)))
+#define ZX_MIN(n)  (ZX_SEC(n) * 60ULL)
+#define ZX_HOUR(n) (ZX_MIN(n) * 60ULL)
 
 typedef uint32_t zx_signals_t;
 
@@ -80,7 +81,7 @@ typedef uint32_t zx_signals_t;
 #define __ZX_OBJECT_SIGNAL_19       ((zx_signals_t)1u << 19)
 #define __ZX_OBJECT_SIGNAL_20       ((zx_signals_t)1u << 20)
 #define __ZX_OBJECT_SIGNAL_21       ((zx_signals_t)1u << 21)
-#define __ZX_OBJECT_LAST_HANDLE     ((zx_signals_t)1u << 22)
+#define __ZX_OBJECT_SIGNAL_22       ((zx_signals_t)1u << 22)
 #define __ZX_OBJECT_HANDLE_CLOSED   ((zx_signals_t)1u << 23)
 
 
@@ -97,9 +98,6 @@ typedef uint32_t zx_signals_t;
 
 // Cancelation (handle was closed while waiting with it)
 #define ZX_SIGNAL_HANDLE_CLOSED     __ZX_OBJECT_HANDLE_CLOSED
-
-// Only one user-more reference (handle) to the object exists.
-#define ZX_SIGNAL_LAST_HANDLE       __ZX_OBJECT_LAST_HANDLE
 
 // Event
 #define ZX_EVENT_SIGNALED           __ZX_OBJECT_SIGNALED
@@ -123,9 +121,8 @@ typedef uint32_t zx_signals_t;
 #define ZX_SOCKET_WRITE_DISABLED    __ZX_OBJECT_SIGNAL_5
 #define ZX_SOCKET_CONTROL_READABLE  __ZX_OBJECT_SIGNAL_6
 #define ZX_SOCKET_CONTROL_WRITABLE  __ZX_OBJECT_SIGNAL_7
-
-// Port
-#define ZX_PORT_READABLE            __ZX_OBJECT_READABLE
+#define ZX_SOCKET_ACCEPT            __ZX_OBJECT_SIGNAL_8
+#define ZX_SOCKET_SHARE             __ZX_OBJECT_SIGNAL_9
 
 // Fifo
 #define ZX_FIFO_READABLE            __ZX_OBJECT_READABLE
@@ -144,6 +141,8 @@ typedef uint32_t zx_signals_t;
 
 // Thread
 #define ZX_THREAD_TERMINATED        __ZX_OBJECT_SIGNALED
+#define ZX_THREAD_RUNNING           __ZX_OBJECT_SIGNAL_4
+#define ZX_THREAD_SUSPENDED         __ZX_OBJECT_SIGNAL_5
 
 // Log
 #define ZX_LOG_READABLE             __ZX_OBJECT_READABLE
@@ -151,6 +150,9 @@ typedef uint32_t zx_signals_t;
 
 // Timer
 #define ZX_TIMER_SIGNALED           __ZX_OBJECT_SIGNALED
+
+// VMO
+#define ZX_VMO_ZERO_CHILDREN        __ZX_OBJECT_SIGNALED
 
 // global kernel object id.
 typedef uint64_t zx_koid_t;
@@ -170,6 +172,10 @@ typedef struct {
     uint32_t rd_num_bytes;
     uint32_t rd_num_handles;
 } zx_channel_call_args_t;
+
+// Maximum number of wait items allowed for zx_object_wait_many()
+// TODO(ZX-1349) Re-lower this.
+#define ZX_WAIT_MANY_MAX_ITEMS 16
 
 // Structure for zx_object_wait_many():
 typedef struct {
@@ -194,15 +200,35 @@ typedef uint32_t zx_rights_t;
 #define ZX_RIGHT_GET_POLICY       ((zx_rights_t)1u << 11)
 #define ZX_RIGHT_SIGNAL           ((zx_rights_t)1u << 12)
 #define ZX_RIGHT_SIGNAL_PEER      ((zx_rights_t)1u << 13)
-
+#define ZX_RIGHT_WAIT             ((zx_rights_t)1u << 14)
+#define ZX_RIGHT_INSPECT          ((zx_rights_t)1u << 15)
+#define ZX_RIGHT_MANAGE_JOB       ((zx_rights_t)1u << 16)
+#define ZX_RIGHT_MANAGE_PROCESS   ((zx_rights_t)1u << 17)
+#define ZX_RIGHT_MANAGE_THREAD    ((zx_rights_t)1u << 18)
+#define ZX_RIGHT_APPLY_PROFILE    ((zx_rights_t)1u << 19)
 #define ZX_RIGHT_SAME_RIGHTS      ((zx_rights_t)1u << 31)
+
+// Convenient names for commonly grouped rights
+#define ZX_RIGHTS_BASIC \
+    (ZX_RIGHT_TRANSFER | ZX_RIGHT_DUPLICATE |\
+     ZX_RIGHT_WAIT | ZX_RIGHT_INSPECT)
+
+#define ZX_RIGHTS_IO \
+    (ZX_RIGHT_READ | ZX_RIGHT_WRITE)
+
+#define ZX_RIGHTS_PROPERTY \
+    (ZX_RIGHT_GET_PROPERTY | ZX_RIGHT_SET_PROPERTY)
+
+#define ZX_RIGHTS_POLICY \
+    (ZX_RIGHT_GET_POLICY | ZX_RIGHT_SET_POLICY)
+
 
 // VM Object opcodes
 #define ZX_VMO_OP_COMMIT                 1u
 #define ZX_VMO_OP_DECOMMIT               2u
 #define ZX_VMO_OP_LOCK                   3u
 #define ZX_VMO_OP_UNLOCK                 4u
-#define ZX_VMO_OP_LOOKUP                 5u
+// opcode 5 was ZX_VMO_OP_LOOKUP, but is now unused.
 #define ZX_VMO_OP_CACHE_SYNC             6u
 #define ZX_VMO_OP_CACHE_INVALIDATE       7u
 #define ZX_VMO_OP_CACHE_CLEAN            8u
@@ -234,10 +260,11 @@ typedef uintptr_t zx_vaddr_t;
 
 // physical address
 typedef uintptr_t zx_paddr_t;
+// low mem physical address
+typedef uint32_t  zx_paddr32_t;
 
 // offset
 typedef uint64_t zx_off_t;
-typedef int64_t zx_rel_off_t;
 
 // Maximum string length for kernel names (process name, thread name, etc)
 #define ZX_MAX_NAME_LEN           (32)
@@ -246,8 +273,23 @@ typedef int64_t zx_rel_off_t;
 #define ZX_CPRNG_DRAW_MAX_LEN        256
 #define ZX_CPRNG_ADD_ENTROPY_MAX_LEN 256
 
-// interrupt flags
-#define ZX_FLAG_REMAP_IRQ  0x1
+// interrupt bind flags
+#define ZX_INTERRUPT_REMAP_IRQ       0x1
+#define ZX_INTERRUPT_MODE_DEFAULT    (0u << 1)
+#define ZX_INTERRUPT_MODE_EDGE_LOW   (1u << 1)
+#define ZX_INTERRUPT_MODE_EDGE_HIGH  (2u << 1)
+#define ZX_INTERRUPT_MODE_LEVEL_LOW  (3u << 1)
+#define ZX_INTERRUPT_MODE_LEVEL_HIGH (4u << 1)
+#define ZX_INTERRUPT_MODE_MASK       0xe
+#define ZX_INTERRUPT_VIRTUAL         0x10
+
+// Preallocated virtual interrupt slot, typically used for signaling interrupt threads to exit.
+#define ZX_INTERRUPT_SLOT_USER              62
+// interrupt wait slots must be in the range 0 - 62 inclusive
+#define ZX_INTERRUPT_MAX_SLOTS              62
+
+// PCI interrupt handles use interrupt slot 0 for the PCI hardware interrupt
+#define ZX_PCI_INTERRUPT_SLOT               0
 
 // Channel options and limits.
 #define ZX_CHANNEL_READ_MAY_DISCARD         1u
@@ -260,33 +302,74 @@ typedef int64_t zx_rel_off_t;
 #define ZX_SOCKET_SHUTDOWN_WRITE            (1u << 0)
 #define ZX_SOCKET_SHUTDOWN_READ             (1u << 1)
 #define ZX_SOCKET_SHUTDOWN_MASK             (ZX_SOCKET_SHUTDOWN_WRITE | ZX_SOCKET_SHUTDOWN_READ)
+
 // These can be passed to zx_socket_create()
 #define ZX_SOCKET_STREAM                    (0u << 0)
 #define ZX_SOCKET_DATAGRAM                  (1u << 0)
 #define ZX_SOCKET_HAS_CONTROL               (1u << 1)
-#define ZX_SOCKET_CREATE_MASK               (ZX_SOCKET_DATAGRAM | ZX_SOCKET_HAS_CONTROL)
+#define ZX_SOCKET_HAS_ACCEPT                (1u << 2)
+#define ZX_SOCKET_CREATE_MASK               (ZX_SOCKET_DATAGRAM | ZX_SOCKET_HAS_CONTROL | ZX_SOCKET_HAS_ACCEPT)
+
 // These can be passed to zx_socket_read() and zx_socket_write().
 #define ZX_SOCKET_CONTROL                   (1u << 2)
 
 // Flags which can be used to to control cache policy for APIs which map memory.
-typedef enum {
-    ZX_CACHE_POLICY_CACHED          = 0,
-    ZX_CACHE_POLICY_UNCACHED        = 1,
-    ZX_CACHE_POLICY_UNCACHED_DEVICE = 2,
-    ZX_CACHE_POLICY_WRITE_COMBINING = 3,
-
-    ZX_CACHE_POLICY_MASK            = 0x3,
-} zx_cache_policy_t;
+#define ZX_CACHE_POLICY_CACHED              0u
+#define ZX_CACHE_POLICY_UNCACHED            1u
+#define ZX_CACHE_POLICY_UNCACHED_DEVICE     2u
+#define ZX_CACHE_POLICY_WRITE_COMBINING     3u
+#define ZX_CACHE_POLICY_MASK                3u
 
 // Flag bits for zx_cache_flush.
 #define ZX_CACHE_FLUSH_INSN         (1u << 0)
 #define ZX_CACHE_FLUSH_DATA         (1u << 1)
+#define ZX_CACHE_FLUSH_INVALIDATE   (1u << 2)
 
 // Timer options.
 #define ZX_TIMER_SLACK_CENTER       0u
 #define ZX_TIMER_SLACK_EARLY        1u
 #define ZX_TIMER_SLACK_LATE         2u
 
+// Bus Transaction Initiatior options.
+#define ZX_BTI_PERM_READ          (1u << 0)
+#define ZX_BTI_PERM_WRITE         (1u << 1)
+#define ZX_BTI_PERM_EXECUTE       (1u << 2)
+#define ZX_BTI_COMPRESS           (1u << 3)
+
+typedef uint32_t zx_obj_type_t;
+
+#define ZX_OBJ_TYPE_NONE            ((zx_obj_type_t)0u)
+#define ZX_OBJ_TYPE_PROCESS         ((zx_obj_type_t)1u)
+#define ZX_OBJ_TYPE_THREAD          ((zx_obj_type_t)2u)
+#define ZX_OBJ_TYPE_VMO             ((zx_obj_type_t)3u)
+#define ZX_OBJ_TYPE_CHANNEL         ((zx_obj_type_t)4u)
+#define ZX_OBJ_TYPE_EVENT           ((zx_obj_type_t)5u)
+#define ZX_OBJ_TYPE_PORT            ((zx_obj_type_t)6u)
+#define ZX_OBJ_TYPE_INTERRUPT       ((zx_obj_type_t)9u)
+#define ZX_OBJ_TYPE_PCI_DEVICE      ((zx_obj_type_t)11u)
+#define ZX_OBJ_TYPE_LOG             ((zx_obj_type_t)12u)
+#define ZX_OBJ_TYPE_SOCKET          ((zx_obj_type_t)14u)
+#define ZX_OBJ_TYPE_RESOURCE        ((zx_obj_type_t)15u)
+#define ZX_OBJ_TYPE_EVENT_PAIR      ((zx_obj_type_t)16u)
+#define ZX_OBJ_TYPE_JOB             ((zx_obj_type_t)17u)
+#define ZX_OBJ_TYPE_VMAR            ((zx_obj_type_t)18u)
+#define ZX_OBJ_TYPE_FIFO            ((zx_obj_type_t)19u)
+#define ZX_OBJ_TYPE_GUEST           ((zx_obj_type_t)20u)
+#define ZX_OBJ_TYPE_VCPU            ((zx_obj_type_t)21u)
+#define ZX_OBJ_TYPE_TIMER           ((zx_obj_type_t)22u)
+#define ZX_OBJ_TYPE_IOMMU           ((zx_obj_type_t)23u)
+#define ZX_OBJ_TYPE_BTI             ((zx_obj_type_t)24u)
+#define ZX_OBJ_TYPE_PROFILE         ((zx_obj_type_t)25u)
+#define ZX_OBJ_TYPE_PMT             ((zx_obj_type_t)26u)
+#define ZX_OBJ_TYPE_SUSPEND_TOKEN   ((zx_obj_type_t)27u)
+#define ZX_OBJ_TYPE_LAST            ((zx_obj_type_t)28u)
+
+typedef struct {
+    zx_handle_t handle;
+    zx_obj_type_t type;
+    zx_rights_t rights;
+    uint32_t unused;
+} zx_handle_info_t;
 
 #ifdef __cplusplus
 // We cannot use <stdatomic.h> with C++ code as _Atomic qualifier defined by

@@ -6,38 +6,63 @@
 
 #include "el2_cpu_state_priv.h"
 
+#include <arch/arm64/el2_state.h>
+#include <arch/arm64/mmu.h>
 #include <fbl/auto_lock.h>
 #include <fbl/mutex.h>
+#include <hypervisor/cpu.h>
+#include <kernel/mp.h>
+#include <vm/physmap.h>
 #include <vm/pmm.h>
 
-static fbl::Mutex el2_mutex;
-static size_t num_guests TA_GUARDED(el2_mutex) = 0;
-static fbl::unique_ptr<El2CpuState> el2_cpu_state TA_GUARDED(el2_mutex);
+static fbl::Mutex guest_mutex;
+static size_t num_guests TA_GUARDED(guest_mutex) = 0;
+static fbl::unique_ptr<El2CpuState> el2_cpu_state TA_GUARDED(guest_mutex);
 
-__BEGIN_CDECLS
-extern zx_status_t arm64_el2_on(zx_paddr_t stack_top);
-extern zx_status_t arm64_el2_off();
-__END_CDECLS
+zx_status_t El2TranslationTable::Init() {
+    zx_status_t status = l0_page_.Alloc(0);
+    if (status != ZX_OK) {
+        return status;
+    }
+    status = l1_page_.Alloc(0);
+    if (status != ZX_OK) {
+        return status;
+    }
 
-El2Stack::~El2Stack() {
-    if (stack_paddr_ != 0)
-        pmm_free_kpages(paddr_to_kvaddr(stack_paddr_), ARCH_DEFAULT_STACK_SIZE / PAGE_SIZE);
+    // L0: Point to a single L1 translation table.
+    pte_t* l0_pte = l0_page_.VirtualAddress<pte_t>();
+    *l0_pte = l1_page_.PhysicalAddress() | MMU_PTE_L012_DESCRIPTOR_TABLE;
+
+    // L1: Identity map the first 512GB of physical memory at.
+    pte_t* l1_pte = l1_page_.VirtualAddress<pte_t>();
+    for (size_t i = 0; i < PAGE_SIZE / sizeof(pte_t); i++) {
+        l1_pte[i] = i * (1u << 30) | MMU_PTE_ATTR_AF | MMU_PTE_ATTR_SH_INNER_SHAREABLE |
+                    MMU_PTE_ATTR_AP_P_RW_U_RW | MMU_PTE_ATTR_NORMAL_MEMORY |
+                    MMU_PTE_L012_DESCRIPTOR_BLOCK;
+    }
+
+    DMB;
+    return ZX_OK;
+}
+
+zx_paddr_t El2TranslationTable::Base() const {
+    return l0_page_.PhysicalAddress();
 }
 
 zx_status_t El2Stack::Alloc() {
-    pmm_alloc_kpages(ARCH_DEFAULT_STACK_SIZE / PAGE_SIZE, nullptr, &stack_paddr_);
-    return stack_paddr_ != 0 ? ZX_OK : ZX_ERR_NO_MEMORY;
+    return page_.Alloc(0);
 }
 
 zx_paddr_t El2Stack::Top() const {
-    return stack_paddr_ + ARCH_DEFAULT_STACK_SIZE;
+    return page_.PhysicalAddress() + PAGE_SIZE;
 }
 
-static zx_status_t el2_on_task(void* context, uint cpu_num) {
-    auto stacks = static_cast<fbl::Array<El2Stack>*>(context);
-    El2Stack& stack = (*stacks)[cpu_num];
+zx_status_t El2CpuState::OnTask(void* context, uint cpu_num) {
+    auto cpu_state = static_cast<El2CpuState*>(context);
+    El2TranslationTable& table = cpu_state->table_;
+    El2Stack& stack = cpu_state->stacks_[cpu_num];
 
-    zx_status_t status = arm64_el2_on(stack.Top());
+    zx_status_t status = arm64_el2_on(table.Base(), stack.Top());
     if (status != ZX_OK) {
         dprintf(CRITICAL, "Failed to turn EL2 on for CPU %u\n", cpu_num);
         return status;
@@ -62,6 +87,11 @@ zx_status_t El2CpuState::Create(fbl::unique_ptr<El2CpuState>* out) {
     if (status != ZX_OK)
         return status;
 
+    // Initialise the EL2 translation table.
+    status = cpu_state->table_.Init();
+    if (status != ZX_OK)
+        return status;
+
     // Allocate EL2 stack for each CPU.
     size_t num_cpus = arch_max_num_cpus();
     El2Stack* stacks = new (&ac) El2Stack[num_cpus];
@@ -73,15 +103,15 @@ zx_status_t El2CpuState::Create(fbl::unique_ptr<El2CpuState>* out) {
         if (status != ZX_OK)
             return status;
     }
+    cpu_state->stacks_ = fbl::move(el2_stacks);
 
     // Setup EL2 for all online CPUs.
-    mp_cpu_mask_t cpu_mask = percpu_exec(el2_on_task, &el2_stacks);
+    cpu_mask_t cpu_mask = percpu_exec(OnTask, cpu_state.get());
     if (cpu_mask != mp_get_online_mask()) {
         mp_sync_exec(MP_IPI_TARGET_MASK, cpu_mask, el2_off_task, nullptr);
         return ZX_ERR_NOT_SUPPORTED;
     }
 
-    cpu_state->stacks_ = fbl::move(el2_stacks);
     *out = fbl::move(cpu_state);
     return ZX_OK;
 }
@@ -91,7 +121,7 @@ El2CpuState::~El2CpuState() {
 }
 
 zx_status_t alloc_vmid(uint8_t* vmid) {
-    fbl::AutoLock lock(&el2_mutex);
+    fbl::AutoLock lock(&guest_mutex);
     if (num_guests == 0) {
         zx_status_t status = El2CpuState::Create(&el2_cpu_state);
         if (status != ZX_OK)
@@ -102,7 +132,7 @@ zx_status_t alloc_vmid(uint8_t* vmid) {
 }
 
 zx_status_t free_vmid(uint8_t vmid) {
-    fbl::AutoLock lock(&el2_mutex);
+    fbl::AutoLock lock(&guest_mutex);
     zx_status_t status = el2_cpu_state->FreeId(vmid);
     if (status != ZX_OK)
         return status;

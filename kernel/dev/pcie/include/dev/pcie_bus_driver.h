@@ -27,7 +27,6 @@ class PcieRoot;
 class PcieUpstreamNode;
 class PciConfig;
 
-
 class PcieBusDriver : public fbl::RefCounted<PcieBusDriver> {
 public:
     // QuirkHandler
@@ -66,11 +65,11 @@ public:
 
     // Add a section of memory mapped PCI config space to the bus driver,
     // provided that it does not overlap with any existing ecam regions.
-    status_t AddEcamRegion(const EcamRegion& ecam);
+    zx_status_t AddEcamRegion(const EcamRegion& ecam);
     const PciConfig* GetConfig(uint bus_id,
-                                uint dev_id,
-                                uint func_id,
-                                paddr_t* out_cfg_phys = nullptr);
+                               uint dev_id,
+                               uint func_id,
+                               paddr_t* out_cfg_phys = nullptr);
 
     // Address space (PIO and MMIO) allocation management
     //
@@ -88,16 +87,16 @@ public:
     // back.  If this behavior is unacceptable, users should be sure to submit
     // only MMIO address space operations which target regions either entirely
     // above or entirely below the 4GB mark.
-    status_t AddBusRegion(uint64_t base, uint64_t size, PciAddrSpace aspace) {
+    zx_status_t AddBusRegion(uint64_t base, uint64_t size, PciAddrSpace aspace) {
         return AddSubtractBusRegion(base, size, aspace, true);
     }
 
-    status_t SubtractBusRegion(uint64_t base, uint64_t size, PciAddrSpace aspace) {
+    zx_status_t SubtractBusRegion(uint64_t base, uint64_t size, PciAddrSpace aspace) {
         return AddSubtractBusRegion(base, size, aspace, false);
     }
 
     // Add a root bus to the driver and attempt to scan it for devices.
-    status_t AddRoot(fbl::RefPtr<PcieRoot>&& root);
+    zx_status_t AddRoot(fbl::RefPtr<PcieRoot>&& root);
 
     // Set a bus driver's memory address space to MMIO or IO.
     //
@@ -139,10 +138,10 @@ public:
     // devices under each of the added roots, run all registered quirks and
     // attempt to allocated bus/IRQ resources for discovered devices.
     //
-    status_t StartBusDriver();
+    zx_status_t StartBusDriver();
 
     // Rescan looking for new devices
-    status_t RescanDevices();
+    zx_status_t RescanDevices();
 
     // TODO(johngro) : Remove this someday.  Getting the "Nth" device is not a
     // concept which is going to carry over well to the world of hot-plugable
@@ -160,6 +159,7 @@ public:
     const RegionAllocator::RegionPool::RefPtr& region_bookkeeping() const {
         return region_bookkeeping_;
     }
+    RegionAllocator& pf_mmio_regions() { return pf_mmio_regions_; }
     RegionAllocator& mmio_lo_regions() { return mmio_lo_regions_; }
     RegionAllocator& mmio_hi_regions() { return mmio_hi_regions_; }
     RegionAllocator& pio_regions()     { return pio_regions_; }
@@ -177,8 +177,8 @@ public:
     }
 
     void DisableBus();
-    static status_t InitializeDriver(PciePlatformInterface& platform);
-    static void     ShutdownDriver();
+    static zx_status_t InitializeDriver(PciePlatformInterface& platform);
+    static void        ShutdownDriver();
 
     // Debug/ASSERT routine, used by devices and bridges to assert that the
     // rescan lock is currently being held.
@@ -209,7 +209,7 @@ private:
 
         const EcamRegion& ecam() const { return ecam_; }
         void* vaddr() const { return vaddr_; }
-        status_t MapEcam();
+        zx_status_t MapEcam();
 
         // WAVLTree properties
         uint8_t GetKey() const { return ecam_.bus_start; }
@@ -225,15 +225,15 @@ private:
     bool     IsNotStarted(bool allow_quirks_phase = false) const;
     bool     IsOperational() const { smp_mb(); return state_ == State::OPERATIONAL; }
 
-    status_t AllocBookkeeping();
-    void     ForeachRoot(ForeachRootCallback cbk, void* ctx);
-    void     ForeachDevice(ForeachDeviceCallback cbk, void* ctx);
-    bool     ForeachDownstreamDevice(const fbl::RefPtr<PcieUpstreamNode>& upstream,
-                                     uint                                  level,
-                                     ForeachDeviceCallback                 cbk,
-                                     void*                                 ctx);
-    status_t AddSubtractBusRegion(uint64_t base, uint64_t size,
-                                  PciAddrSpace aspace, bool add_op);
+    zx_status_t AllocBookkeeping();
+    void        ForeachRoot(ForeachRootCallback cbk, void* ctx);
+    void        ForeachDevice(ForeachDeviceCallback cbk, void* ctx);
+    bool        ForeachDownstreamDevice(const fbl::RefPtr<PcieUpstreamNode>& upstream,
+                                        uint                                 level,
+                                        ForeachDeviceCallback                cbk,
+                                        void*                                ctx);
+    zx_status_t AddSubtractBusRegion(uint64_t base, uint64_t size,
+                                     PciAddrSpace aspace, bool add_op);
 
     // IRQ support.  Implementation in pcie_irqs.cpp
     void ShutdownIrqs();
@@ -249,6 +249,7 @@ private:
 
     bool                                is_mmio_ = true;
     RegionAllocator::RegionPool::RefPtr region_bookkeeping_;
+    RegionAllocator                     pf_mmio_regions_;
     RegionAllocator                     mmio_lo_regions_;
     RegionAllocator                     mmio_hi_regions_;
     RegionAllocator                     pio_regions_;
@@ -263,12 +264,3 @@ private:
     static fbl::RefPtr<PcieBusDriver>  driver_;
     static fbl::Mutex                  driver_lock_;
 };
-
-#if WITH_DEV_PCIE
-#define STATIC_PCIE_QUIRK_HANDLER(quirk_handler) \
-    [[gnu::used, gnu::section("pcie_quirk_handlers")]] \
-    alignas(void*) static const PcieBusDriver::QuirkHandler \
-        __pcie_quirk_handler_##quirk_handler = quirk_handler
-#else  // WITH_DEV_PCIE
-#define STATIC_PCIE_QUIRK_HANDLER(quirk_handler)
-#endif  // WITH_DEV_PCIE

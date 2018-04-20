@@ -12,13 +12,19 @@
 
 __BEGIN_CDECLS
 
-// The maximum HCI ACL frame size used for data transactions
-#define BT_HCI_MAX_FRAME_SIZE         1028  // (1024 + 4 bytes for the ACL header)
-
 // Potential values for the flags bitfield in a snoop channel packet.
-#define BT_HCI_SNOOP_FLAG_SENT        0x00  // Host -> Controller
-#define BT_HCI_SNOOP_FLAG_RECEIVED    0x01  // Controller <- Host
-#define BT_HCI_SNOOP_FLAG_DATA        0x02  // Data packet
+typedef enum {
+  BT_HCI_SNOOP_TYPE_CMD = 0,
+  BT_HCI_SNOOP_TYPE_EVT = 1,
+  BT_HCI_SNOOP_TYPE_ACL = 2,
+  BT_HCI_SNOOP_TYPE_SCO = 3,
+} bt_hci_snoop_type_t;
+
+#define BT_HCI_SNOOP_FLAG_RECV 0x04 // Host -> Controller
+
+static inline uint8_t bt_hci_snoop_flags(bt_hci_snoop_type_t type, bool is_received) {
+  return (uint8_t)(type | (is_received ? BT_HCI_SNOOP_FLAG_RECV : 0x00));
+}
 
 // Get a channel handle for a two-way HCI command channel for sending and
 // receiving HCI command and event packets, respectively.
@@ -59,6 +65,6 @@ IOCTL_WRAPPER_OUT(ioctl_bt_hci_get_acl_data_channel, IOCTL_BT_HCI_GET_ACL_DATA_C
 // ssize_t ioctl_bt_hci_get_snoop_channel(int fd, zx_handle_t* out);
 IOCTL_WRAPPER_OUT(ioctl_bt_hci_get_snoop_channel, IOCTL_BT_HCI_GET_SNOOP_CHANNEL, zx_handle_t);
 
-// TODO(armansito): Add ioctls for ACL and SCO
+// TODO(jamuraa): Add ioctl for SCO
 
 __END_CDECLS

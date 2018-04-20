@@ -35,12 +35,24 @@ zx_status_t VmObjectDispatcher::Create(fbl::RefPtr<VmObject> vmo,
 }
 
 VmObjectDispatcher::VmObjectDispatcher(fbl::RefPtr<VmObject> vmo)
-    : vmo_(vmo), state_tracker_(0u) {}
+    : SoloDispatcher(ZX_VMO_ZERO_CHILDREN), vmo_(vmo) {
+        vmo_->SetChildObserver(this);
+    }
 
 VmObjectDispatcher::~VmObjectDispatcher() {
     // Intentionally leave vmo_->user_id() set to our koid even though we're
     // dying and the koid will no longer map to a Dispatcher. koids are never
     // recycled, and it could be a useful breadcrumb.
+    vmo_->SetChildObserver(nullptr);
+}
+
+
+void VmObjectDispatcher::OnZeroChild() {
+    UpdateState(0, ZX_VMO_ZERO_CHILDREN);
+}
+
+void VmObjectDispatcher::OnOneChild() {
+    UpdateState(ZX_VMO_ZERO_CHILDREN, 0);
 }
 
 void VmObjectDispatcher::get_name(char out_name[ZX_MAX_NAME_LEN]) const {
@@ -53,22 +65,20 @@ zx_status_t VmObjectDispatcher::set_name(const char* name, size_t len) {
     return vmo_->set_name(name, len);
 }
 
-zx_status_t VmObjectDispatcher::Read(user_ptr<void> user_data,
+zx_status_t VmObjectDispatcher::Read(user_out_ptr<void> user_data,
                                      size_t length,
-                                     uint64_t offset,
-                                     size_t* bytes_read) {
+                                     uint64_t offset) {
     canary_.Assert();
 
-    return vmo_->ReadUser(user_data, offset, length, bytes_read);
+    return vmo_->ReadUser(user_data, offset, length);
 }
 
-zx_status_t VmObjectDispatcher::Write(user_ptr<const void> user_data,
+zx_status_t VmObjectDispatcher::Write(user_in_ptr<const void> user_data,
                                       size_t length,
-                                      uint64_t offset,
-                                      size_t* bytes_written) {
+                                      uint64_t offset) {
     canary_.Assert();
 
-    return vmo_->WriteUser(user_data, offset, length, bytes_written);
+    return vmo_->WriteUser(user_data, offset, length);
 }
 
 zx_status_t VmObjectDispatcher::SetSize(uint64_t size) {
@@ -86,7 +96,7 @@ zx_status_t VmObjectDispatcher::GetSize(uint64_t* size) {
 }
 
 zx_status_t VmObjectDispatcher::RangeOp(uint32_t op, uint64_t offset, uint64_t size,
-                                        user_ptr<void> buffer, size_t buffer_size) {
+                                        user_inout_ptr<void> buffer, size_t buffer_size) {
     canary_.Assert();
 
     LTRACEF("op %u offset %#" PRIx64 " size %#" PRIx64
@@ -108,15 +118,6 @@ zx_status_t VmObjectDispatcher::RangeOp(uint32_t op, uint64_t offset, uint64_t s
         case ZX_VMO_OP_UNLOCK:
             // TODO: handle
             return ZX_ERR_NOT_SUPPORTED;
-        case ZX_VMO_OP_LOOKUP:
-            // we will be using the user pointer
-            if (!buffer)
-                return ZX_ERR_INVALID_ARGS;
-
-            // make sure that zx_paddr_t doesn't drift from paddr_t, which the VM uses internally
-            static_assert(sizeof(zx_paddr_t) == sizeof(paddr_t), "");
-
-            return vmo_->LookupUser(offset, size, buffer.reinterpret<paddr_t>(), buffer_size);
         case ZX_VMO_OP_CACHE_SYNC:
             return vmo_->SyncCache(offset, size);
         case ZX_VMO_OP_CACHE_INVALIDATE:

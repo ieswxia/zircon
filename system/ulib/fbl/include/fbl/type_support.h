@@ -58,11 +58,6 @@ struct remove_reference<T&&> {
     using type = T;
 };
 
-template <typename T>
-constexpr typename remove_reference<T>::type&& move(T&& t) {
-    return static_cast<typename remove_reference<T>::type&&>(t);
-}
-
 // remove_const:
 
 template <typename T>
@@ -94,6 +89,13 @@ struct remove_cv {
     typedef typename remove_volatile<typename remove_const<T>::type>::type type;
 };
 
+// move
+
+template <typename T>
+constexpr typename remove_reference<T>::type&& move(T&& t) {
+    return static_cast<typename remove_reference<T>::type&&>(t);
+}
+
 // forward:
 
 template <typename T>
@@ -103,7 +105,7 @@ constexpr T&& forward(typename remove_reference<T>::type& t) {
 
 template <typename T>
 constexpr T&& forward(typename remove_reference<T>::type&& t) {
-    static_assert(!is_lvalue_reference<T>::value, "bad util::forward call");
+    static_assert(!is_lvalue_reference<T>::value, "bad fbl::forward call");
     return static_cast<T&&>(t);
 }
 
@@ -316,6 +318,24 @@ struct trait_name {                                                             
 private:                                                                          \
     template <typename C> static ::fbl::true_type test( decltype(&C::fn_name) ); \
     template <typename C> static ::fbl::false_type test(...);                    \
+                                                                                  \
+public:                                                                           \
+    static constexpr bool value = decltype(test<T>(nullptr))::value;              \
+}
+
+// Similar to DECLARE_HAS_MEMBER_FN but also checks the function signature.
+// This is especially useful when the desired function may be overloaded.
+// The signature must take the form "ResultType (C::*)(ArgType1, ArgType2)".
+//
+// Example:
+//
+// DECLARE_HAS_MEMBER_FN_WITH_SIGNATURE(has_c_str, c_str, const char* (C::*)() const);
+#define DECLARE_HAS_MEMBER_FN_WITH_SIGNATURE(trait_name, fn_name, sig)            \
+template <typename T>                                                             \
+struct trait_name {                                                               \
+private:                                                                          \
+    template <typename C> static ::fbl::true_type test( decltype(static_cast<sig>(&C::fn_name)) ); \
+    template <typename C> static ::fbl::false_type test(...);                     \
                                                                                   \
 public:                                                                           \
     static constexpr bool value = decltype(test<T>(nullptr))::value;              \

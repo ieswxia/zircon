@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#include <ddk/debug.h>
 #include <ddk/device.h>
 #include <ddk/driver.h>
 #include <ddk/protocol/usb-bus.h>
@@ -31,6 +32,11 @@ typedef struct usb_virtual_host {
     completion_t completion;
     bool connected;
 } usb_virtual_host_t;
+
+static void virt_host_request_queue(void* ctx, usb_request_t* req) {
+    usb_virtual_host_t* host = ctx;
+    usb_virtual_bus_host_queue(host->bus, req);
+}
 
 static void virt_host_set_bus_interface(void* ctx, usb_bus_interface_t* bus_intf) {
     usb_virtual_host_t* host = ctx;
@@ -87,6 +93,7 @@ size_t virt_host_get_max_transfer_size(void* ctx, uint32_t device_id, uint8_t ep
 }
 
 static usb_hci_protocol_ops_t virtual_host_protocol = {
+    .request_queue = virt_host_request_queue,
     .set_bus_interface = virt_host_set_bus_interface,
     .get_max_device_count = virt_host_get_max_device_count,
     .enable_endpoint = virt_host_enable_ep,
@@ -97,11 +104,6 @@ static usb_hci_protocol_ops_t virtual_host_protocol = {
     .reset_endpoint = virt_host_reset_endpoint,
     .get_max_transfer_size = virt_host_get_max_transfer_size,
 };
-
-static void virt_host_iotxn_queue(void* ctx, iotxn_t* txn) {
-    usb_virtual_host_t* host = ctx;
-    iotxn_queue(host->bus->zxdev, txn);
-}
 
 static void virt_host_unbind(void* ctx) {
     printf("virt_host_unbind\n");
@@ -119,7 +121,6 @@ static void virt_host_release(void* ctx) {
 
 static zx_protocol_device_t virt_host_device_proto = {
     .version = DEVICE_OPS_VERSION,
-    .iotxn_queue = virt_host_iotxn_queue,
     .unbind = virt_host_unbind,
     .release = virt_host_release,
 };

@@ -6,9 +6,9 @@
 
 #include <fbl/arena.h>
 
-#include <vm/vm_aspace.h>
 #include <fbl/alloc_checker.h>
-#include <unittest.h>
+#include <lib/unittest/unittest.h>
+#include <vm/vm_aspace.h>
 
 using fbl::Arena;
 
@@ -16,35 +16,35 @@ struct TestObj {
     int xx, yy, zz;
 };
 
-static bool init_null_name_succeeds(void* context) {
+static bool init_null_name_succeeds() {
     BEGIN_TEST;
     Arena arena;
     EXPECT_EQ(ZX_OK, arena.Init(nullptr, sizeof(TestObj), 16), "");
     END_TEST;
 }
 
-static bool init_zero_ob_size_fails(void* context) {
+static bool init_zero_ob_size_fails() {
     BEGIN_TEST;
     Arena arena;
     EXPECT_EQ(ZX_ERR_INVALID_ARGS, arena.Init("name", 0, 16), "");
     END_TEST;
 }
 
-static bool init_large_ob_size_fails(void* context) {
+static bool init_large_ob_size_fails() {
     BEGIN_TEST;
     Arena arena;
     EXPECT_EQ(ZX_ERR_INVALID_ARGS, arena.Init("name", PAGE_SIZE + 1, 16), "");
     END_TEST;
 }
 
-static bool init_zero_count_fails(void* context) {
+static bool init_zero_count_fails() {
     BEGIN_TEST;
     Arena arena;
     EXPECT_EQ(ZX_ERR_INVALID_ARGS, arena.Init("name", sizeof(TestObj), 0), "");
     END_TEST;
 }
 
-static bool start_and_end_look_good(void* context) {
+static bool start_and_end_look_good() {
     BEGIN_TEST;
     static const size_t num_slots = (2 * PAGE_SIZE) / sizeof(TestObj);
     static const size_t expected_size = num_slots * sizeof(TestObj);
@@ -61,7 +61,7 @@ static bool start_and_end_look_good(void* context) {
     END_TEST;
 }
 
-static bool in_range_tests(void* context) {
+static bool in_range_tests() {
     BEGIN_TEST;
     static const size_t num_slots = (2 * PAGE_SIZE) / sizeof(TestObj);
 
@@ -114,7 +114,7 @@ static bool in_range_tests(void* context) {
     END_TEST;
 }
 
-static bool out_of_memory(void* context) {
+static bool out_of_memory() {
     BEGIN_TEST;
     static const size_t num_slots = (2 * PAGE_SIZE) / sizeof(TestObj);
 
@@ -122,8 +122,10 @@ static bool out_of_memory(void* context) {
     EXPECT_EQ(ZX_OK, arena.Init("name", sizeof(TestObj), num_slots), "");
 
     // Allocate all of the data objects.
-    void** objs = reinterpret_cast<void**>(malloc(sizeof(void*) * num_slots));
-    void** top = objs;
+    fbl::AllocChecker ac;
+    fbl::unique_ptr<void*[]> objs = fbl::unique_ptr<void*[]>(new (&ac) void*[num_slots]);
+    EXPECT_TRUE(ac.check(), "");
+    void** top = &objs[0];
     for (size_t i = 0; i < num_slots; i++) {
         char msg[32];
         snprintf(msg, sizeof(msg), "[%zu]", i);
@@ -151,11 +153,10 @@ static bool out_of_memory(void* context) {
 
     // Free all objects.
     // Nothing much to check except that it doesn't crash.
-    while (top > objs) {
+    while (top > objs.get()) {
         arena.Free(*--top);
     }
 
-    free(objs);
     END_TEST;
 }
 
@@ -164,13 +165,13 @@ static bool out_of_memory(void* context) {
 // correspond to a live VmMapping.
 static bool count_committed_pages(
     vaddr_t start, vaddr_t end, size_t* committed, size_t* uncommitted) {
-    BEGIN_TEST; // Not a test, but we need these guards to use REQUIRE_*
+    BEGIN_TEST; // Not a test, but we need these guards to use ASSERT_*
     *committed = 0;
     *uncommitted = 0;
 
     // Find the VmMapping that covers |start|. Assume that it covers |end-1|.
     const auto region = VmAspace::kernel_aspace()->FindRegion(start);
-    REQUIRE_NONNULL(region, "FindRegion");
+    ASSERT_NONNULL(region, "FindRegion");
     const auto mapping = region->as_vm_mapping();
     if (mapping == nullptr) {
         // It's a VMAR, not a mapping, so no pages are committed.
@@ -187,7 +188,7 @@ static bool count_committed_pages(
     END_TEST;
 }
 
-static bool committing_tests(void* context) {
+static bool committing_tests() {
     BEGIN_TEST;
     static const size_t num_slots = (64 * PAGE_SIZE) / sizeof(TestObj);
 
@@ -276,7 +277,7 @@ using fbl::ArenaTestFriend;
 
 // Hit the decommit code path. We can't observe it without peeking inside the
 // control pool, since the data pool doesn't currently decommit.
-static bool uncommitting_tests(void* context) {
+static bool uncommitting_tests() {
     BEGIN_TEST;
     // Create an arena with a 16-page control pool.
     static const size_t num_pages = 16;
@@ -307,8 +308,10 @@ static bool uncommitting_tests(void* context) {
 
     // Allocate all of the data objects. Hold onto the pointers so we can free
     // them.
-    void** objs = reinterpret_cast<void**>(malloc(sizeof(void*) * num_slots));
-    void** top = objs;
+    fbl::AllocChecker ac;
+    fbl::unique_ptr<void*[]> objs = fbl::unique_ptr<void*[]>(new (&ac) void*[num_slots]);
+    EXPECT_TRUE(ac.check(), "");
+    void** top = &objs[0];
     for (size_t i = 0; i < num_slots; i++) {
         char msg[32];
         snprintf(msg, sizeof(msg), "[%zu]", i);
@@ -339,7 +342,7 @@ static bool uncommitting_tests(void* context) {
     EXPECT_GT(uncommitted, 0u, "");
 
     // Free all of the data objects.
-    while (top > objs) {
+    while (top > objs.get()) {
         arena.Free(*--top);
     }
 
@@ -353,7 +356,7 @@ static bool uncommitting_tests(void* context) {
     // Allocate half of the data objects, freeing up half of the free nodes
     // (and thus half of the control slots).
     auto orig_committed = committed;
-    REQUIRE_EQ(top, objs, "");
+    ASSERT_EQ(top, objs.get(), "");
     for (size_t i = 0; i < num_slots / 2; i++) {
         char msg[32];
         snprintf(msg, sizeof(msg), "[%zu]", i);
@@ -406,12 +409,11 @@ static bool uncommitting_tests(void* context) {
     EXPECT_EQ(committed, orig_committed, "");
     EXPECT_GT(uncommitted, 0u, "");
 
-    free(objs);
     END_TEST;
 }
 
 // Checks that destroying an arena unmaps all of its pages.
-static bool memory_cleanup(void* context) {
+static bool memory_cleanup() {
     BEGIN_TEST;
     static const size_t num_slots = (16 * PAGE_SIZE) / sizeof(TestObj);
 
@@ -452,11 +454,11 @@ static bool memory_cleanup(void* context) {
 
 // Basic checks that the contents of allocated objects stick around, aren't
 // stomped on.
-static bool content_preservation(void* context) {
+static bool content_preservation() {
     BEGIN_TEST;
     Arena arena;
     zx_status_t s = arena.Init("arena_tests", sizeof(TestObj), 1000);
-    REQUIRE_EQ(ZX_OK, s, "arena.Init()");
+    ASSERT_EQ(ZX_OK, s, "arena.Init()");
 
     const int count = 30;
 
@@ -465,7 +467,7 @@ static bool content_preservation(void* context) {
 
         for (int ix = 0; ix != count; ++ix) {
             afp[ix] = reinterpret_cast<TestObj*>(arena.Alloc());
-            REQUIRE_NONNULL(afp[ix], "arena.Alloc()");
+            ASSERT_NONNULL(afp[ix], "arena.Alloc()");
             *afp[ix] = {17, 5, ix + 100};
         }
 
@@ -475,7 +477,7 @@ static bool content_preservation(void* context) {
         afp[3] = afp[4] = afp[5] = nullptr;
 
         afp[4] = reinterpret_cast<TestObj*>(arena.Alloc());
-        REQUIRE_NONNULL(afp[4], "arena.Alloc()");
+        ASSERT_NONNULL(afp[4], "arena.Alloc()");
         *afp[4] = {17, 5, 104};
 
         for (int ix = 0; ix != count; ++ix) {
@@ -492,7 +494,7 @@ static bool content_preservation(void* context) {
         // Leak a few objects.
         for (int ix = 0; ix != 7; ++ix) {
             TestObj* leak = reinterpret_cast<TestObj*>(arena.Alloc());
-            REQUIRE_NONNULL(leak, "arena.Alloc()");
+            ASSERT_NONNULL(leak, "arena.Alloc()");
             *leak = {2121, 77, 55};
         }
     }
@@ -513,4 +515,4 @@ ARENA_UNITTEST(committing_tests)
 ARENA_UNITTEST(uncommitting_tests)
 ARENA_UNITTEST(memory_cleanup)
 ARENA_UNITTEST(content_preservation)
-UNITTEST_END_TESTCASE(arena_tests, "arenatests", "Arena allocator test", nullptr, nullptr);
+UNITTEST_END_TESTCASE(arena_tests, "arenatests", "Arena allocator test");

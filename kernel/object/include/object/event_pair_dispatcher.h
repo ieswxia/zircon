@@ -11,10 +11,9 @@
 #include <fbl/mutex.h>
 #include <fbl/ref_ptr.h>
 #include <object/dispatcher.h>
-#include <object/state_tracker.h>
 #include <sys/types.h>
 
-class EventPairDispatcher final : public Dispatcher {
+class EventPairDispatcher final : public PeeredDispatcher<EventPairDispatcher> {
 public:
     static zx_status_t Create(fbl::RefPtr<Dispatcher>* dispatcher0,
                               fbl::RefPtr<Dispatcher>* dispatcher1,
@@ -22,26 +21,16 @@ public:
 
     ~EventPairDispatcher() final;
     zx_obj_type_t get_type() const final { return ZX_OBJ_TYPE_EVENT_PAIR; }
-    StateTracker* get_state_tracker() final { return &state_tracker_; }
+    bool has_state_tracker() const final { return true; }
     CookieJar* get_cookie_jar() final { return &cookie_jar_; }
-    zx_status_t user_signal(uint32_t clear_mask, uint32_t set_mask, bool peer) final;
     void on_zero_handles() final;
-    zx_koid_t get_related_koid() const final { return other_koid_; }
+    zx_signals_t allowed_user_signals() const final { return ZX_USER_SIGNAL_ALL | ZX_EVENT_SIGNALED; }
 
 private:
-    EventPairDispatcher();
+    explicit EventPairDispatcher(fbl::RefPtr<PeerHolder<EventPairDispatcher>> holder);
     void Init(fbl::RefPtr<EventPairDispatcher> other);
 
     CookieJar cookie_jar_;
 
     fbl::Canary<fbl::magic("EVPD")> canary_;
-
-    StateTracker state_tracker_;
-
-    // Set in Init(); never changes otherwise.
-    zx_koid_t other_koid_;
-
-    // Protects |other_| (except in Init(), where it's not needed).
-    fbl::Mutex lock_;
-    fbl::RefPtr<EventPairDispatcher> other_ TA_GUARDED(lock_);
 };

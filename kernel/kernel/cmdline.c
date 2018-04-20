@@ -5,28 +5,54 @@
 // https://opensource.org/licenses/MIT
 
 #include <kernel/cmdline.h>
+
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 
 char __kernel_cmdline[CMDLINE_MAX];
-unsigned __kernel_cmdline_size;
-unsigned __kernel_cmdline_count;
+size_t __kernel_cmdline_size;
+size_t __kernel_cmdline_count;
 
 // import into kernel commandline, converting invalid
 // characters to '.', combining multiple spaces, and
 // converting into a \0 separated, \0\0 terminated
 // style environment string
 void cmdline_append(const char* data) {
-    unsigned i = __kernel_cmdline_size;
-    unsigned max = CMDLINE_MAX - 2;
+    if (data == NULL || *data == 0) {
+        return;
+    }
+
+    size_t i = __kernel_cmdline_size;
+    if (i == CMDLINE_MAX) {
+        return;
+    }
+
+    // if there is a double-null terminator at i, then step back
+    if (i > 1) {
+        if (__kernel_cmdline[i] == 0 && __kernel_cmdline[i-1] == 0) {
+            i--;
+        }
+    }
+    size_t max = CMDLINE_MAX - 2;
+
+    // if the existing arguments are missing a null separator, add one
+    if (i < max && i > 0 && __kernel_cmdline[i] != 0) {
+        i++; // i should have always been null, but it wasn't
+        __kernel_cmdline[i++] = 0;
+    }
 
     bool found_equal = false;
     while (i < max) {
         unsigned c = *data++;
         if (c == 0) {
-            if (found_equal) { //last option was null delimited
-                ++__kernel_cmdline_count;
+            // finish an in-progress argument
+            if (__kernel_cmdline[i - 1] != 0) {
+                if (!found_equal) {
+                    __kernel_cmdline[i++] = '=';
+                }
+                __kernel_cmdline[i++] = 0;
+                __kernel_cmdline_count++;
             }
             break;
         }
@@ -55,10 +81,6 @@ void cmdline_append(const char* data) {
         }
         __kernel_cmdline[i++] = c;
     }
-    if (!found_equal && i > 0 && __kernel_cmdline[i - 1] != '\0' && i < max) {
-        __kernel_cmdline[i++] = '=';
-        ++__kernel_cmdline_count;
-    }
 
     // ensure a double-\0 terminator
     __kernel_cmdline[i++] = 0;
@@ -69,7 +91,7 @@ void cmdline_append(const char* data) {
 const char* cmdline_get(const char* key) {
     if (!key)
         return __kernel_cmdline;
-    unsigned sz = strlen(key);
+    size_t sz = strlen(key);
     const char* ptr = __kernel_cmdline;
     for (;;) {
         if (!strncmp(ptr, key, sz) && (ptr[sz] == '=' || ptr[sz] == '\0')) {

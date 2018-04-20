@@ -29,7 +29,7 @@ typedef struct netfilemsg_t {
     uint8_t data[1024];
 } netfilemsg;
 
-int netfile_open(const char* filename, uint32_t arg);
+int netfile_open(const char* filename, uint32_t arg, size_t* file_size);
 
 int netfile_offset_read(void *data_out, off_t offset, size_t max_len);
 
@@ -57,12 +57,16 @@ void netboot_run_cmd(const char* cmd);
 
 // TFTP interface
 extern zx_time_t tftp_next_timeout;
+extern atomic_bool paving_in_progress;
 
 void tftp_recv(void *data, size_t len,
                const ip6_addr_t* daddr, uint16_t dport,
                const ip6_addr_t* saddr, uint16_t sport);
 
 void tftp_timeout_expired(void);
+
+bool tftp_has_pending(void);
+void tftp_send_next(void);
 
 // debuglog interface
 extern zx_time_t debuglog_next_timeout;
@@ -72,3 +76,6 @@ int debuglog_init(void);
 void debuglog_recv(void* data, size_t len, bool is_mcast);
 
 void debuglog_timeout_expired(void);
+
+// netsvc interface
+void update_timeouts(void);

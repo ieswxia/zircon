@@ -5,67 +5,16 @@
 #include "provider_impl.h"
 
 #include <inttypes.h>
+
+#include <fbl/algorithm.h>
+#include <fbl/type_support.h>
+#include <fdio/util.h>
+#include <lib/fidl/coding.h>
 #include <zircon/assert.h>
 #include <zircon/syscalls.h>
 
-#include <fdio/util.h>
-#include <fbl/algorithm.h>
-#include <fbl/type_support.h>
-
 #include "handler_impl.h"
-
-namespace {
-
-// Handrolled FIDL structures...
-
-struct header_v0 {
-    uint32_t size;
-    uint32_t version;
-    uint32_t ordinal;
-    uint32_t flags;
-};
-
-struct header_v1 : header_v0 {
-    uint64_t id;
-};
-
-struct message {
-    uint32_t size;
-    uint32_t version;
-};
-
-// TraceProvider::Start(handle<vmo> buffer, handle<eventpair> fence, array<string> categories)
-//     => (bool success)
-struct start : message {
-    uint32_t buffer; // handle<vmo>
-    uint32_t fence; // handle<eventpair>
-    uint64_t category_array_header_length; // always 8
-    uint32_t category_offsets_array_length; // in bytes
-    uint32_t num_categories;
-    uint64_t category_offsets[]; // offset to string from this location
-};
-
-constexpr unsigned kExpectedCategoryArrayHeaderLength = 8;
-
-struct string_entry {
-    uint32_t entry_length; // not including any padding
-    uint32_t string_length; // Note: there is no trailing NUL
-    char text[];
-};
-
-struct start_reply : message {
-    uint8_t success; // bool, least significant bit
-    uint8_t padding[7];
-};
-
-// TraceRegistry::RegisterTraceProvider(TraceProvider provider, string? label)
-struct register_trace_provider : message {
-    uint32_t provider; // TraceProvider
-    uint32_t padding;
-    uint64_t label; // string?
-};
-
-} // namespace
+#include "trace_provider.fidl.h"
 
 namespace trace {
 namespace internal {
@@ -76,19 +25,16 @@ TraceProviderImpl::TraceProviderImpl(async_t* async, zx::channel channel)
 
 TraceProviderImpl::~TraceProviderImpl() = default;
 
-bool TraceProviderImpl::Start(zx::vmo buffer, zx::eventpair fence,
+void TraceProviderImpl::Start(zx::vmo buffer, zx::eventpair fence,
                               fbl::Vector<fbl::String> enabled_categories) {
     if (running_)
-        return false;
+        return;
 
     zx_status_t status = TraceHandlerImpl::StartEngine(
         async_, fbl::move(buffer), fbl::move(fence),
         fbl::move(enabled_categories));
-    if (status != ZX_OK)
-        return false;
-
-    running_ = true;
-    return true;
+    if (status == ZX_OK)
+        running_ = true;
 }
 
 void TraceProviderImpl::Stop() {
@@ -102,164 +48,101 @@ void TraceProviderImpl::Stop() {
 TraceProviderImpl::Connection::Connection(TraceProviderImpl* impl,
                                           zx::channel channel)
     : impl_(impl), channel_(fbl::move(channel)),
-      wait_(channel_.get(),
+      wait_(this, channel_.get(),
             ZX_CHANNEL_READABLE | ZX_CHANNEL_PEER_CLOSED) {
-    wait_.set_handler(fbl::BindMember(this, &Connection::Handle));
-
     zx_status_t status = wait_.Begin(impl_->async_);
-    ZX_DEBUG_ASSERT(status == ZX_OK || status == ZX_ERR_BAD_STATE);
+    if (status != ZX_OK) {
+        Close();
+    }
 }
 
 TraceProviderImpl::Connection::~Connection() {
     Close();
 }
 
-async_wait_result_t TraceProviderImpl::Connection::Handle(
-    async_t* async, zx_status_t status, const zx_packet_signal_t* signal) {
+void TraceProviderImpl::Connection::Handle(
+    async_t* async, async::WaitBase* wait, zx_status_t status,
+    const zx_packet_signal_t* signal) {
     if (status != ZX_OK) {
         printf("TraceProvider wait failed: status=%d\n", status);
-        return ASYNC_WAIT_FINISHED;
-    }
-
-    if (signal->observed & ZX_CHANNEL_READABLE) {
-        if (ReadMessage())
-            return ASYNC_WAIT_AGAIN;
-        printf("TraceProvider received invalid FIDL message or failed to send reply.\n");
+    } else if (signal->observed & ZX_CHANNEL_READABLE) {
+        if (ReadMessage()) {
+            if (wait_.Begin(async) == ZX_OK) {
+                return;
+            }
+        } else {
+            printf("TraceProvider received invalid FIDL message or failed to send reply.\n");
+        }
     } else {
         ZX_DEBUG_ASSERT(signal->observed & ZX_CHANNEL_PEER_CLOSED);
     }
 
     Close();
-    return ASYNC_WAIT_FINISHED;
 }
 
 bool TraceProviderImpl::Connection::ReadMessage() {
-    // Using handrolled FIDL.
-
-    uint8_t buffer[16 * 1024];
-    zx_handle_t unowned_handles[2];
+    FIDL_ALIGNDECL uint8_t buffer[16 * 1024];
     uint32_t num_bytes = 0u;
+    zx_handle_t handles[2];
     uint32_t num_handles = 0u;
     zx_status_t status = channel_.read(
         0u, buffer, sizeof(buffer), &num_bytes,
-        unowned_handles, fbl::count_of(unowned_handles), &num_handles);
+        handles, static_cast<uint32_t>(fbl::count_of(handles)), &num_handles);
     if (status != ZX_OK)
         return false;
 
-    zx::handle handles[2];
-    for (size_t i = 0; i < num_handles; i++) {
-        handles[i].reset(unowned_handles[i]); // take ownership
+    if (!DecodeAndDispatch(buffer, num_bytes, handles, num_handles)) {
+        for (uint32_t i = 0; i < num_handles; i++)
+            zx_handle_close(handles[i]);
+        return false;
     }
 
-    if (num_bytes < sizeof(header_v0))
+    return true;
+}
+
+bool TraceProviderImpl::Connection::DecodeAndDispatch(
+    uint8_t* buffer, uint32_t num_bytes,
+    zx_handle_t* handles, uint32_t num_handles) {
+    if (num_bytes < sizeof(fidl_message_header_t))
         return false;
 
-    const header_v0* h0 = reinterpret_cast<header_v0*>(buffer);
-    if (h0->size & 7)
-        return false;
-    if (h0->size < sizeof(header_v0) || h0->size > num_bytes)
-        return false;
-
-    const header_v1* h1 = nullptr;
-    if (h0->version >= 1) {
-        if (h0->size < sizeof(header_v1))
-            return false;
-        h1 = static_cast<const header_v1*>(h0);
-    }
-
-    num_bytes -= h0->size;
-    if (num_bytes < sizeof(message))
-        return false;
-
-    const message* m = reinterpret_cast<message*>(buffer + h0->size);
-    if (m->size & 7)
-        return false;
-    if (m->size < sizeof(message) || m->size > num_bytes)
-        return false;
-
-    switch (h0->ordinal) {
-    case 0: {
-        // TraceProvider::Start(handle<vmo> buffer, handle<eventpair> fence,
-        //     array<string> categories) => (bool success)
-        if (!h1) // request id only present in v1 and beyond
-            return false;
-        if (!(h1->flags & 1)) // expects response
-            return false;
-        if (num_bytes < sizeof(start))
-            return false;
-        const start* s = static_cast<const start*>(m);
-        if (s->buffer != 0u || s->fence != 1u)
-            return false;
-
-        fbl::Vector<fbl::String> enabled_categories;
-        if (s->category_array_header_length != kExpectedCategoryArrayHeaderLength) {
-            printf("%s: unexpected value for category_array_header_length field of fidl start message: %" PRIu64 "\n",
-                   __func__, s->category_array_header_length);
-            return false;
-        }
-        if (s->category_offsets_array_length - 2 * sizeof(uint32_t) != s->num_categories * sizeof(uint64_t)) {
-            printf("%s: category offsets array error: length %u for %u categories\n",
-                   __func__, s->category_offsets_array_length, s->num_categories);
-            return false;
-        }
-        auto message_end = reinterpret_cast<const char*>(s) + num_bytes;
-        for (uint32_t i = 0; i < s->num_categories; ++i) {
-            auto str_ptr = reinterpret_cast<const char*>(&s->category_offsets[i]) + s->category_offsets[i];
-            if (s->category_offsets[i] >= num_bytes ||
-                str_ptr + 2 * sizeof(uint32_t) >= message_end) {
-                printf("%s: category offset error, too large for message: %" PRIu64 "\n",
-                       __func__, s->category_offsets[i]);
-                return false;
-            }
-            auto str = reinterpret_cast<const string_entry*>(str_ptr);
-            auto str_end = str_ptr + str->entry_length;
-            if (str_end > message_end ||
-                str->string_length >= str->entry_length) {
-                printf("%s: string length error: entry_length %u, string_length %u\n",
-                       __func__, str->entry_length, str->string_length);
-                return false;
-            }
-            enabled_categories.push_back(fbl::String(str->text, str->string_length));
-        }
-
-        bool success = impl_->Start(
-            zx::vmo(fbl::move(handles[s->buffer])),
-            zx::eventpair(fbl::move(handles[s->fence])),
-            fbl::move(enabled_categories));
-
-        // Send reply.
-        struct {
-            header_v1 h;
-            start_reply m;
-        } reply = {};
-        reply.h.size = 24;
-        reply.h.version = 1;
-        reply.h.ordinal = 0;
-        reply.h.flags = 2;
-        reply.h.id = h1->id;
-        reply.m.size = 16;
-        reply.m.version = 0;
-        reply.m.success = success ? 1 : 0;
-        status = channel_.write(0u, &reply, sizeof(reply), nullptr, 0u);
+    auto hdr = reinterpret_cast<fidl_message_header_t*>(buffer);
+    switch (hdr->ordinal) {
+    case ProviderStartOrdinal: {
+        zx_status_t status = fidl_decode(&_ProviderStartRequestTable,
+                                         buffer, num_bytes, handles, num_handles,
+                                         nullptr);
         if (status != ZX_OK)
-            return false;
+            break;
+
+        auto request = reinterpret_cast<ProviderStartRequest*>(buffer);
+        auto buffer = zx::vmo(request->buffer);
+        auto fence = zx::eventpair(request->fence);
+        fbl::Vector<fbl::String> categories;
+        auto strings = reinterpret_cast<fidl_string_t*>(request->categories.data);
+        for (size_t i = 0; i < request->categories.count; i++) {
+            categories.push_back(fbl::String(strings[i].data, strings[i].size));
+        }
+        impl_->Start(fbl::move(buffer), fbl::move(fence), fbl::move(categories));
         return true;
     }
-    case 1:
-        // TraceProvider::Stop()
+    case ProviderStopOrdinal: {
+        zx_status_t status = fidl_decode(&_ProviderStopRequestTable,
+                                         buffer, num_bytes, handles, num_handles,
+                                         nullptr);
+        if (status != ZX_OK)
+            break;
+
         impl_->Stop();
         return true;
-    case 2:
-        // TraceProvider::Dump(handle<socket> output)
-        return true; // ignored
-    default:
-        return false;
     }
+    }
+    return false;
 }
 
 void TraceProviderImpl::Connection::Close() {
     if (channel_) {
-        wait_.Cancel(impl_->async_);
+        wait_.Cancel();
         channel_.reset();
         impl_->Stop();
     }
@@ -278,7 +161,7 @@ trace_provider_t* trace_provider_create(async_t* async) {
     if (status != ZX_OK)
         return nullptr;
 
-    status = fdio_service_connect("/svc/tracing::TraceRegistry",
+    status = fdio_service_connect("/svc/trace_link.Registry",
                                   registry_service.release()); // takes ownership
     if (status != ZX_OK)
         return nullptr;
@@ -290,26 +173,13 @@ trace_provider_t* trace_provider_create(async_t* async) {
     if (status != ZX_OK)
         return nullptr;
 
-    // Invoke TraceRegistry::RegisterTraceProvider(TraceProvider provider, string? label)
-    // TODO(ZX-1036): We currently set the label to null.  Once tracing fully migrates
-    // to Zircon and we publish the provider via the hub we will no longer need to
-    // specify a label at all since we will be able to identify providers based on their
-    // path within the hub's directory structure.
-    struct {
-        header_v0 h;
-        register_trace_provider m;
-    } call = {};
-    call.h.size = 16;
-    call.h.version = 0;
-    call.h.ordinal = 0;
-    call.h.flags = 0;
-    call.m.size = 24;
-    call.m.version = 0;
-    call.m.provider = 0;
-    call.m.label = 0;
+    // Register the trace provider.
+    RegistryRegisterTraceProviderRequest request = {};
+    request.hdr.ordinal = RegistryRegisterTraceProviderOrdinal;
+    request.provider = FIDL_HANDLE_PRESENT;
     zx_handle_t handles[] = {provider_client.release()};
-    status = registry_client.write(0u, &call, sizeof(call),
-                                   handles, fbl::count_of(handles));
+    status = registry_client.write(0u, &request, sizeof(request),
+                                   handles, static_cast<uint32_t>(fbl::count_of(handles)));
     if (status != ZX_OK) {
         provider_client.reset(handles[0]); // take back ownership after failure
         return nullptr;

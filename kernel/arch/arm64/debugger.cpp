@@ -4,44 +4,29 @@
 // license that can be found in the LICENSE file or at
 // https://opensource.org/licenses/MIT
 
-#include <err.h>
-#include <string.h>
-#include <sys/types.h>
 #include <arch/arm64.h>
 #include <arch/debugger.h>
+#include <err.h>
 #include <kernel/thread.h>
+#include <string.h>
+#include <sys/types.h>
 #include <zircon/syscalls/debug.h>
+#include <zircon/types.h>
 
 // Only the NZCV flags (bits 31 to 28 respectively) of the CPSR are
 // readable and writable by userland on ARM64.
 static uint32_t kUserVisibleFlags = 0xf0000000;
 
-uint arch_num_regsets(void)
-{
-    return 1; // TODO(dje): Just the general regs for now.
-}
+// SS (="Single Step") is bit 0 in MDSCR_EL1.
+static constexpr uint64_t kSSMask = 1;
 
-static status_t arch_get_general_regs(struct thread *thread, zx_arm64_general_regs_t *out, uint32_t *buf_size)
-{
-    uint32_t provided_buf_size = *buf_size;
-    *buf_size = sizeof(*out);
+zx_status_t arch_get_general_regs(struct thread* thread, zx_thread_state_general_regs_t* out) {
+    // Punt if registers aren't available. E.g.,
+    // ZX-563 (registers aren't available in synthetic exceptions)
+    if (thread->arch.suspended_general_regs == nullptr)
+        return ZX_ERR_NOT_SUPPORTED;
 
-    if (provided_buf_size < sizeof(*out))
-        return ZX_ERR_BUFFER_TOO_SMALL;
-
-    if (thread_stopped_in_exception(thread)) {
-        // TODO(dje): We could get called while processing a synthetic
-        // exception where there is no frame.
-        if (thread->exception_context->frame == NULL)
-            return ZX_ERR_NOT_SUPPORTED;
-    } else {
-        // TODO(dje): Punt if, for example, suspended in channel call.
-        // Can be removed when ZX-747 done.
-        if (thread->arch.suspended_general_regs == nullptr)
-            return ZX_ERR_NOT_SUPPORTED;
-    }
-
-    struct arm64_iframe_long *in = thread->arch.suspended_general_regs;
+    struct arm64_iframe_long* in = thread->arch.suspended_general_regs;
     DEBUG_ASSERT(in);
 
     static_assert(sizeof(in->r) == sizeof(out->r), "");
@@ -54,24 +39,13 @@ static status_t arch_get_general_regs(struct thread *thread, zx_arm64_general_re
     return ZX_OK;
 }
 
-static status_t arch_set_general_regs(struct thread *thread, const zx_arm64_general_regs_t *in, uint32_t buf_size)
-{
-    if (buf_size != sizeof(*in))
-        return ZX_ERR_INVALID_ARGS;
+zx_status_t arch_set_general_regs(struct thread* thread, const zx_thread_state_general_regs_t* in) {
+    // Punt if registers aren't available. E.g.,
+    // ZX-563 (registers aren't available in synthetic exceptions)
+    if (thread->arch.suspended_general_regs == nullptr)
+        return ZX_ERR_NOT_SUPPORTED;
 
-    if (thread_stopped_in_exception(thread)) {
-        // TODO(dje): We could get called while processing a synthetic
-        // exception where there is no frame.
-        if (thread->exception_context->frame == NULL)
-            return ZX_ERR_NOT_SUPPORTED;
-    } else {
-        // TODO(dje): Punt if, for example, suspended in channel call.
-        // Can be removed when ZX-747 done.
-        if (thread->arch.suspended_general_regs == nullptr)
-            return ZX_ERR_NOT_SUPPORTED;
-    }
-
-    struct arm64_iframe_long *out = thread->arch.suspended_general_regs;
+    struct arm64_iframe_long* out = thread->arch.suspended_general_regs;
     DEBUG_ASSERT(out);
 
     static_assert(sizeof(out->r) == sizeof(in->r), "");
@@ -79,34 +53,31 @@ static status_t arch_set_general_regs(struct thread *thread, const zx_arm64_gene
     out->lr = in->lr;
     out->usp = in->sp;
     out->elr = in->pc;
-    out->spsr = (out->spsr & ~kUserVisibleFlags)
-        | (in->cpsr & kUserVisibleFlags);
+    out->spsr = (out->spsr & ~kUserVisibleFlags) | (in->cpsr & kUserVisibleFlags);
 
     return ZX_OK;
 }
 
-// The caller is responsible for making sure the thread is in an exception
-// or is suspended, and stays so.
-status_t arch_get_regset(struct thread *thread, uint regset, void *regs, uint32_t *buf_size)
-{
-    switch (regset)
-    {
-    case 0:
-        return arch_get_general_regs(thread, (zx_arm64_general_regs_t *)regs, buf_size);
-    default:
-        return ZX_ERR_INVALID_ARGS;
-    }
+zx_status_t arch_get_single_step(struct thread* thread, bool* single_step) {
+    // Punt if registers aren't available. E.g.,
+    // ZX-563 (registers aren't available in synthetic exceptions)
+    if (thread->arch.suspended_general_regs == nullptr)
+        return ZX_ERR_NOT_SUPPORTED;
+    struct arm64_iframe_long* regs = thread->arch.suspended_general_regs;
+    *single_step = !!(regs->mdscr & kSSMask);
+    return ZX_OK;
 }
 
-// The caller is responsible for making sure the thread is in an exception
-// or is suspended, and stays so.
-status_t arch_set_regset(struct thread *thread, uint regset, const void *regs, uint32_t buf_size)
-{
-    switch (regset)
-    {
-    case 0:
-        return arch_set_general_regs(thread, (zx_arm64_general_regs_t *)regs, buf_size);
-    default:
-        return ZX_ERR_INVALID_ARGS;
+zx_status_t arch_set_single_step(struct thread* thread, bool single_step) {
+    // Punt if registers aren't available. E.g.,
+    // ZX-563 (registers aren't available in synthetic exceptions)
+    if (thread->arch.suspended_general_regs == nullptr)
+        return ZX_ERR_NOT_SUPPORTED;
+    struct arm64_iframe_long* regs = thread->arch.suspended_general_regs;
+    if (single_step) {
+        regs->mdscr |= kSSMask;
+    } else {
+        regs->mdscr &= ~kSSMask;
     }
+    return ZX_OK;
 }

@@ -5,44 +5,69 @@
 // license that can be found in the LICENSE file or at
 // https://opensource.org/licenses/MIT
 
-#include <assert.h>
-#include <debug.h>
-#include <stdlib.h>
 #include <arch.h>
-#include <arch/ops.h>
 #include <arch/arm64.h>
+#include <arch/arm64/feature.h>
 #include <arch/arm64/mmu.h>
 #include <arch/mp.h>
+#include <arch/ops.h>
+#include <assert.h>
 #include <bits.h>
+#include <debug.h>
+#include <inttypes.h>
 #include <kernel/cmdline.h>
 #include <kernel/thread.h>
 #include <lk/init.h>
 #include <lk/main.h>
-#include <zircon/errors.h>
-#include <inttypes.h>
 #include <platform.h>
+#include <stdlib.h>
 #include <string.h>
 #include <trace.h>
+#include <zircon/errors.h>
+#include <zircon/types.h>
 
 #define LOCAL_TRACE 0
 
-enum {
-    PMCR_EL0_ENABLE_BIT         = 1 << 0,
-    PMCR_EL0_LONG_COUNTER_BIT   = 1 << 6,
-};
+// Counter-timer Kernel Control Register, EL1.
+static constexpr uint64_t CNTKCTL_EL1_ENABLE_VIRTUAL_COUNTER = 1 << 1;
 
+// Monitor Debug System Control Register, EL1.
+static constexpr uint32_t MDSCR_EL1_ENABLE_DEBUG_EXCEPTIONS = 1 << 13;
+static constexpr uint32_t MDSCR_EL1_ENABLE_DEBUG_BREAKPOINTS = 1 << 15;
 
-typedef struct {
-    uint64_t    mpid;
-    void*       sp;
+// Initial value for MSDCR_EL1 when starting userspace.
+static constexpr uint32_t MSDCR_EL1_INITIAL_VALUE =
+    MDSCR_EL1_ENABLE_DEBUG_EXCEPTIONS | MDSCR_EL1_ENABLE_DEBUG_BREAKPOINTS;
+
+// Performance Monitors Count Enable Set, EL0.
+static constexpr uint64_t PMCNTENSET_EL0_ENABLE = 1UL << 31;  // Enable cycle count register.
+
+// Performance Monitor Control Register, EL0.
+static constexpr uint64_t PMCR_EL0_ENABLE_BIT = 1 << 0;
+static constexpr uint64_t PMCR_EL0_LONG_COUNTER_BIT = 1 << 6;
+
+// Performance Monitors User Enable Regiser, EL0.
+static constexpr uint64_t PMUSERENR_EL0_ENABLE = 1 << 0;  // Enable EL0 access to cycle counter.
+
+// System Control Register, EL1.
+static constexpr uint64_t SCTLR_EL1_UCI = 1 << 26; // Allow certain cache ops in EL0.
+static constexpr uint64_t SCTLR_EL1_UCT = 1 << 15; // Allow EL0 access to CTR register.
+static constexpr uint64_t SCTLR_EL1_DZE = 1 << 14; // Allow EL0 to use DC ZVA.
+static constexpr uint64_t SCTLR_EL1_SA0 = 1 << 4;  // Enable Stack Alignment Check EL0.
+static constexpr uint64_t SCTLR_EL1_SA = 1 << 3;   // Enable Stack Alignment Check EL1.
+static constexpr uint64_t SCTLR_EL1_AC = 1 << 1;   // Enable Alignment Checking for EL1 EL0.
+
+struct arm64_sp_info_t {
+    uint64_t mpid;
+    void* sp;
 
     // This part of the struct itself will serve temporarily as the
     // fake arch_thread in the thread pointer, so that safe-stack
     // and stack-protector code can work early.  The thread pointer
     // (TPIDR_EL1) points just past arm64_sp_info_t.
-    uintptr_t   stack_guard;
-    void*       unsafe_sp;
-} arm64_sp_info_t;
+    uintptr_t stack_guard;
+    void* unsafe_sp;
+};
 
 static_assert(sizeof(arm64_sp_info_t) == 32,
               "check arm64_get_secondary_sp assembly");
@@ -57,30 +82,26 @@ static_assert(TP_OFFSET(stack_guard) == ZX_TLS_STACK_GUARD_OFFSET, "");
 static_assert(TP_OFFSET(unsafe_sp) == ZX_TLS_UNSAFE_SP_OFFSET, "");
 #undef TP_OFFSET
 
-/* smp boot lock */
-static spin_lock_t arm_boot_cpu_lock = 1;
+// SMP boot lock.
+static spin_lock_t arm_boot_cpu_lock = (spin_lock_t){1};
 static volatile int secondaries_to_init = 0;
 static thread_t _init_thread[SMP_MAX_CPUS - 1];
 arm64_sp_info_t arm64_secondary_sp_list[SMP_MAX_CPUS];
 
-static arm64_cache_info_t cache_info[SMP_MAX_CPUS];
+extern uint64_t arch_boot_el;  // Defined in start.S.
 
-extern uint64_t arch_boot_el; // Defined in start.S.
-
-uint64_t arm64_get_boot_el(void)
-{
+uint64_t arm64_get_boot_el() {
     return arch_boot_el >> 2;
 }
 
-status_t arm64_set_secondary_sp(uint cluster, uint cpu,
-                                void* sp, void* unsafe_sp) {
+zx_status_t arm64_set_secondary_sp(uint cluster, uint cpu, void* sp, void* unsafe_sp) {
     uint64_t mpid = ARM64_MPID(cluster, cpu);
 
     uint32_t i = 0;
     while ((i < SMP_MAX_CPUS) && (arm64_secondary_sp_list[i].mpid != 0)) {
         i++;
     }
-    if (i==SMP_MAX_CPUS)
+    if (i == SMP_MAX_CPUS)
         return ZX_ERR_NO_RESOURCES;
     LTRACEF("set mpid 0x%lx sp to %p\n", mpid, sp);
 #if __has_feature(safe_stack)
@@ -96,184 +117,49 @@ status_t arm64_set_secondary_sp(uint cluster, uint cpu,
     return ZX_OK;
 }
 
-static void parse_ccsid(arm64_cache_desc_t* desc, uint64_t ccsid) {
-    desc->write_through = BIT(ccsid, 31) > 0;
-    desc->write_back    = BIT(ccsid, 30) > 0;
-    desc->read_alloc    = BIT(ccsid, 29) > 0;
-    desc->write_alloc   = BIT(ccsid, 28) > 0;
-    desc->num_sets      = (uint32_t)BITS_SHIFT(ccsid, 27, 13) + 1;
-    desc->associativity = (uint32_t)BITS_SHIFT(ccsid, 12, 3)  + 1;
-    desc->line_size     = 1u << (BITS(ccsid, 2, 0) + 4);
-}
-
-void arm64_get_cache_info(arm64_cache_info_t* info) {
-    uint64_t temp=0;
-
-    uint64_t sysreg = ARM64_READ_SYSREG(clidr_el1);
-    info->inner_boundary    = (uint8_t)BITS_SHIFT(sysreg, 32, 30);
-    info->lou_u             = (uint8_t)BITS_SHIFT(sysreg, 29, 27);
-    info->loc               = (uint8_t)BITS_SHIFT(sysreg, 26, 24);
-    info->lou_is            = (uint8_t)BITS_SHIFT(sysreg, 23, 21);
-    for (int i = 0; i < 7; i++) {
-        uint8_t ctype = (sysreg >> (3*i)) & 0x07;
-        if (ctype == 0) {
-            info->level_data_type[i].ctype = 0;
-            info->level_inst_type[i].ctype = 0;
-        } else if (ctype == 4) {                                // Unified
-            ARM64_WRITE_SYSREG(CSSELR_EL1, (int64_t)(i << 1));  // Select cache level
-            temp = ARM64_READ_SYSREG(ccsidr_el1);
-            info->level_data_type[i].ctype = 4;
-            parse_ccsid(&(info->level_data_type[i]),temp);
-        } else {
-            if (ctype & 0x02) {
-                ARM64_WRITE_SYSREG(CSSELR_EL1, (int64_t)(i << 1));
-                temp = ARM64_READ_SYSREG(ccsidr_el1);
-                info->level_data_type[i].ctype = 2;
-                parse_ccsid(&(info->level_data_type[i]),temp);
-            }
-            if (ctype & 0x01) {
-                ARM64_WRITE_SYSREG(CSSELR_EL1, (int64_t)(i << 1) | 0x01);
-                temp = ARM64_READ_SYSREG(ccsidr_el1);
-                info->level_inst_type[i].ctype = 1;
-                parse_ccsid(&(info->level_inst_type[i]),temp);
-            }
-        }
-    }
-}
-
-void arm64_dump_cache_info(uint32_t cpu) {
-
-    arm64_cache_info_t*  info = &(cache_info[cpu]);
-    printf("==== ARM64 CACHE INFO CORE %u====\n",cpu);
-    printf("Inner Boundary = L%u\n",info->inner_boundary);
-    printf("Level of Unification Uinprocessor = L%u\n", info->lou_u);
-    printf("Level of Coherence = L%u\n", info->loc);
-    printf("Level of Unification Inner Shareable = L%u\n",info->lou_is);
-    for (int i = 0; i < 7; i++) {
-        printf("L%d Details:\n",i+1);
-        if ((info->level_data_type[i].ctype == 0) && (info->level_inst_type[i].ctype == 0)) {
-            printf("\tNot Implemented\n");
-        } else {
-            if (info->level_data_type[i].ctype == 4) {
-                printf("\tUnified Cache, sets=%u, associativity=%u, line size=%u bytes\n", info->level_data_type[i].num_sets,
-                                                                    info->level_data_type[i].associativity,
-                                                                    info->level_data_type[i].line_size);
-            } else {
-                if (info->level_data_type[i].ctype & 0x02) {
-                    printf("\tData Cache, sets=%u, associativity=%u, line size=%u bytes\n", info->level_data_type[i].num_sets,
-                                                                    info->level_data_type[i].associativity,
-                                                                    info->level_data_type[i].line_size);
-                }
-                if (info->level_inst_type[i].ctype & 0x01) {
-                    printf("\tInstruction Cache, sets=%u, associativity=%u, line size=%u bytes\n", info->level_inst_type[i].num_sets,
-                                                                    info->level_inst_type[i].associativity,
-                                                                    info->level_inst_type[i].line_size);
-                }
-            }
-        }
-    }
-}
-
-static void arm64_cpu_early_init(void)
-{
-    /* make sure the per cpu pointer is set up */
+static void arm64_cpu_early_init() {
+    // Make sure the per cpu pointer is set up.
     arm64_init_percpu_early();
 
-    uint64_t mmfr0 = ARM64_READ_SYSREG(ID_AA64MMFR0_EL1);
-
-    /* check to make sure implementation supports 16 bit asids */
-    ASSERT( (mmfr0 & ARM64_MMFR0_ASIDBITS_MASK) == ARM64_MMFR0_ASIDBITS_16);
-
-    /* set the vector base */
+    // Set the vector base.
     ARM64_WRITE_SYSREG(VBAR_EL1, (uint64_t)&arm64_el1_exception_base);
 
-    /* set some control bits in sctlr */
+    // Set some control bits in sctlr.
     uint64_t sctlr = ARM64_READ_SYSREG(sctlr_el1);
-    sctlr |= (1<<26);  /* UCI - Allow certain cache ops in EL0 */
-    sctlr |= (1<<15);  /* UCT - Allow EL0 access to CTR register */
-    sctlr |= (1<<14);  /* DZE - Allow EL0 to use DC ZVA */
-    sctlr |= (1<<4);   /* SA0 - Enable Stack Alignment Check EL0 */
-    sctlr |= (1<<3);   /* SA  - Enable Stack Alignment Check EL1 */
-    sctlr &= ~(1<<1);  /* AC  - Disable Alignment Checking for EL1 EL0 */
+    sctlr |= SCTLR_EL1_UCI | SCTLR_EL1_UCT | SCTLR_EL1_DZE | SCTLR_EL1_SA0 | SCTLR_EL1_SA;
+    sctlr &= ~SCTLR_EL1_AC;  // Disable alignment checking for EL1, EL0.
     ARM64_WRITE_SYSREG(sctlr_el1, sctlr);
 
+    // Save all of the features of the cpu.
+    arm64_feature_init();
+
+    // Enable cycle counter.
+    ARM64_WRITE_SYSREG(pmcr_el0, PMCR_EL0_ENABLE_BIT | PMCR_EL0_LONG_COUNTER_BIT);
+    ARM64_WRITE_SYSREG(pmcntenset_el0, PMCNTENSET_EL0_ENABLE);
+
+    // Enable user space access to cycle counter.
+    ARM64_WRITE_SYSREG(pmuserenr_el0, PMUSERENR_EL0_ENABLE);
+
+    // Enable user space access to virtual counter (CNTVCT_EL0).
+    ARM64_WRITE_SYSREG(cntkctl_el1, CNTKCTL_EL1_ENABLE_VIRTUAL_COUNTER);
+
+    ARM64_WRITE_SYSREG(mdscr_el1, MSDCR_EL1_INITIAL_VALUE);
+
     arch_enable_fiqs();
-
-    /* enable cycle counter */
-    ARM64_WRITE_SYSREG(pmcr_el0, (uint64_t)(PMCR_EL0_ENABLE_BIT | PMCR_EL0_LONG_COUNTER_BIT));
-    ARM64_WRITE_SYSREG(pmcntenset_el0, (1UL << 31));
-
-    /* enable user space access to cycle counter */
-    ARM64_WRITE_SYSREG(pmuserenr_el0, 1UL);
-
-    /* enable user space access to virtual counter (CNTVCT_EL0) */
-    ARM64_WRITE_SYSREG(cntkctl_el1, 1UL << 1);
-
-    uint32_t cpu = arch_curr_cpu_num();
-    arm64_get_cache_info(&(cache_info[cpu]));
 }
 
-void arch_early_init(void)
-{
+void arch_early_init() {
     arm64_cpu_early_init();
-
-    /* read the block size of DC ZVA */
-    uint64_t dczid = ARM64_READ_SYSREG(dczid_el0);
-    if (BIT(dczid, 4) == 0) {
-        arm64_zva_shift = (uint32_t)(ARM64_READ_SYSREG(dczid_el0) & 0xf) + 2;
-    }
-    ASSERT(arm64_zva_shift != 0); /* for now, fail if DC ZVA is unavailable */
 
     platform_init_mmu_mappings();
 }
 
-static void midr_to_core(uint32_t midr, char *str, size_t len)
-{
-    __UNUSED uint32_t implementer = BITS_SHIFT(midr, 31, 24);
-    __UNUSED uint32_t variant = BITS_SHIFT(midr, 23, 20);
-    __UNUSED uint32_t architecture = BITS_SHIFT(midr, 19, 16);
-    __UNUSED uint32_t partnum = BITS_SHIFT(midr, 15, 4);
-    __UNUSED uint32_t revision = BITS_SHIFT(midr, 3, 0);
-
-    const char *partnum_str = "unknown";
-    if (implementer == 'A') {
-        // ARM cores
-        switch (partnum) {
-            case 0xd03: partnum_str = "ARM Cortex-a53"; break;
-            case 0xd04: partnum_str = "ARM Cortex-a35"; break;
-            case 0xd07: partnum_str = "ARM Cortex-a57"; break;
-            case 0xd08: partnum_str = "ARM Cortex-a72"; break;
-            case 0xd09: partnum_str = "ARM Cortex-a73"; break;
-        }
-    } else if (implementer == 'C' && partnum == 0xa1) {
-        // Cavium
-        partnum_str = "Cavium CN88XX";
-    }
-
-    snprintf(str, len, "%s r%up%u", partnum_str, variant, revision);
-}
-
-static void print_cpu_info()
-{
-    uint32_t midr = (uint32_t)ARM64_READ_SYSREG(midr_el1);
-    char cpu_name[128];
-    midr_to_core(midr, cpu_name, sizeof(cpu_name));
-
-    uint64_t mpidr = ARM64_READ_SYSREG(mpidr_el1);
-
-    dprintf(INFO, "ARM cpu %u: midr %#x '%s' mpidr %#" PRIx64 " aff %u:%u:%u:%u\n", arch_curr_cpu_num(), midr, cpu_name,
-            mpidr,
-            (uint32_t)((mpidr & MPIDR_AFF3_MASK) >> MPIDR_AFF3_SHIFT),
-            (uint32_t)((mpidr & MPIDR_AFF2_MASK) >> MPIDR_AFF2_SHIFT),
-            (uint32_t)((mpidr & MPIDR_AFF1_MASK) >> MPIDR_AFF1_SHIFT),
-            (uint32_t)((mpidr & MPIDR_AFF0_MASK) >> MPIDR_AFF0_SHIFT));
-}
-
-void arch_init(void)
-{
+void arch_init() TA_NO_THREAD_SAFETY_ANALYSIS {
     arch_mp_init_percpu();
 
-    print_cpu_info();
+    dprintf(INFO, "ARM boot EL%lu\n", arm64_get_boot_el());
+
+    arm64_feature_debug(true);
 
     uint32_t max_cpus = arch_max_num_cpus();
     uint32_t cmdline_max_cpus = cmdline_get_uint32("kernel.smp.maxcpus", max_cpus);
@@ -288,53 +174,44 @@ void arch_init(void)
 
     LTRACEF("releasing %d secondary cpus\n", secondaries_to_init);
 
-    /* release the secondary cpus */
+    // Release the secondary cpus.
     spin_unlock(&arm_boot_cpu_lock);
 
-    /* flush the release of the lock, since the secondary cpus are running without cache on */
+    // Flush the release of the lock, since the secondary cpus are running without cache on.
     arch_clean_cache_range((addr_t)&arm_boot_cpu_lock, sizeof(arm_boot_cpu_lock));
 }
 
-void arch_quiesce(void)
-{
+__NO_RETURN int arch_idle_thread_routine(void*) {
+    for (;;)
+        __asm__ volatile("wfi");
 }
 
-void arch_idle(void)
-{
-    __asm__ volatile("wfi");
-}
-
-void arch_chain_load(void *entry, ulong arg0, ulong arg1, ulong arg2, ulong arg3)
-{
-    PANIC_UNIMPLEMENTED;
-}
-
-/* switch to user mode, set the user stack pointer to user_stack_top, put the svc stack pointer to the top of the kernel stack */
+// Switch to user mode, set the user stack pointer to user_stack_top, put the svc stack pointer to
+// the top of the kernel stack.
 void arch_enter_uspace(uintptr_t pc, uintptr_t sp, uintptr_t arg1, uintptr_t arg2) {
-    thread_t *ct = get_current_thread();
+    thread_t* ct = get_current_thread();
 
-    /* set up a default spsr to get into 64bit user space:
-     * zeroed NZCV
-     * no SS, no IL, no D
-     * all interrupts enabled
-     * mode 0: EL0t
-     */
+    // Set up a default spsr to get into 64bit user space:
+    //  - Zeroed NZCV.
+    //  - No SS, no IL, no D.
+    //  - All interrupts enabled.
+    //  - Mode 0: EL0t.
+    //
     // TODO: (hollande,travisg) Need to determine why some platforms throw an
     //         SError exception when first switching to uspace.
-    uint32_t spsr = (uint32_t)(1 << 8); //Mask SError exceptions (currently unhandled)
+    uint32_t spsr = 1 << 8;  // Mask SError exceptions (currently unhandled).
 
     arch_disable_ints();
 
     LTRACEF("arm_uspace_entry(%#" PRIxPTR ", %#" PRIxPTR ", %#x, %#" PRIxPTR
             ", %#" PRIxPTR ", 0, %#" PRIxPTR ")\n",
             arg1, arg2, spsr, ct->stack_top, sp, pc);
-    arm64_uspace_entry(arg1, arg2, pc, sp, ct->stack_top, spsr);
+    arm64_uspace_entry(arg1, arg2, pc, sp, ct->stack_top, spsr, MSDCR_EL1_INITIAL_VALUE);
     __UNREACHABLE;
 }
 
-/* called from assembly */
-extern "C" void arm64_secondary_entry(void)
-{
+// called from assembly.
+extern "C" void arm64_secondary_entry() {
     arm64_cpu_early_init();
 
     spin_lock(&arm_boot_cpu_lock);
@@ -342,12 +219,12 @@ extern "C" void arm64_secondary_entry(void)
 
     uint cpu = arch_curr_cpu_num();
     thread_secondary_cpu_init_early(&_init_thread[cpu - 1]);
-    /* run early secondary cpu init routines up to the threading level */
+    // Run early secondary cpu init routines up to the threading level.
     lk_init_level(LK_INIT_FLAG_SECONDARY_CPUS, LK_INIT_LEVEL_EARLIEST, LK_INIT_LEVEL_THREADING - 1);
 
     arch_mp_init_percpu();
 
-    print_cpu_info();
+    arm64_feature_debug(false);
 
     lk_secondary_cpu_entry();
 }

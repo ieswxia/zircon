@@ -16,9 +16,10 @@ __BEGIN_CDECLS
 #define BOOT_CPU_ID 0
 
 typedef enum {
-    HALT_ACTION_HALT = 0,       // Spin forever.
-    HALT_ACTION_REBOOT,         // Reset the CPU.
-    HALT_ACTION_SHUTDOWN,       // Shutdown and power off.
+    HALT_ACTION_HALT = 0,           // Spin forever.
+    HALT_ACTION_REBOOT,             // Reset the CPU.
+    HALT_ACTION_REBOOT_BOOTLOADER,  // Reboot into the bootloader.
+    HALT_ACTION_SHUTDOWN,           // Shutdown and power off.
 } platform_halt_action;
 
 typedef enum {
@@ -36,10 +37,13 @@ typedef enum {
 } platform_halt_reason;
 
 /* current time in nanoseconds */
-lk_time_t current_time(void);
+zx_time_t current_time(void);
 
 /* high-precision timer ticks per second */
-uint64_t ticks_per_second(void);
+zx_ticks_t ticks_per_second(void);
+
+/* high-precision timer current_ticks */
+zx_ticks_t current_ticks(void);
 
 /* super early platform initialization, before almost everything */
 void platform_early_init(void);
@@ -119,5 +123,16 @@ size_t platform_stow_crashlog(void* log, size_t len);
  */
 size_t platform_recover_crashlog(size_t len, void* cookie,
                                  void (*func)(const void* data, size_t off, size_t len, void* cookie));
+
+// Called just before initiating a system suspend to give the platform layer a
+// chance to save state.  Must be called with interrupts disabled.
+void platform_suspend(void);
+
+// Called immediately after resuming from a system suspend to let the platform layer
+// reinitialize arch components.  Must be called with interrupts disabled.
+void platform_resume(void);
+
+// Returns true if this system has a debug serial port that is enabled
+bool platform_serial_enabled(void);
 
 __END_CDECLS

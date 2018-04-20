@@ -11,22 +11,16 @@
 
 #include <arch/ops.h>
 #include <arch/user_copy.h>
+#include <hypervisor/ktrace.h>
 #include <kernel/cmdline.h>
-#include <vm/vm_aspace.h>
 #include <lib/ktrace.h>
 #include <lk/init.h>
-#include <zircon/thread_annotations.h>
 #include <object/thread_dispatcher.h>
+#include <vm/vm_aspace.h>
+#include <zircon/thread_annotations.h>
 
-#if __x86_64__
-#define ktrace_timestamp() rdtsc();
+#define ktrace_timestamp() current_ticks();
 #define ktrace_ticks_per_ms() (ticks_per_second() / 1000)
-#else
-#define ktrace_timestamp() current_time()
-#define ktrace_ticks_per_ms() (1000000)
-#endif
-
-static void ktrace_name_etc(uint32_t tag, uint32_t id, uint32_t arg, const char* name, bool always);
 
 // Generated struct that has the syscall index and name.
 static struct ktrace_syscall_info {
@@ -48,10 +42,10 @@ void ktrace_report_syscalls(ktrace_syscall_info* call) {
 
 static uint32_t probe_number = 1;
 
-extern ktrace_probe_info_t __start_ktrace_probe[] __WEAK;
-extern ktrace_probe_info_t __stop_ktrace_probe[] __WEAK;
+extern ktrace_probe_info_t* const __start_ktrace_probe[];
+extern ktrace_probe_info_t* const __stop_ktrace_probe[];
 
-static mutex_t probe_list_lock = MUTEX_INITIAL_VALUE(probe_list_lock);
+static fbl::Mutex probe_list_lock;
 static ktrace_probe_info_t* probe_list TA_GUARDED(probe_list_lock);
 
 static ktrace_probe_info_t* ktrace_find_probe(const char* name) TA_REQ(probe_list_lock) {
@@ -74,12 +68,11 @@ static void ktrace_add_probe(ktrace_probe_info_t* probe) TA_REQ(probe_list_lock)
 }
 
 static void ktrace_report_probes(void) {
+    fbl::AutoLock lock(&probe_list_lock);
     ktrace_probe_info_t *probe;
-    mutex_acquire(&probe_list_lock);
     for (probe = probe_list; probe != nullptr; probe = probe->next) {
         ktrace_name_etc(TAG_PROBE_NAME, probe->num, 0, probe->name, true);
     }
-    mutex_release(&probe_list_lock);
 }
 
 typedef struct ktrace_state {
@@ -162,23 +155,21 @@ zx_status_t ktrace_control(uint32_t action, uint32_t options, void* ptr) {
         atomic_store(&ks->offset, KTRACE_RECSIZE * 2);
         ktrace_report_syscalls(kt_syscall_info);
         ktrace_report_probes();
+        ktrace_report_vcpu_meta();
         break;
     case KTRACE_ACTION_NEW_PROBE: {
+        fbl::AutoLock lock(&probe_list_lock);
         ktrace_probe_info_t* probe;
-        mutex_acquire(&probe_list_lock);
         if ((probe = ktrace_find_probe((const char*) ptr)) != nullptr) {
-            mutex_release(&probe_list_lock);
             return probe->num;
         }
         probe = (ktrace_probe_info_t*) calloc(sizeof(*probe) + ZX_MAX_NAME_LEN, 1);
         if (probe == nullptr) {
-            mutex_release(&probe_list_lock);
             return ZX_ERR_NO_MEMORY;
         }
         probe->name = (const char*) (probe + 1);
         memcpy(probe + 1, ptr, ZX_MAX_NAME_LEN);
         ktrace_add_probe(probe);
-        mutex_release(&probe_list_lock);
         return probe->num;
     }
     default:
@@ -217,12 +208,14 @@ void ktrace_init(unsigned level) {
     dprintf(INFO, "ktrace: buffer at %p (%u bytes)\n", ks->buffer, mb);
 
     // register all static probes
-    ktrace_probe_info_t *probe;
-    mutex_acquire(&probe_list_lock);
-    for (probe = __start_ktrace_probe; probe != __stop_ktrace_probe; probe++) {
-        ktrace_add_probe(probe);
+    {
+        fbl::AutoLock lock(&probe_list_lock);
+        for (auto probe = __start_ktrace_probe;
+             probe != __stop_ktrace_probe;
+             ++probe) {
+            ktrace_add_probe(*probe);
+        }
     }
-    mutex_release(&probe_list_lock);
 
     // write metadata to the first two event slots
     uint64_t n = ktrace_ticks_per_ms();
@@ -241,6 +234,15 @@ void ktrace_init(unsigned level) {
 
     // report names of existing threads
     ktrace_report_live_threads();
+
+    // report metadata for VCPUs
+    ktrace_report_vcpu_meta();
+
+    // Report an event for "tracing is all set up now".  This also
+    // serves to ensure that there will be at least one static probe
+    // entry so that the __{start,stop}_ktrace_probe symbols above
+    // will be defined by the linker.
+    ktrace_probe0("ktrace_ready");
 }
 
 void ktrace_tiny(uint32_t tag, uint32_t arg) {
@@ -280,10 +282,10 @@ void* ktrace_open(uint32_t tag) {
     return hdr + 1;
 }
 
-static void ktrace_name_etc(uint32_t tag, uint32_t id, uint32_t arg, const char* name, bool always) {
+void ktrace_name_etc(uint32_t tag, uint32_t id, uint32_t arg, const char* name, bool always) {
     ktrace_state_t* ks = &KTRACE_STATE;
     if ((tag & atomic_load(&ks->grpmask)) || always) {
-        uint32_t len = static_cast<uint32_t>(strnlen(name, 31));
+        uint32_t len = static_cast<uint32_t>(strnlen(name, ZX_MAX_NAME_LEN - 1));
 
         // set size to: sizeof(hdr) + len + 1, round up to multiple of 8
         tag = (tag & 0xFFFFFFF0) | ((KTRACE_NAMESIZE + len + 1 + 7) >> 3);
@@ -303,8 +305,4 @@ static void ktrace_name_etc(uint32_t tag, uint32_t id, uint32_t arg, const char*
     }
 }
 
-void ktrace_name(uint32_t tag, uint32_t id, uint32_t arg, const char* name) {
-    ktrace_name_etc(tag, id, arg, name, false);
-}
-
-LK_INIT_HOOK(ktrace, ktrace_init, LK_INIT_LEVEL_APPS - 1);
+LK_INIT_HOOK(ktrace, ktrace_init, LK_INIT_LEVEL_USER);

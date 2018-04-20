@@ -50,26 +50,102 @@ constexpr bool is_pow2(T val) {
     return internal::IsPow2Helper<T>::is_pow2(val);
 }
 
-// roundup rounds up val until it is divisible by multiple.
+// round_up rounds up val until it is divisible by multiple.
 // Zero is divisible by all multiples.
 template<class T, class U,
+         class L = typename conditional<sizeof(T) >= sizeof(U), T, U>::type,
          class = typename enable_if<is_unsigned_integer<T>::value>::type,
          class = typename enable_if<is_unsigned_integer<U>::value>::type>
-constexpr const T roundup(const T& val, const U& multiple) {
+constexpr const L round_up(const T& val_, const U& multiple_) {
+    const L val = static_cast<L>(val_);
+    const L multiple = static_cast<L>(multiple_);
     return val == 0 ? 0 :
-            is_pow2<U>(multiple) ? (val + (multiple - 1)) & ~(multiple - 1) :
+            is_pow2<L>(multiple) ? (val + (multiple - 1)) & ~(multiple - 1) :
                 ((val + (multiple - 1)) / multiple) * multiple;
 }
 
-// roundup rounds down val until it is divisible by multiple.
+// round_down rounds down val until it is divisible by multiple.
 // Zero is divisible by all multiples.
 template<class T, class U,
+         class L = typename conditional<sizeof(T) >= sizeof(U), T, U>::type,
          class = typename enable_if<is_unsigned_integer<T>::value>::type,
          class = typename enable_if<is_unsigned_integer<U>::value>::type>
-constexpr const T rounddown(const T& val, const U& multiple) {
+constexpr const L round_down(const T& val_, const U& multiple_) {
+    const L val = static_cast<L>(val_);
+    const L multiple = static_cast<L>(multiple_);
     return val == 0 ? 0 :
-            is_pow2<U>(multiple) ? val & ~(multiple - 1) :
+            is_pow2<L>(multiple) ? val & ~(multiple - 1) :
                 (val / multiple) * multiple;
+}
+
+// Returns an iterator to the maximum element in the range [|first|, |last|).
+//
+// |first| and |last| must be forward iterators.
+//
+// Similar to: <http://en.cppreference.com/w/cpp/algorithm/max_element>
+template<class FwIterator>
+FwIterator max_element(FwIterator first, FwIterator last) {
+    FwIterator max = first;
+    while (first < last) {
+        if (*first > *max) {
+            max = first;
+        }
+        first++;
+    }
+    return max;
+}
+
+// Returns an iterator to the maximum element in the range [|first|, |last|).
+// using |comp| to compare elements instead of operator>
+//
+// |first| and |last| must be forward iterators.
+//
+// Similar to: <http://en.cppreference.com/w/cpp/algorithm/max_element>
+template<class FwIterator, class Compare>
+FwIterator max_element(FwIterator first, FwIterator last, Compare comp) {
+    FwIterator max = first;
+    while (first < last) {
+        if (comp(*first, *max)) {
+            max = first;
+        }
+        first++;
+    }
+    return max;
+}
+
+// Returns an iterator to the minimum element in the range [|first|, |last|).
+//
+// |first| and |last| must be forward iterators.
+//
+// Similar to: <http://en.cppreference.com/w/cpp/algorithm/min_element>
+template<class FwIterator>
+FwIterator min_element(FwIterator first, FwIterator last) {
+    FwIterator min = first;
+    while (first < last) {
+        if (*first < *min) {
+            min = first;
+        }
+        first++;
+    }
+    return min;
+}
+
+// Returns an iterator to the minimum element in the range [|first|, |last|)
+// using |comp| to compare elements instead of operator<
+//
+// |first| and |last| must be forward iterators.
+//
+// Similar to: <http://en.cppreference.com/w/cpp/algorithm/min_element>
+template<class FwIterator, class Compare>
+FwIterator min_element(FwIterator first, FwIterator last, Compare comp) {
+    FwIterator min = first;
+    while (first < last) {
+        if (comp(*first, *min)) {
+            min = first;
+        }
+        first++;
+    }
+    return min;
 }
 
 // Returns a pointer to the first element that is not less than |value|, or
@@ -111,6 +187,70 @@ const T* lower_bound(const T* first, const T* last, const U& value, Compare comp
 template <typename T, size_t N>
 constexpr size_t count_of(T const(&)[N]) {
     return N;
+}
+
+// 2017-12-10: On ARM/release/GCC, a div(mod)-based implementation runs at 2x
+// the speed of subtract-based ones, with no O(n) scaling as input values grow.
+// For x86-64/release/GCC, sub-based methods are initially 20-40% faster (depending
+// on int type) but scale linearly; they are comparable for values 100000-200000.
+//
+// gcd (greatest common divisor) returns the largest non-negative integer that cleanly
+// divides both inputs. Inputs are unsigned integers. gcd(x,0)=x; gcd(x,1)=1
+template <typename T, class = typename enable_if<is_unsigned_integer<T>::value>::type>
+T gcd(T first, T second) {
+    // If function need not support uint8 or uint16, static_casts can be removed
+    while (second != 0) {
+        first = static_cast<T>(first % second);
+        if (first == 0) {
+            return second;
+        }
+        second = static_cast<T>(second % first);
+    }
+
+    return first;
+}
+
+// lcm (least common multiple) returns the smallest non-negative integer that is
+// cleanly divided by both inputs.
+// Inputs are unsigned integers. lcm(x,0)=0; lcm(x,1)=x
+template <typename T, class = typename enable_if<is_unsigned_integer<T>::value>::type>
+T lcm(T first, T second) {
+    if (first == 0 && second == 0) {
+        return 0;
+    }
+
+    // If function need not support uint8 or uint16, static_cast can be removed
+    return static_cast<T>((first / gcd(first, second)) * second);
+}
+
+// Accumulates the elements in the range [|first|, |last|) with |initial_value|.
+// Returns the accumulated value.
+//
+// |first| and |last| must be InputIterators.
+//
+// Similar to <http://en.cppreference.com/w/cpp/algorithm/accumulate>.
+template <class InputIterator, class T>
+T accumulate(InputIterator first, InputIterator last, T initial_value) {
+    while(first < last) {
+        initial_value += *first;
+        first++;
+    }
+    return initial_value;
+}
+
+// Accumulates the elements in the range [|first|, |last|) with |initial_value|
+// using |op| instead of operator+.  Returns the accumulated value.
+//
+// |first| and |last| must be InputIterators.
+//
+// Similar to <http://en.cppreference.com/w/cpp/algorithm/accumulate>.
+template <class InputIterator, class T, class BinaryOp>
+T accumulate(InputIterator first, InputIterator last, T initial_value, BinaryOp op) {
+    while(first < last) {
+        initial_value = op(initial_value, *first);
+        first++;
+    }
+    return initial_value;
 }
 
 }  // namespace fbl

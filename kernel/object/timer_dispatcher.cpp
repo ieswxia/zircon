@@ -12,18 +12,18 @@
 
 #include <kernel/thread.h>
 
-#include <zircon/compiler.h>
-#include <zircon/rights.h>
 #include <fbl/alloc_checker.h>
 #include <fbl/auto_lock.h>
+#include <zircon/compiler.h>
+#include <zircon/rights.h>
+#include <zircon/types.h>
 
 using fbl::AutoLock;
 
-static handler_return timer_irq_callback(timer* timer, lk_time_t now, void* arg) {
+static void timer_irq_callback(timer* timer, zx_time_t now, void* arg) {
     // We are in IRQ context and cannot touch the timer state_tracker, so we
     // schedule a DPC to do so. TODO(cpu): figure out ways to reduce the lag.
-    dpc_queue(reinterpret_cast<dpc_t*>(arg), false);
-    return INT_RESCHEDULE;
+    dpc_queue(reinterpret_cast<dpc_t*>(arg), true);
 }
 
 static void dpc_callback(dpc_t* d) {
@@ -73,7 +73,7 @@ TimerDispatcher::~TimerDispatcher() {
 void TimerDispatcher::on_zero_handles() {
     // The timers can be kept alive indefinitely by the callbacks, so
     // we need to cancel when there are no more user-mode clients.
-    AutoLock al(&lock_);
+    AutoLock al(get_lock());
 
     // We must ensure that the timer callback (running in interrupt context,
     // possibly on a different CPU) has completed before possibly destroy
@@ -85,14 +85,14 @@ void TimerDispatcher::on_zero_handles() {
 zx_status_t TimerDispatcher::Set(zx_time_t deadline, zx_duration_t slack) {
     canary_.Assert();
 
-    AutoLock al(&lock_);
+    AutoLock al(get_lock());
 
     bool did_cancel = CancelTimerLocked();
 
     // If the timer is already due, then we can set the signal immediately without
     // starting the timer.
     if ((deadline == 0u) || (deadline <= current_time())) {
-        state_tracker_.UpdateState(0u, ZX_TIMER_SIGNALED);
+        UpdateStateLocked(0u, ZX_TIMER_SIGNALED);
         return ZX_OK;
     }
 
@@ -120,7 +120,7 @@ zx_status_t TimerDispatcher::Set(zx_time_t deadline, zx_duration_t slack) {
 
 zx_status_t TimerDispatcher::Cancel() {
     canary_.Assert();
-    AutoLock al(&lock_);
+    AutoLock al(get_lock());
     CancelTimerLocked();
     return ZX_OK;
 }
@@ -134,7 +134,7 @@ void TimerDispatcher::SetTimerLocked(bool cancel_first) {
 
 bool TimerDispatcher::CancelTimerLocked() {
     // Always clear the signal bit.
-    state_tracker_.UpdateState(ZX_TIMER_SIGNALED, 0u);
+    UpdateStateLocked(ZX_TIMER_SIGNALED, 0u);
 
     // If the timer isn't pending then we're done.
     if (!deadline_)
@@ -166,7 +166,7 @@ void TimerDispatcher::OnTimerFired() {
     canary_.Assert();
 
     {
-        AutoLock al(&lock_);
+        AutoLock al(get_lock());
 
         if (cancel_pending_) {
             // We previously attempted to cancel the timer but the dpc had already
@@ -182,7 +182,7 @@ void TimerDispatcher::OnTimerFired() {
             }
         } else {
             // The timer is firing.
-            state_tracker_.UpdateState(0u, ZX_TIMER_SIGNALED);
+            UpdateStateLocked(0u, ZX_TIMER_SIGNALED);
             deadline_ = 0u;
         }
     }

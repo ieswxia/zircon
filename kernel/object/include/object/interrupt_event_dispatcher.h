@@ -8,40 +8,29 @@
 
 #include <zircon/types.h>
 #include <fbl/canary.h>
-#include <fbl/intrusive_wavl_tree.h>
-#include <fbl/mutex.h>
 #include <object/interrupt_dispatcher.h>
 #include <sys/types.h>
 
 class InterruptEventDispatcher final : public InterruptDispatcher {
 public:
-    static zx_status_t Create(uint32_t vector,
-                              uint32_t flags,
-                              fbl::RefPtr<Dispatcher>* dispatcher,
+    static zx_status_t Create(fbl::RefPtr<Dispatcher>* dispatcher,
                               zx_rights_t* rights);
 
     InterruptEventDispatcher(const InterruptDispatcher &) = delete;
     InterruptEventDispatcher& operator=(const InterruptDispatcher &) = delete;
 
-    ~InterruptEventDispatcher() final;
-    zx_status_t InterruptComplete() final;
-    zx_status_t UserSignal() final;
+    zx_status_t Bind(uint32_t slot, uint32_t vector, uint32_t options) final;
 
-    // requred to exist in our collection of allocated vectors.
-    uint32_t GetKey() const { return vector_; }
+protected:
+    void MaskInterrupt(uint32_t vector) final;
+    void UnmaskInterrupt(uint32_t vector) final;
+    zx_status_t RegisterInterruptHandler(uint32_t vector, void* data) final;
+    void UnregisterInterruptHandler(uint32_t vector) final;
 
 private:
-    using VectorCollection = fbl::WAVLTree<uint32_t, InterruptEventDispatcher*>;
-    friend fbl::DefaultWAVLTreeTraits<InterruptEventDispatcher*>;
+    explicit InterruptEventDispatcher() {}
 
-    explicit InterruptEventDispatcher(uint32_t vector) : vector_(vector) { }
-
-    static enum handler_return IrqHandler(void* ctx);
+    static void IrqHandler(void* ctx);
 
     fbl::Canary<fbl::magic("INED")> canary_;
-    const uint32_t vector_;
-    fbl::WAVLTreeNodeState<InterruptEventDispatcher*> wavl_node_state_;
-
-    static fbl::Mutex vectors_lock_;
-    static VectorCollection vectors_ TA_GUARDED(vectors_lock_);
 };

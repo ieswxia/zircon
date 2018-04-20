@@ -3,33 +3,23 @@
 # found in the LICENSE file.
 
 config("fidl_config") {
-  include_dirs = [ "." ]
+  include_dirs = [ "include" ]
   visibility = [ ":*" ]
 }
 
 source_set("compiler") {
   public_configs = [ ":fidl_config" ]
   sources = [
-    "ast.h",
-    "identifier_table.cpp",
-    "identifier_table.h",
-    "lexer.cpp",
-    "lexer.h",
-    "parser.cpp",
-    "parser.h",
-    "source_manager.cpp",
-    "source_manager.h",
-    "string_view.h",
-    "token.h",
-    "token_definitions.h",
-  ]
-}
-
-executable("fidl2") {
-  sources = [
-    "main.cpp",
-  ]
-  deps = [
-    ":compiler",
+    "lib/c_generator.cpp",
+    "lib/error_reporter.cpp",
+    "lib/flat_ast.cpp",
+    "lib/identifier_table.cpp",
+    "lib/json_generator.cpp",
+    "lib/lexer.cpp",
+    "lib/parser.cpp",
+    "lib/source_file.cpp",
+    "lib/source_location.cpp",
+    "lib/source_manager.cpp",
+    "lib/tables_generator.cpp",
   ]
 }

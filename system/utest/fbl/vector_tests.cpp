@@ -2,13 +2,13 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#include <unittest/unittest.h>
-#include <fbl/string.h>
-#include <fbl/tests/lfsr.h>
 #include <fbl/ref_counted.h>
 #include <fbl/ref_ptr.h>
+#include <fbl/string.h>
+#include <fbl/tests/lfsr.h>
 #include <fbl/unique_ptr.h>
 #include <fbl/vector.h>
+#include <unittest/unittest.h>
 
 namespace fbl {
 namespace tests {
@@ -23,11 +23,13 @@ using ValueType = size_t;
 struct TestObject {
     DISALLOW_COPY_AND_ASSIGN_ALLOW_MOVE(TestObject);
     TestObject() = delete;
-    explicit TestObject(ValueType val) : alive_(true), val_(val) {
+    explicit TestObject(ValueType val)
+        : alive_(true), val_(val) {
         ++live_obj_count_;
         ++ctor_count_;
     }
-    TestObject(TestObject&& r) : alive_(r.alive_), val_(r.val_) {
+    TestObject(TestObject&& r)
+        : alive_(r.alive_), val_(r.val_) {
         r.alive_ = false;
         ++ctor_count_;
     }
@@ -93,7 +95,8 @@ struct UniquePtrTraits {
 
 template <typename T>
 struct RefCountedItem : public fbl::RefCounted<RefCountedItem<T>> {
-    RefCountedItem(T v) : val(fbl::move(v)) {}
+    RefCountedItem(T v)
+        : val(fbl::move(v)) {}
     DISALLOW_COPY_ASSIGN_AND_MOVE(RefCountedItem);
     T val;
 };
@@ -680,7 +683,6 @@ bool vector_test_insert_delete() {
             vector.erase(0);
         }
         ASSERT_EQ(vector.size(), 0);
-
     }
     ASSERT_TRUE(ItemTraits::CheckLiveCount(0));
     ASSERT_TRUE(ItemTraits::CheckCtorDtorCount());
@@ -745,6 +747,47 @@ bool vector_test_no_alloc_check() {
     END_TEST;
 }
 
+template <typename ItemTraits>
+bool vector_test_initializer_list() {
+    using ItemType = typename ItemTraits::ItemType;
+
+    BEGIN_TEST;
+
+    Generator<ItemTraits> gen;
+
+    CountedAllocatorTraits::allocation_count = 0;
+    ASSERT_TRUE(ItemTraits::CheckLiveCount(0));
+    ASSERT_TRUE(ItemTraits::CheckCtorDtorCount());
+
+    // empty
+    {
+        fbl::Vector<ItemType, CountedAllocatorTraits> vector{};
+        ASSERT_EQ(CountedAllocatorTraits::allocation_count, 0);
+        ASSERT_EQ(0, vector.size());
+        ASSERT_EQ(0, vector.capacity());
+    }
+
+    // 5 items
+    {
+        fbl::Vector<ItemType, CountedAllocatorTraits> vector{
+            gen.NextItem(), gen.NextItem(), gen.NextItem(),
+            gen.NextItem(), gen.NextItem()};
+        ASSERT_EQ(CountedAllocatorTraits::allocation_count, 1);
+        ASSERT_EQ(5, vector.size());
+        ASSERT_EQ(5, vector.capacity());
+
+        gen.Reset();
+        for (size_t i = 0; i < 5; i++) {
+            ASSERT_EQ(ItemTraits::GetValue(vector[i]), gen.NextValue());
+        }
+        ASSERT_TRUE(ItemTraits::CheckLiveCount(5));
+    }
+    ASSERT_TRUE(ItemTraits::CheckLiveCount(0));
+    ASSERT_TRUE(ItemTraits::CheckCtorDtorCount());
+
+    END_TEST;
+}
+
 bool vector_test_implicit_conversion() {
     BEGIN_TEST;
 
@@ -782,21 +825,21 @@ bool vector_test_implicit_conversion() {
     END_TEST;
 }
 
-}  // namespace anonymous
+} // namespace
 
-#define RUN_FOR_ALL_TRAITS(test_base, test_size)              \
-        RUN_TEST((test_base<ValueTypeTraits, test_size>))     \
-        RUN_TEST((test_base<StructTypeTraits, test_size>))    \
-        RUN_TEST((test_base<UniquePtrTraits, test_size>))     \
-        RUN_TEST((test_base<RefPtrTraits, test_size>))
+#define RUN_FOR_ALL_TRAITS(test_base, test_size)       \
+    RUN_TEST((test_base<ValueTypeTraits, test_size>))  \
+    RUN_TEST((test_base<StructTypeTraits, test_size>)) \
+    RUN_TEST((test_base<UniquePtrTraits, test_size>))  \
+    RUN_TEST((test_base<RefPtrTraits, test_size>))
 
-#define RUN_FOR_ALL(test_base)            \
-        RUN_FOR_ALL_TRAITS(test_base, 1)  \
-        RUN_FOR_ALL_TRAITS(test_base, 2)  \
-        RUN_FOR_ALL_TRAITS(test_base, 10) \
-        RUN_FOR_ALL_TRAITS(test_base, 32) \
-        RUN_FOR_ALL_TRAITS(test_base, 64) \
-        RUN_FOR_ALL_TRAITS(test_base, 100)
+#define RUN_FOR_ALL(test_base)        \
+    RUN_FOR_ALL_TRAITS(test_base, 1)  \
+    RUN_FOR_ALL_TRAITS(test_base, 2)  \
+    RUN_FOR_ALL_TRAITS(test_base, 10) \
+    RUN_FOR_ALL_TRAITS(test_base, 32) \
+    RUN_FOR_ALL_TRAITS(test_base, 64) \
+    RUN_FOR_ALL_TRAITS(test_base, 100)
 
 BEGIN_TEST_CASE(vector_tests)
 RUN_FOR_ALL(vector_test_access_release)
@@ -811,8 +854,10 @@ RUN_FOR_ALL(vector_test_swap)
 RUN_FOR_ALL(vector_test_iterator)
 RUN_FOR_ALL(vector_test_insert_delete)
 RUN_FOR_ALL(vector_test_no_alloc_check)
+RUN_TEST(vector_test_initializer_list<ValueTypeTraits>)
+RUN_TEST(vector_test_initializer_list<RefPtrTraits>)
 RUN_TEST(vector_test_implicit_conversion)
 END_TEST_CASE(vector_tests)
 
-}  // namespace tests
-}  // namespace fbl
+} // namespace tests
+} // namespace fbl

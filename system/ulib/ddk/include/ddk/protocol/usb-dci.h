@@ -5,6 +5,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <ddk/usb-request.h>
 #include <zircon/compiler.h>
 #include <zircon/types.h>
 #include <zircon/hw/usb.h>
@@ -41,21 +42,24 @@ static inline void usb_dci_set_speed(usb_dci_interface_t* intf, usb_speed_t spee
 }
 
 typedef struct {
+    void (*request_queue)(void* ctx, usb_request_t* req);
     zx_status_t (*set_interface)(void* ctx, usb_dci_interface_t* interface);
     zx_status_t (*config_ep)(void* ctx, usb_endpoint_descriptor_t* ep_desc,
                              usb_ss_ep_comp_descriptor_t* ss_comp_desc);
     zx_status_t (*disable_ep)(void* ctx, uint8_t ep_addr);
-    // enables or disables the device controller hardware
-    // should not be enabled until upper layer is ready to respond to the host
-    zx_status_t (*set_enabled)(void* ctx, bool enabled);
     zx_status_t (*ep_set_stall)(void* ctx, uint8_t ep_address);
     zx_status_t (*ep_clear_stall)(void* ctx, uint8_t ep_address);
+    zx_status_t (*get_bti)(void* ctx, zx_handle_t* out_handle);
 } usb_dci_protocol_ops_t;
 
 typedef struct {
     usb_dci_protocol_ops_t* ops;
     void* ctx;
 } usb_dci_protocol_t;
+
+static inline void usb_dci_request_queue(usb_dci_protocol_t* dci, usb_request_t* req) {
+    dci->ops->request_queue(dci->ctx, req);
+}
 
 // registers callback interface with the controller driver
 static inline void usb_dci_set_interface(usb_dci_protocol_t* dci, usb_dci_interface_t* intf) {
@@ -72,16 +76,17 @@ static inline zx_status_t usb_dci_disable_ep(usb_dci_protocol_t* dci, uint8_t ep
     return dci->ops->disable_ep(dci->ctx, ep_addr);
 }
 
-static zx_status_t usb_dci_set_enabled(usb_dci_protocol_t* dci, bool enabled) {
-    return dci->ops->set_enabled(dci->ctx, enabled);
-}
-
 static zx_status_t usb_dci_ep_set_stall(usb_dci_protocol_t* dci, uint8_t ep_address) {
     return dci->ops->ep_set_stall(dci->ctx, ep_address);
 }
 
 static zx_status_t usb_dci_ep_clear_stall(usb_dci_protocol_t* dci, uint8_t ep_address) {
     return dci->ops->ep_clear_stall(dci->ctx, ep_address);
+}
+
+// shares a copy of the DCI driver's BTI handle
+static inline zx_status_t usb_dci_get_bti(usb_dci_protocol_t* dci, zx_handle_t* out_handle) {
+    return dci->ops->get_bti(dci->ctx, out_handle);
 }
 
 __END_CDECLS;

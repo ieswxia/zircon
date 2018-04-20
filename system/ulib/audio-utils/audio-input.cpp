@@ -65,7 +65,7 @@ zx_status_t AudioInput::Record(AudioSink& sink, float duration_seconds) {
 
     zx_time_t duration_nsec = static_cast<zx_time_t>(ZX_SEC(1)
                             * static_cast<double>(duration_seconds));
-    zx_time_t stop_time = zx_time_get(ZX_CLOCK_MONOTONIC) + duration_nsec;
+    zx_time_t stop_time = zx_clock_get(ZX_CLOCK_MONOTONIC) + duration_nsec;
     printf("Recording for %.1f seconds\n", duration_seconds);
 
     res = StartRingBuffer();
@@ -80,7 +80,7 @@ zx_status_t AudioInput::Record(AudioSink& sink, float duration_seconds) {
         zx_signals_t sigs;
 
         res = rb_ch_.wait_one(ZX_CHANNEL_READABLE | ZX_CHANNEL_PEER_CLOSED,
-                              stop_time, &sigs);
+                              zx::time(stop_time), &sigs);
 
         // If we get a timeout error, we have hit our stop time.
         if (res == ZX_ERR_TIMED_OUT) break;
@@ -132,6 +132,12 @@ zx_status_t AudioInput::Record(AudioSink& sink, float duration_seconds) {
         uint32_t amt = fbl::min(space, todo);
         auto data = static_cast<const uint8_t*>(rb_virt_) + rd_ptr;
 
+        res = zx_cache_flush(data, amt, ZX_CACHE_FLUSH_DATA | ZX_CACHE_FLUSH_INVALIDATE);
+        if (res != ZX_OK) {
+            printf("Failed to cache invalidate(res %d).\n", res);
+            break;
+        }
+
         res = sink.PutFrames(data, amt);
         if (res != ZX_OK) {
             printf("Failed to record %u bytes (res %d)\n", amt, res);
@@ -140,7 +146,13 @@ zx_status_t AudioInput::Record(AudioSink& sink, float duration_seconds) {
 
         if (amt < todo) {
             amt = todo - amt;
-            ZX_DEBUG_ASSERT(amt < ring_bytes);
+            ZX_DEBUG_ASSERT(amt < rb_sz_);
+
+            res = zx_cache_flush(rb_virt_, amt, ZX_CACHE_FLUSH_DATA | ZX_CACHE_FLUSH_INVALIDATE);
+            if (res != ZX_OK) {
+                printf("Failed to cache invalidate(res %d) %d\n", res, __LINE__);
+                break;
+            }
 
             res = sink.PutFrames(rb_virt_, amt);
             if (res != ZX_OK) {
@@ -151,8 +163,8 @@ zx_status_t AudioInput::Record(AudioSink& sink, float duration_seconds) {
             rd_ptr = amt;
         } else {
             rd_ptr += amt;
-            if (rd_ptr >= ring_bytes) {
-                ZX_DEBUG_ASSERT(rd_ptr == ring_bytes);
+            if (rd_ptr >= rb_sz_) {
+                ZX_DEBUG_ASSERT(rd_ptr == rb_sz_);
                 rd_ptr = 0;
             }
         }

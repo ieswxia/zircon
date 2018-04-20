@@ -62,8 +62,12 @@ static const char* guid_to_type(char* guid) {
         return "fuchsia-system";
     } else if (!strcmp(GUID_DATA_STRING, guid)) {
         return "fuchsia-data";
-    } else if (!strcmp(GUID_BLOBFS_STRING, guid)) {
-        return "fuchsia-blobfs";
+    } else if (!strcmp(GUID_INSTALL_STRING, guid)) {
+        return "fuchsia-install";
+    } else if (!strcmp(GUID_BLOB_STRING, guid)) {
+        return "fuchsia-blob";
+    } else if (!strcmp(GUID_FVM_STRING, guid)) {
+        return "fuchsia-fvm";
     } else {
         return "unknown";
     }
@@ -188,6 +192,30 @@ out:
     return rc;
 }
 
+static int cmd_stats(const char* dev, bool clear) {
+    int fd = open(dev, O_RDONLY);
+    if (fd < 0) {
+        printf("Error opening %s\n", dev);
+        return fd;
+    }
+
+    block_stats_t stats;
+    ssize_t rc = ioctl_block_get_stats(fd, &clear, &stats);
+    if (rc < 0) {
+        printf("Error getting stats for %s\n", dev);
+        close(fd);
+        goto out;
+    }
+
+    printf("max concurrent ops:        %zu\n", stats.max_concur);
+    printf("max pending block ops:     %zu\n", stats.max_pending);
+    printf("total submitted block ops: %zu\n", stats.total_ops);
+    printf("total submitted blocks:    %zu\n", stats.total_blocks);
+out:
+    close(fd);
+    return rc;
+}
+
 int main(int argc, const char** argv) {
     int rc = 0;
     const char *cmd = argc > 1 ? argv[1] : NULL;
@@ -197,6 +225,10 @@ int main(int argc, const char** argv) {
         } else if (!strcmp(cmd, "read")) {
             if (argc < 5) goto usage;
             rc = cmd_read_blk(argv[2], strtoul(argv[3], NULL, 10), strtoull(argv[4], NULL, 10));
+        } else if (!strcmp(cmd, "stats")) {
+            if (argc < 4) goto usage;
+            if (strcmp("true", argv[3]) && strcmp("false", argv[3])) goto usage;
+            rc = cmd_stats(argv[2], !strcmp("true", argv[3]) ? true : false);
         } else {
             printf("Unrecognized command %s!\n", cmd);
             goto usage;
@@ -209,5 +241,6 @@ usage:
     printf("Usage:\n");
     printf("%s\n", argv[0]);
     printf("%s read <blkdev> <offset> <count>\n", argv[0]);
+    printf("%s stats <blkdev> <clear=true|false>\n", argv[0]);
     return 0;
 }

@@ -11,14 +11,15 @@
 #include <platform.h>
 #include <pow2.h>
 
-#include <zircon/compiler.h>
-#include <zircon/rights.h>
-#include <zircon/syscalls/port.h>
 #include <fbl/alloc_checker.h>
 #include <fbl/arena.h>
 #include <fbl/auto_lock.h>
 #include <object/excp_port.h>
-#include <object/state_tracker.h>
+#include <object/handle.h>
+#include <zircon/compiler.h>
+#include <zircon/rights.h>
+#include <zircon/syscalls/port.h>
+#include <zircon/types.h>
 
 using fbl::AutoLock;
 
@@ -30,6 +31,8 @@ static_assert(sizeof(zx_packet_guest_mem_t) == sizeof(zx_packet_user_t),
               "size of zx_packet_guest_mem_t must match zx_packet_user_t");
 static_assert(sizeof(zx_packet_guest_io_t) == sizeof(zx_packet_user_t),
               "size of zx_packet_guest_io_t must match zx_packet_user_t");
+static_assert(sizeof(zx_packet_guest_vcpu_t) == sizeof(zx_packet_user_t),
+              "size of zx_packet_guest_vcpu_t must match zx_packet_user_t");
 
 class ArenaPortAllocator final : public PortAllocator {
 public:
@@ -38,6 +41,10 @@ public:
 
     virtual PortPacket* Alloc();
     virtual void Free(PortPacket* port_packet);
+
+    size_t DiagnosticCount() const {
+        return arena_.DiagnosticCount();
+    }
 
 private:
     fbl::TypedArena<PortPacket, fbl::Mutex> arena_;
@@ -75,6 +82,11 @@ PortPacket::PortPacket(const void* handle, PortAllocator* allocator)
     }
 }
 
+// static
+size_t PortPacket::DiagnosticAllocationCount() {
+    return port_allocator.DiagnosticCount();
+}
+
 PortObserver::PortObserver(uint32_t type, const Handle* handle, fbl::RefPtr<PortDispatcher> port,
                            uint64_t key, zx_signals_t signals)
     : type_(type),
@@ -110,7 +122,7 @@ StateObserver::Flags PortObserver::OnStateChange(zx_signals_t new_state) {
     return MaybeQueue(new_state, 1u);
 }
 
-StateObserver::Flags PortObserver::OnCancel(Handle* handle) {
+StateObserver::Flags PortObserver::OnCancel(const Handle* handle) {
     if (packet_.handle == handle) {
         return kHandled | kNeedRemoval;
     } else {
@@ -118,7 +130,7 @@ StateObserver::Flags PortObserver::OnCancel(Handle* handle) {
     }
 }
 
-StateObserver::Flags PortObserver::OnCancelByKey(Handle* handle, const void* port, uint64_t key) {
+StateObserver::Flags PortObserver::OnCancelByKey(const Handle* handle, const void* port, uint64_t key) {
     if ((packet_.handle != handle) || (packet_.key() != key) || (port_.get() != port))
         return 0;
     return kHandled | kNeedRemoval;
@@ -177,7 +189,7 @@ void PortDispatcher::on_zero_handles() {
     canary_.Assert();
 
     {
-        AutoLock al(&lock_);
+        AutoLock al(get_lock());
         zero_handles_ = true;
 
         // Unlink and unbind exception ports.
@@ -185,12 +197,16 @@ void PortDispatcher::on_zero_handles() {
             auto eport = eports_.pop_back();
 
             // Tell the eport to unbind itself, then drop our ref to it.
-            lock_.Release();  // The eport may call our ::UnlinkExceptionPort
+            get_lock()->Release();  // The eport may call our ::UnlinkExceptionPort
             eport->OnPortZeroHandles();
-            lock_.Acquire();
+            get_lock()->Acquire();
+        }
+
+        // Free any queued packets.
+        while (!packets_.is_empty()) {
+            FreePacket(packets_.pop_front());
         }
     }
-    while (Dequeue(0ull, nullptr) == ZX_OK) {}
 }
 
 zx_status_t PortDispatcher::QueueUser(const zx_port_packet_t& packet) {
@@ -201,7 +217,7 @@ zx_status_t PortDispatcher::QueueUser(const zx_port_packet_t& packet) {
         return ZX_ERR_NO_MEMORY;
 
     port_packet->packet = packet;
-    port_packet->packet.type = ZX_PKT_TYPE_USER | PKT_FLAG_EPHEMERAL;
+    port_packet->packet.type = ZX_PKT_TYPE_USER;
 
     auto status = Queue(port_packet, 0u, 0u);
     if (status < 0)
@@ -214,13 +230,16 @@ zx_status_t PortDispatcher::Queue(PortPacket* port_packet, zx_signals_t observed
 
     int wake_count = 0;
     {
-        AutoLock al(&lock_);
+        AutoLock al(get_lock());
         if (zero_handles_)
             return ZX_ERR_BAD_STATE;
 
         if (observed) {
-            if (port_packet->InContainer())
+            if (port_packet->InContainer()) {
+                port_packet->packet.signal.observed |= observed;
+                // |count| is deliberately left as is.
                 return ZX_OK;
+            }
             port_packet->packet.signal.observed = observed;
             port_packet->packet.signal.count = count;
         }
@@ -240,41 +259,43 @@ zx_status_t PortDispatcher::Dequeue(zx_time_t deadline, zx_port_packet_t* out_pa
 
     while (true) {
         {
-            AutoLock al(&lock_);
+            AutoLock al(get_lock());
 
             PortPacket* port_packet = packets_.pop_front();
             if (port_packet == nullptr)
                 goto wait;
 
-            if (out_packet != nullptr)
-                *out_packet = port_packet->packet;
-
-            PortObserver* observer = port_packet->observer;
-
-            if (observer) {
-                // Deleting the observer under the lock is fine because
-                // the reference that holds to this PortDispatcher is by
-                // construction not the last one. We need to do this under
-                // the lock because another thread can call CanReap().
-                delete observer;
-            } else if (port_packet->is_ephemeral()) {
-                port_packet->Free();
-            }
+            *out_packet = port_packet->packet;
+            FreePacket(port_packet);
         }
 
         return ZX_OK;
 
 wait:
-        zx_status_t st = sema_.Wait(deadline);
+        zx_status_t st = sema_.Wait(deadline, nullptr);
         if (st != ZX_OK)
             return st;
+    }
+}
+
+void PortDispatcher::FreePacket(PortPacket* port_packet) {
+    PortObserver* observer = port_packet->observer;
+
+    if (observer) {
+        // Deleting the observer under the lock is fine because the
+        // reference that holds to this PortDispatcher is by construction
+        // not the last one. We need to do this under the lock because
+        // another thread can call CanReap().
+        delete observer;
+    } else if (port_packet->is_ephemeral()) {
+        port_packet->Free();
     }
 }
 
 bool PortDispatcher::CanReap(PortObserver* observer, PortPacket* port_packet) {
     canary_.Assert();
 
-    AutoLock al(&lock_);
+    AutoLock al(get_lock());
     if (!port_packet->InContainer())
         return true;
     // The destruction will happen when the packet is dequeued or in CancelQueued()
@@ -290,13 +311,22 @@ zx_status_t PortDispatcher::MakeObserver(uint32_t options, Handle* handle, uint6
     // Called under the handle table lock.
 
     auto dispatcher = handle->dispatcher();
-    if (!dispatcher->get_state_tracker())
+    if (!dispatcher->has_state_tracker())
         return ZX_ERR_NOT_SUPPORTED;
 
-    fbl::AllocChecker ac;
-    auto type = (options == ZX_WAIT_ASYNC_ONCE) ?
-        ZX_PKT_TYPE_SIGNAL_ONE : ZX_PKT_TYPE_SIGNAL_REP;
+    uint32_t type;
+    switch (options) {
+        case ZX_WAIT_ASYNC_ONCE:
+            type = ZX_PKT_TYPE_SIGNAL_ONE;
+            break;
+        case ZX_WAIT_ASYNC_REPEATING:
+            type = ZX_PKT_TYPE_SIGNAL_REP;
+            break;
+        default:
+            return ZX_ERR_INVALID_ARGS;
+    }
 
+    fbl::AllocChecker ac;
     auto observer = new (&ac) PortObserver(type, handle, fbl::RefPtr<PortDispatcher>(this), key,
                                            signals);
     if (!ac.check())
@@ -309,7 +339,7 @@ zx_status_t PortDispatcher::MakeObserver(uint32_t options, Handle* handle, uint6
 bool PortDispatcher::CancelQueued(const void* handle, uint64_t key) {
     canary_.Assert();
 
-    AutoLock al(&lock_);
+    AutoLock al(get_lock());
 
     // This loop can take a while if there are many items.
     // In practice, the number of pending signal packets is
@@ -355,7 +385,7 @@ bool PortDispatcher::CancelQueued(const void* handle, uint64_t key) {
 void PortDispatcher::LinkExceptionPort(ExceptionPort* eport) {
     canary_.Assert();
 
-    AutoLock al(&lock_);
+    AutoLock al(get_lock());
     DEBUG_ASSERT_COND(eport->PortMatches(this, /* allow_null */ false));
     DEBUG_ASSERT(!eport->InContainer());
     eports_.push_back(fbl::move(AdoptRef(eport)));
@@ -364,7 +394,7 @@ void PortDispatcher::LinkExceptionPort(ExceptionPort* eport) {
 void PortDispatcher::UnlinkExceptionPort(ExceptionPort* eport) {
     canary_.Assert();
 
-    AutoLock al(&lock_);
+    AutoLock al(get_lock());
     DEBUG_ASSERT_COND(eport->PortMatches(this, /* allow_null */ true));
     if (eport->InContainer()) {
         eports_.erase(*eport);

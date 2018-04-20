@@ -97,6 +97,11 @@ struct ProviderSectionMetadataRecordFields : MetadataRecordFields {
     using Id = Field<20, 51>;
 };
 
+struct ProviderEventMetadataRecordFields : MetadataRecordFields {
+    using Id = Field<20, 51>;
+    using Event = Field<52, 55>;
+};
+
 using InitializationRecordFields = RecordFields;
 
 struct StringRecordFields : RecordFields {
@@ -114,6 +119,12 @@ struct EventRecordFields : RecordFields {
     using ThreadRef = Field<24, 31>;
     using CategoryStringRef = Field<32, 47>;
     using NameStringRef = Field<48, 63>;
+};
+
+struct BlobRecordFields : RecordFields {
+    using NameStringRef = Field<16, 31>;
+    using BlobSize = Field<32, 46>;
+    using BlobType = Field<48, 55>;
 };
 
 struct KernelObjectRecordFields : RecordFields {

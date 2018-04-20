@@ -35,7 +35,7 @@ static PortPacket* MakePacket(uint64_t key, uint32_t type, zx_koid_t pid, zx_koi
         return nullptr;
 
     port_packet->packet.key = key;
-    port_packet->packet.type = type | PKT_FLAG_EPHEMERAL;
+    port_packet->packet.type = type;
     port_packet->packet.exception.pid = pid;
     port_packet->packet.exception.tid = tid;
     port_packet->packet.exception.reserved0 = 0;
@@ -221,6 +221,11 @@ void ExceptionPort::OnTargetUnbind() {
     LTRACE_EXIT_OBJ;
 }
 
+bool ExceptionPort::PortMatches(const PortDispatcher *port, bool allow_null) {
+    fbl::AutoLock lock(&lock_);
+    return (allow_null && port_ == nullptr) || port_.get() == port;
+}
+
 zx_status_t ExceptionPort::SendPacketWorker(uint32_t type, zx_koid_t pid, zx_koid_t tid) {
     AutoLock lock(&lock_);
     LTRACEF("%s, type %u, pid %" PRIu64 ", tid %" PRIu64 "\n",
@@ -263,8 +268,10 @@ void ExceptionPort::BuildArchReport(zx_exception_report_t* report, uint32_t type
     arch_fill_in_exception_context(arch_context, report);
 }
 
-void ExceptionPort::OnThreadStart(ThreadDispatcher* thread) {
+void ExceptionPort::OnThreadStartForDebugger(ThreadDispatcher* thread) {
     canary_.Assert();
+
+    DEBUG_ASSERT(type_ == Type::DEBUGGER);
 
     zx_koid_t pid = thread->process()->get_koid();
     zx_koid_t tid = thread->get_koid();
@@ -286,69 +293,13 @@ void ExceptionPort::OnThreadStart(ThreadDispatcher* thread) {
     }
 }
 
-void ExceptionPort::OnThreadSuspending(ThreadDispatcher* thread) {
-    canary_.Assert();
-
-    zx_koid_t pid = thread->process()->get_koid();
-    zx_koid_t tid = thread->get_koid();
-    LTRACEF("thread %" PRIu64 ".%" PRIu64 " suspending\n", pid, tid);
-
-    // A note on the tense of the words used here: suspending vs suspended.
-    // "suspending" is used in the internal context because we're still
-    // in the process of suspending the thread. "suspended" is used in the
-    // external context because once the debugger receives the "suspended"
-    // report it can assume the thread is, for its purposes, suspended.
-
-    // The result is ignored, not much else we can do.
-    SendPacket(thread, ZX_EXCP_THREAD_SUSPENDED);
-}
-
-void ExceptionPort::OnThreadResuming(ThreadDispatcher* thread) {
-    canary_.Assert();
-
-    zx_koid_t pid = thread->process()->get_koid();
-    zx_koid_t tid = thread->get_koid();
-    LTRACEF("thread %" PRIu64 ".%" PRIu64 " resuming\n", pid, tid);
-
-    // See OnThreadSuspending for a note on the tense of the words uses here:
-    // suspending vs suspended.
-
-    // The result is ignored, not much else we can do.
-    SendPacket(thread, ZX_EXCP_THREAD_RESUMED);
-}
-
-// This isn't called for every process's destruction, only for processes that
-// have a bound process or debugger exception export.
-
-void ExceptionPort::OnProcessExit(ProcessDispatcher* process) {
-    canary_.Assert();
-
-    zx_koid_t pid = process->get_koid();
-    LTRACEF("process %" PRIu64 " gone\n", pid);
-
-    // The result is ignored, not much else we can do.
-    SendPacketWorker(ZX_EXCP_GONE, pid, ZX_KOID_INVALID);
-}
-
-// This isn't called for every thread's destruction, only for threads that
-// have a thread-specific exception handler.
-
-void ExceptionPort::OnThreadExit(ThreadDispatcher* thread) {
-    canary_.Assert();
-
-    zx_koid_t pid = thread->process()->get_koid();
-    zx_koid_t tid = thread->get_koid();
-    LTRACEF("thread %" PRIu64 ".%" PRIu64 " gone\n", pid, tid);
-
-    // The result is ignored, not much else we can do.
-    SendPacket(thread, ZX_EXCP_GONE);
-}
-
 // This isn't called for every thread's destruction, only when a debugger
 // is attached.
 
 void ExceptionPort::OnThreadExitForDebugger(ThreadDispatcher* thread) {
     canary_.Assert();
+
+    DEBUG_ASSERT(type_ == Type::DEBUGGER);
 
     zx_koid_t pid = thread->process()->get_koid();
     zx_koid_t tid = thread->get_koid();

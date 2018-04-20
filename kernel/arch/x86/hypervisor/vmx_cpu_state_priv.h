@@ -7,7 +7,6 @@
 #pragma once
 
 #include <arch/hypervisor.h>
-#include <hypervisor/cpu_state.h>
 
 // clang-format off
 
@@ -42,22 +41,10 @@ struct VmxInfo {
     VmxInfo();
 };
 
-/* Stores miscellaneous VMX info from the X86_MSR_IA32_VMX_MISC MSR. */
-struct MiscInfo {
-    bool wait_for_sipi;
-    uint32_t msr_list_limit;
-
-    MiscInfo();
-};
-
 /* Stores EPT info from the IA32_VMX_EPT_VPID_CAP MSR. */
 struct EptInfo {
     bool page_walk_4;
     bool write_back;
-    bool pde_2mb_page;
-    bool pdpe_1gb_page;
-    bool ept_flags;
-    bool exit_info;
     bool invept;
 
     EptInfo();
@@ -68,19 +55,6 @@ struct VmxRegion {
     uint32_t revision_id;
 };
 
-/* Maintains the VMX state for each CPU. */
-class VmxCpuState : public hypervisor::CpuState<uint16_t, 64> {
-public:
-    static zx_status_t Create(fbl::unique_ptr<VmxCpuState>* out);
-    ~VmxCpuState();
-    DISALLOW_COPY_ASSIGN_AND_MOVE(VmxCpuState);
-
-private:
-    fbl::Array<VmxPage> vmxon_pages_;
-
-    VmxCpuState() = default;
-};
-
-zx_status_t alloc_vpid(uint16_t* vpid);
-zx_status_t free_vpid(uint16_t vpid);
+zx_status_t alloc_vmx_state();
+zx_status_t free_vmx_state();
 bool cr_is_invalid(uint64_t cr_value, uint32_t fixed0_msr, uint32_t fixed1_msr);

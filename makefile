@@ -7,7 +7,7 @@
 
 LKMAKEROOT := .
 BUILDROOT ?= .
-DEFAULT_PROJECT ?= zircon-pc-x86-64
+DEFAULT_PROJECT ?= x64
 TOOLCHAIN_PREFIX ?=
 
 ENABLE_BUILD_SYSROOT ?= true
@@ -28,9 +28,8 @@ export TOOLCHAIN_PREFIX
 export ENABLE_BUILD_SYSROOT
 export ENABLE_BUILD_LISTFILES
 
-# vaneer makefile that calls into the engine with lk as the build root
+# veneer makefile that calls into the engine with lk as the build root
 # if we're the top level invocation, call ourselves with additional args
+.PHONY: _top $(MAKECMDGOALS)
 $(MAKECMDGOALS) _top:
 	@$(MAKE) -C $(LKMAKEROOT) --no-print-directory -rR -f make/engine.mk $(MAKECMDGOALS)
-
-.PHONY: _top

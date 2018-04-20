@@ -37,9 +37,9 @@
 #define GS_R15      (GS_R14 + 8)
 #define GS_CR2      (GS_R15 + 8)
 
-#ifndef ASSEMBLY
+#ifndef __ASSEMBLER__
 
-#include <sys/types.h>
+#include <zircon/types.h>
 
 /* Holds the register state used to restore a host. */
 struct HostState {
@@ -123,11 +123,12 @@ static_assert(__offsetof(VmxState, guest_state.r15) == GS_R15, "");
 static_assert(__offsetof(VmxState, guest_state.cr2) == GS_CR2, "");
 
 __BEGIN_CDECLS
+
 /* Launch the guest and save the host state.
  * If we return 0, we have exited from the guest, otherwise we have failed to
  * launch the guest.
  */
-status_t vmx_enter(VmxState* vmx_state);
+zx_status_t vmx_enter(VmxState* vmx_state);
 
 /* Exit from the guest, and load the saved host state.
  * This function is never called directly, but is executed on exit from a guest.
@@ -138,4 +139,4 @@ void vmx_exit(VmxState* vmx_state);
 
 __END_CDECLS
 
-#endif // ASSEMBLY
+#endif // __ASSEMBLER__

@@ -6,15 +6,23 @@ LOCAL_DIR := $(GET_LOCAL_DIR)
 
 MODULE := $(LOCAL_DIR)
 
-MODULE_TYPE := driver
+MODULE_TYPE := userlib
 
 MODULE_SRCS += \
-    $(LOCAL_DIR)/hi3660-bus.c \
+    $(LOCAL_DIR)/hi3660.c \
+    $(LOCAL_DIR)/hi3660-gpios.c \
     $(LOCAL_DIR)/hi3660-usb.c \
-    $(LOCAL_DIR)/pl061.c \
+    $(LOCAL_DIR)/hi3660-i2c.c \
+    $(LOCAL_DIR)/hi3660-dsi.c \
 
-MODULE_STATIC_LIBS := system/ulib/ddk
+MODULE_STATIC_LIBS := \
+    system/ulib/ddk \
+    system/dev/gpio/pl061 \
+    system/ulib/sync \
 
-MODULE_LIBS := system/ulib/driver system/ulib/c system/ulib/zircon
+MODULE_LIBS := \
+    system/ulib/driver \
+    system/ulib/c \
+    system/ulib/zircon \
 
 include make/module.mk

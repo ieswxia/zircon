@@ -6,14 +6,14 @@
 
 #include <trace/handler.h>
 
-#include <zx/eventpair.h>
-#include <zx/vmo.h>
+#include <lib/zx/eventpair.h>
+#include <lib/zx/vmo.h>
 #include <fbl/intrusive_hash_table.h>
 #include <fbl/macros.h>
 #include <fbl/string.h>
 #include <fbl/unique_ptr.h>
 #include <fbl/vector.h>
-#include <hash/hash.h>
+#include <zircon/misc/fnv1hash.h>
 
 namespace trace {
 namespace internal {
@@ -33,8 +33,10 @@ private:
 
     // |trace::TraceHandler|
     bool IsCategoryEnabled(const char* category) override;
+    void TraceStarted() override;
     void TraceStopped(async_t* async,
                       zx_status_t disposition, size_t buffer_bytes_written) override;
+    void BufferOverflow() override;
 
     void* buffer_;
     size_t buffer_num_bytes_;
@@ -52,7 +54,6 @@ private:
         const CString string;
 
         // Used by the hash table.
-        CString GetKey() const { return string; }
         static size_t GetHash(CString key) {
             return fnv1a64str(key);
         }
@@ -63,9 +64,6 @@ private:
     struct CategoryStringKeyTraits {
         static CString GetKey(const StringSetEntry& obj) {
             return obj.string;
-        }
-        static bool LessThan(const CString& key1, const CString& key2) {
-            return strcmp(key1, key2) < 0;
         }
         static bool EqualTo(const CString& key1, const CString& key2) {
             return strcmp(key1, key2) == 0;

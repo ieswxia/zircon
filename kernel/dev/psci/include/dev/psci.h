@@ -9,6 +9,7 @@
 
 #include <arch.h>
 #include <arch/arm64/mp.h>
+#include <dev/power.h>
 
 #define PSCI64_PSCI_VERSION                 (0x84000000)
 #define PSCI64_CPU_SUSPEND                  (0xC4000001)
@@ -29,12 +30,25 @@
 #define PSCI64_PSCI_STAT_RESIDENCY          (0xC4000010)
 #define PSCI64_PSCI_STAT_COUNT              (0xC4000011)
 
+#define PSCI_SUCCESS                        0
+#define PSCI_NOT_SUPPORTED                  -1
+#define PSCI_INVALID_PARAMETERS             -2
+#define PSCI_DENIED                         -3
+#define PSCI_ALREADY_ON                     -4
+#define PSCI_ON_PENDING                     -5
+#define PSCI_INTERNAL_FAILURE               -6
+#define PSCI_NOT_PRESENT                    -7
+#define PSCI_DISABLED                       -8
+#define PSCI_INVALID_ADDRESS                -9
+
+__BEGIN_CDECLS
+
 /* TODO NOTE: - currently these routines assume cpu topologies that are described only in AFF0 and AFF1.
             If a system is architected such that AFF2 or AFF3 are non-zero then this code will need
             to be revisited
 */
 
-typedef uint64_t (*psci_call_proc)(ulong arg0, ulong arg1, ulong arg2, ulong arg3);
+typedef uint64_t (*psci_call_proc)(uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3);
 
 extern psci_call_proc do_psci_call;
 
@@ -59,12 +73,10 @@ static inline uint32_t psci_get_affinity_info(uint64_t cluster, uint64_t cpuid) 
     return (uint32_t)do_psci_call(PSCI64_AFFINITY_INFO, ARM64_MPID(cluster, cpuid), 0, 0);
 }
 
-static inline void psci_system_off(void) {
+void psci_system_off(void);
 
-    do_psci_call(PSCI64_SYSTEM_OFF, 0, 0, 0);
-}
+void psci_system_reset(enum reboot_flags flags);
 
-static inline void psci_system_reset(void) {
+uint64_t psci_smc_call(uint64_t arg0, uint64_t arg1, uint64_t arg2, uint64_t arg3);
 
-    do_psci_call(PSCI64_SYSTEM_RESET, 0, 0, 0);
-}
+__END_CDECLS

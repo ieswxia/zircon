@@ -12,7 +12,6 @@
 #include <inttypes.h>
 #include <kernel/mp.h>
 #include <kernel/timer.h>
-#include <kernel/vm.h>
 #include <lib/console.h>
 #include <lk/init.h>
 #include <platform.h>
@@ -20,6 +19,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <trace.h>
+#include <vm/bootalloc.h>
+#include <vm/physmap.h>
+#include <vm/vm.h>
 
 #include "pmm_arena.h"
 #include "vm_priv.h"
@@ -76,7 +78,8 @@ vm_page_t* paddr_to_vm_page(paddr_t addr) TA_NO_THREAD_SAFETY_ANALYSIS {
 // We disable thread safety analysis here, since this function is only called
 // during early boot before threading exists.
 zx_status_t pmm_add_arena(const pmm_arena_info_t* info) TA_NO_THREAD_SAFETY_ANALYSIS {
-    LTRACEF("arena %p name '%s' base %#" PRIxPTR " size %#zx\n", info, info->name, info->base, info->size);
+    dprintf(INFO, "PMM: add arena '%s' [%#" PRIxPTR ", %#" PRIxPTR "]\n",
+            info->name, info->base, info->base + info->size - 1);
 
     // Make sure we're in early boot (ints disabled and no active CPUs according
     // to the scheduler).
@@ -85,10 +88,19 @@ zx_status_t pmm_add_arena(const pmm_arena_info_t* info) TA_NO_THREAD_SAFETY_ANAL
 
     DEBUG_ASSERT(IS_PAGE_ALIGNED(info->base));
     DEBUG_ASSERT(IS_PAGE_ALIGNED(info->size));
-    DEBUG_ASSERT(info->size > 0);
+    DEBUG_ASSERT((info->base + info->size) > info->base);
 
     // allocate a c++ arena object
-    PmmArena* arena = new (boot_alloc_mem(sizeof(PmmArena))) PmmArena(info);
+    PmmArena* arena = new (boot_alloc_mem(sizeof(PmmArena))) PmmArena();
+
+    // initialize the object
+    auto status = arena->Init(info);
+    if (status != ZX_OK) {
+        // leaks boot allocator memory
+        arena->~PmmArena();
+        printf("PMM: pmm_add_arena failed to initialize arena\n");
+        return status;
+    }
 
     // walk the arena list and add arena based on priority order
     for (auto& a : arena_list) {
@@ -102,9 +114,6 @@ zx_status_t pmm_add_arena(const pmm_arena_info_t* info) TA_NO_THREAD_SAFETY_ANAL
     arena_list.push_back(arena);
 
 done_add:
-    // tell the arena to allocate a page array
-    arena->BootAllocArray();
-
     arena_cumulative_size += info->size;
 
     return ZX_OK;
@@ -204,6 +213,16 @@ size_t pmm_alloc_contiguous(size_t count, uint alloc_flags, uint8_t alignment_lo
     if (alignment_log2 < PAGE_SIZE_SHIFT)
         alignment_log2 = PAGE_SIZE_SHIFT;
 
+    /* if we're called with a single page, just fall through to the regular allocation routine */
+    if (unlikely(count == 1 && alignment_log2 == PAGE_SIZE_SHIFT)) {
+        auto page = pmm_alloc_page(alloc_flags, pa);
+        if (!page)
+            return 0;
+        if (list)
+            list_add_tail(list, &page->free.node);
+        return 1;
+    }
+
     AutoLock al(&arena_lock);
 
     for (auto& a : arena_list) {
@@ -245,7 +264,7 @@ void* pmm_alloc_kpages(size_t count, struct list_node* list, paddr_t* _pa) {
     }
 
     LTRACEF("pa %#" PRIxPTR "\n", pa);
-    void* ptr = paddr_to_kvaddr(pa);
+    void* ptr = paddr_to_physmap(pa);
     DEBUG_ASSERT(ptr);
 
     if (_pa)
@@ -262,7 +281,7 @@ void* pmm_alloc_kpage(paddr_t* _pa, vm_page_t** _p) {
     if (!p)
         return nullptr;
 
-    void* ptr = paddr_to_kvaddr(pa);
+    void* ptr = paddr_to_physmap(pa);
     DEBUG_ASSERT(ptr);
 
     if (_pa)
@@ -365,10 +384,9 @@ void pmm_count_total_states(size_t state_count[_VM_PAGE_STATE_COUNT]) {
     }
 }
 
-extern "C" enum handler_return pmm_dump_timer(struct timer* t, lk_time_t now, void*) TA_REQ(arena_lock) {
-    timer_set(t, now + LK_SEC(1), TIMER_SLACK_CENTER, LK_MSEC(20), &pmm_dump_timer, nullptr);
+static void pmm_dump_timer(timer_t* t, zx_time_t now, void*) TA_REQ(arena_lock) {
+    timer_set(t, now + ZX_SEC(1), TIMER_SLACK_CENTER, ZX_MSEC(20), &pmm_dump_timer, nullptr);
     pmm_dump_free();
-    return INT_NO_RESCHEDULE;
 }
 
 // No lock analysis here, as we want to just go for it in the panic case without the lock.
@@ -420,7 +438,7 @@ static int cmd_pmm(int argc, const cmd_args* argv, uint32_t flags) {
         if (!show_mem) {
             printf("pmm free: issue the same command to stop.\n");
             timer_init(&timer);
-            timer_set(&timer, current_time() + LK_SEC(1), TIMER_SLACK_CENTER, LK_MSEC(20),
+            timer_set(&timer, current_time() + ZX_SEC(1), TIMER_SLACK_CENTER, ZX_MSEC(20),
                       &pmm_dump_timer, nullptr);
             show_mem = true;
         } else {

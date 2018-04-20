@@ -42,8 +42,11 @@ struct ethdev {
 
     uint8_t mac[6];
 
+    uint8_t phy_addr;
     mtx_t send_lock;
 };
+
+#define ETH_MTU 1500
 
 #define ETH_RXBUF_SIZE  2048
 #define ETH_RXBUF_COUNT 32
@@ -67,8 +70,19 @@ void eth_dump_regs(ethdev_t* eth);
 
 status_t eth_rx(ethdev_t* eth, void** data, size_t* len);
 void eth_rx_ack(ethdev_t* eth);
+void eth_enable_rx(ethdev_t* eth);
+void eth_disable_rx(ethdev_t* eth);
 
 status_t eth_tx(ethdev_t* eth, const void* data, size_t len);
+size_t eth_tx_queued(ethdev_t* eth);
+void eth_enable_tx(ethdev_t* eth);
+void eth_disable_tx(ethdev_t* eth);
+
+void eth_start_promisc(ethdev_t* eth);
+void eth_stop_promisc(ethdev_t* eth);
+
+zx_status_t eth_enable_phy(ethdev_t* eth);
+zx_status_t eth_disable_phy(ethdev_t* eth);
 
 bool eth_status_online(ethdev_t* eth);
 

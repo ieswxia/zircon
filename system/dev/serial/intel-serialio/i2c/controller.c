@@ -102,27 +102,20 @@ static zx_status_t intel_serialio_i2c_add_slave(
     // Temporarily add binding support for the i2c slave. The real way to do
     // this will involve ACPI/devicetree enumeration, but for now we publish PCI
     // VID/DID and i2c ADDR as binding properties.
-
-    // Retrieve pci_config (again)
     pci_protocol_t pci;
     status = device_get_protocol(device->pcidev, ZX_PROTOCOL_PCI, &pci);
     if (status != ZX_OK) {
-        goto fail2;
+        goto fail;
     }
 
-    const pci_config_t* pci_config;
-    size_t config_size;
-    zx_handle_t config_handle;
-    status = pci_map_resource(&pci, PCI_RESOURCE_CONFIG, ZX_CACHE_POLICY_UNCACHED_DEVICE,
-                              (void**)&pci_config, &config_size, &config_handle);
-    if (status != ZX_OK) {
-        xprintf("i2c: failed to map pci config: %d\n", status);
-        goto fail2;
-    }
-
+    uint16_t vendor_id;
+    uint16_t device_id;
     int count = 0;
-    slave->props[count++] = (zx_device_prop_t){BIND_PCI_VID, 0, pci_config->vendor_id};
-    slave->props[count++] = (zx_device_prop_t){BIND_PCI_DID, 0, pci_config->device_id};
+
+    pci_config_read16(&pci, PCI_CONFIG_VENDOR_ID, &vendor_id);
+    pci_config_read16(&pci, PCI_CONFIG_DEVICE_ID, &device_id);
+    slave->props[count++] = (zx_device_prop_t){BIND_PCI_VID, 0, vendor_id};
+    slave->props[count++] = (zx_device_prop_t){BIND_PCI_DID, 0, device_id};
     slave->props[count++] = (zx_device_prop_t){BIND_I2C_ADDR, 0, address};
 
     char name[sizeof(address) * 2 + 2] = {
@@ -141,14 +134,12 @@ static zx_status_t intel_serialio_i2c_add_slave(
 
     status = device_add(device->zxdev, &args, &slave->zxdev);
     if (status != ZX_OK) {
-        goto fail1;
+        goto fail;
     }
 
     return ZX_OK;
 
-fail1:
-    zx_handle_close(config_handle);
-fail2:
+fail:
     mtx_lock(&device->mutex);
     list_delete(&slave->slave_list_node);
     mtx_unlock(&device->mutex);
@@ -227,12 +218,16 @@ static uint32_t intel_serialio_compute_scl_lcnt(
     return low_count / 1000000 - 1;
 }
 
-static zx_status_t intel_serialio_configure_bus_timing(
+static zx_status_t intel_serialio_compute_bus_timing(
     intel_serialio_i2c_device_t* device) {
 
     uint32_t clock_frequency = device->controller_freq;
 
     // These constants are from the i2c timing requirements
+    uint32_t fmp_hcnt = intel_serialio_compute_scl_hcnt(
+        clock_frequency, 260, 120);
+    uint32_t fmp_lcnt = intel_serialio_compute_scl_lcnt(
+        clock_frequency, 500, 120);
     uint32_t fs_hcnt = intel_serialio_compute_scl_hcnt(
         clock_frequency, 600, 300);
     uint32_t fs_lcnt = intel_serialio_compute_scl_lcnt(
@@ -243,6 +238,10 @@ static zx_status_t intel_serialio_configure_bus_timing(
         clock_frequency, 4700, 300);
 
     // Make sure the counts are within bounds.
+    if (fmp_hcnt >= (1 << 16) || fmp_hcnt < 6 ||
+        fmp_lcnt >= (1 << 16) || fmp_lcnt < 8) {
+        return ZX_ERR_OUT_OF_RANGE;
+    }
     if (fs_hcnt >= (1 << 16) || fs_hcnt < 6 ||
         fs_lcnt >= (1 << 16) || fs_lcnt < 8) {
         return ZX_ERR_OUT_OF_RANGE;
@@ -252,30 +251,34 @@ static zx_status_t intel_serialio_configure_bus_timing(
         return ZX_ERR_OUT_OF_RANGE;
     }
 
-    RMWREG32(&device->regs->fs_scl_hcnt, 0, 16, fs_hcnt);
-    RMWREG32(&device->regs->fs_scl_lcnt, 0, 16, fs_lcnt);
-    RMWREG32(&device->regs->ss_scl_hcnt, 0, 16, ss_hcnt);
-    RMWREG32(&device->regs->ss_scl_lcnt, 0, 16, ss_lcnt);
+    device->fmp_scl_hcnt = fmp_hcnt;
+    device->fmp_scl_lcnt = fmp_lcnt;
+    device->fs_scl_hcnt = fs_hcnt;
+    device->fs_scl_lcnt = fs_lcnt;
+    device->ss_scl_hcnt = ss_hcnt;
+    device->ss_scl_lcnt = ss_lcnt;
+    device->sda_hold = 1;
     return ZX_OK;
 }
 
 static zx_status_t intel_serialio_i2c_set_bus_frequency(intel_serialio_i2c_device_t* device,
                                                         uint32_t frequency) {
     if (frequency != I2C_MAX_FAST_SPEED_HZ &&
-        frequency != I2C_MAX_STANDARD_SPEED_HZ) {
+        frequency != I2C_MAX_STANDARD_SPEED_HZ &&
+        frequency != I2C_MAX_FAST_PLUS_SPEED_HZ) {
         return ZX_ERR_INVALID_ARGS;
     }
 
     mtx_lock(&device->mutex);
     device->bus_freq = frequency;
 
-    unsigned int speed = CTL_SPEED_STANDARD;
-    if (device->bus_freq == I2C_MAX_FAST_SPEED_HZ) {
-        speed = CTL_SPEED_FAST;
+    zx_status_t status = intel_serialio_i2c_reset_controller(device);
+    if (status != ZX_OK) {
+        mtx_unlock(&device->mutex);
+        return status;
     }
-    RMWREG32(&device->regs->ctl, CTL_SPEED, 2, speed);
-    mtx_unlock(&device->mutex);
 
+    mtx_unlock(&device->mutex);
     return ZX_OK;
 }
 
@@ -305,7 +308,7 @@ static zx_status_t intel_serialio_i2c_ioctl(
         if (in_len < sizeof(*args)) {
             return ZX_ERR_INVALID_ARGS;
         }
-        intel_serialio_i2c_set_bus_frequency(device, args->frequency);
+        return intel_serialio_i2c_set_bus_frequency(device, args->frequency);
     }
     default:
         return ZX_ERR_INVALID_ARGS;
@@ -316,7 +319,8 @@ static int intel_serialio_i2c_irq_thread(void* arg) {
     intel_serialio_i2c_device_t* dev = (intel_serialio_i2c_device_t*)arg;
     zx_status_t status;
     for (;;) {
-        status = zx_interrupt_wait(dev->irq_handle);
+        uint64_t slots;
+        status = zx_interrupt_wait(dev->irq_handle, &slots);
         if (status != ZX_OK) {
             xprintf("i2c: error waiting for interrupt: %d\n", status);
             continue;
@@ -328,13 +332,13 @@ static int intel_serialio_i2c_irq_thread(void* arg) {
             // If we hit an underflow, it's a bug.
             zx_object_signal(dev->event_handle, 0, ERROR_DETECTED_SIGNAL);
             *REG32(&dev->regs->clr_rx_under);
-            dprintf(ERROR, "i2c: rx underflow detected!\n");
+            zxlogf(ERROR, "i2c: rx underflow detected!\n");
         }
         if (intr_stat & (1u << INTR_RX_OVER)) {
             // If we hit an overflow, it's a bug.
             zx_object_signal(dev->event_handle, 0, ERROR_DETECTED_SIGNAL);
             *REG32(&dev->regs->clr_rx_over);
-            dprintf(ERROR, "i2c: rx overflow detected!\n");
+            zxlogf(ERROR, "i2c: rx overflow detected!\n");
         }
         if (intr_stat & (1u << INTR_RX_FULL)) {
             mtx_lock(&dev->irq_mask_mutex);
@@ -346,7 +350,7 @@ static int intel_serialio_i2c_irq_thread(void* arg) {
             // If we hit an overflow, it's a bug.
             zx_object_signal(dev->event_handle, 0, ERROR_DETECTED_SIGNAL);
             *REG32(&dev->regs->clr_tx_over);
-            dprintf(ERROR, "i2c: tx overflow detected!\n");
+            zxlogf(ERROR, "i2c: tx overflow detected!\n");
         }
         if (intr_stat & (1u << INTR_TX_EMPTY)) {
             mtx_lock(&dev->irq_mask_mutex);
@@ -355,6 +359,7 @@ static int intel_serialio_i2c_irq_thread(void* arg) {
             mtx_unlock(&dev->irq_mask_mutex);
         }
         if (intr_stat & (1u << INTR_TX_ABORT)) {
+            zxlogf(ERROR, "i2c: tx abort detected: 0x%08x\n", *REG32(&dev->regs->tx_abrt_source));
             zx_object_signal(dev->event_handle, 0, ERROR_DETECTED_SIGNAL);
             *REG32(&dev->regs->clr_tx_abort);
         }
@@ -363,7 +368,7 @@ static int intel_serialio_i2c_irq_thread(void* arg) {
             mtx_lock(&dev->irq_mask_mutex);
             RMWREG32(&dev->regs->intr_mask, INTR_ACTIVITY, 1, 0);
             mtx_unlock(&dev->irq_mask_mutex);
-            dprintf(INFO, "i2c: spurious activity irq\n");
+            zxlogf(INFO, "i2c: spurious activity irq\n");
         }
         if (intr_stat & (1u << INTR_STOP_DETECTION)) {
             zx_object_signal(dev->event_handle, 0, STOP_DETECTED_SIGNAL);
@@ -377,10 +382,8 @@ static int intel_serialio_i2c_irq_thread(void* arg) {
             mtx_lock(&dev->irq_mask_mutex);
             RMWREG32(&dev->regs->intr_mask, INTR_GENERAL_CALL, 1, 0);
             mtx_unlock(&dev->irq_mask_mutex);
-            dprintf(INFO, "i2c: spurious general call irq\n");
+            zxlogf(INFO, "i2c: spurious general call irq\n");
         }
-
-        zx_interrupt_complete(dev->irq_handle);
     }
     return 0;
 }
@@ -595,12 +598,21 @@ zx_status_t intel_serialio_i2c_reset_controller(
     RMWREG32(&device->regs->i2c_en, I2C_EN_ENABLE, 1, 0);
 
     // Reconfigure the bus timing
-    status = intel_serialio_configure_bus_timing(device);
-    if (status < 0)
-        return status;
+    if (device->bus_freq == I2C_MAX_FAST_PLUS_SPEED_HZ) {
+        RMWREG32(&device->regs->fs_scl_hcnt, 0, 16, device->fmp_scl_hcnt);
+        RMWREG32(&device->regs->fs_scl_lcnt, 0, 16, device->fmp_scl_lcnt);
+    } else {
+        RMWREG32(&device->regs->fs_scl_hcnt, 0, 16, device->fs_scl_hcnt);
+        RMWREG32(&device->regs->fs_scl_lcnt, 0, 16, device->fs_scl_lcnt);
+    }
+    RMWREG32(&device->regs->ss_scl_hcnt, 0, 16, device->ss_scl_hcnt);
+    RMWREG32(&device->regs->ss_scl_lcnt, 0, 16, device->ss_scl_lcnt);
+    RMWREG32(&device->regs->sda_hold, 0, 16, device->sda_hold);
 
     unsigned int speed = CTL_SPEED_STANDARD;
-    if (device->bus_freq == I2C_MAX_FAST_SPEED_HZ) {
+    if (device->bus_freq == I2C_MAX_FAST_SPEED_HZ ||
+        device->bus_freq == I2C_MAX_FAST_PLUS_SPEED_HZ) {
+
         speed = CTL_SPEED_FAST;
     }
 
@@ -646,7 +658,7 @@ cleanup:
 
 static zx_status_t intel_serialio_i2c_device_specific_init(
     intel_serialio_i2c_device_t* device,
-    const pci_config_t* pci_config) {
+    uint16_t device_id) {
 
     static const struct {
         uint16_t device_ids[16];
@@ -674,8 +686,6 @@ static zx_status_t intel_serialio_i2c_device_specific_init(
         },
     };
 
-    uint16_t device_id = pci_config->device_id;
-
     for (unsigned int i = 0; i < countof(dev_props); ++i) {
         const unsigned int num_dev_ids = countof(dev_props[0].device_ids);
         for (unsigned int dev_idx = 0; dev_idx < num_dev_ids; ++dev_idx) {
@@ -696,6 +706,44 @@ static zx_status_t intel_serialio_i2c_device_specific_init(
     return ZX_ERR_NOT_SUPPORTED;
 }
 
+static void intel_serialio_add_devices(intel_serialio_i2c_device_t* parent,
+                                       pci_protocol_t* pci) {
+    // get child info from aux data, max 4
+    // TODO: this seems nonstandard to device model
+    uint8_t childdata[sizeof(auxdata_i2c_device_t) * 4];
+    memset(childdata, 0, sizeof(childdata));
+
+    uint32_t actual;
+    zx_status_t status = pci_get_auxdata(pci, "i2c-child", childdata, sizeof(childdata),
+                             &actual);
+    if (status != ZX_OK) {
+        return;
+    }
+
+    auxdata_i2c_device_t* child = (auxdata_i2c_device_t*)childdata;
+    uint32_t count = actual / sizeof(auxdata_i2c_device_t);
+    uint32_t bus_speed = 0;
+    while (count--) {
+        zxlogf(SPEW, "i2c: got child bus_master=%d ten_bit=%d address=0x%x bus_speed=%u"
+                     " protocol_id=0x%08x\n",
+               child->bus_master, child->ten_bit, child->address, child->bus_speed,
+               child->protocol_id);
+
+        if (bus_speed && bus_speed != child->bus_speed) {
+            zxlogf(ERROR, "i2c: cannot add devices with different bus speeds (%u, %u)\n",
+                    bus_speed, child->bus_speed);
+        }
+        if (!bus_speed) {
+            intel_serialio_i2c_set_bus_frequency(parent, child->bus_speed);
+            bus_speed = child->bus_speed;
+        }
+        intel_serialio_i2c_add_slave(parent,
+                child->ten_bit ? I2C_10BIT_ADDRESS : I2C_7BIT_ADDRESS,
+                child->address);
+        child += 1;
+    }
+}
+
 zx_status_t intel_serialio_bind_i2c(zx_device_t* dev) {
     pci_protocol_t pci;
     if (device_get_protocol(dev, ZX_PROTOCOL_PCI, &pci))
@@ -710,20 +758,13 @@ zx_status_t intel_serialio_bind_i2c(zx_device_t* dev) {
     mtx_init(&device->irq_mask_mutex, mtx_plain);
     device->pcidev = dev;
 
-    const pci_config_t* pci_config;
-    size_t config_size;
-    zx_handle_t config_handle;
-    zx_status_t status = pci_map_resource(&pci, PCI_RESOURCE_CONFIG,
-                                          ZX_CACHE_POLICY_UNCACHED_DEVICE,
-                                          (void**)&pci_config, &config_size,
-                                          &config_handle);
-    if (status != ZX_OK) {
-        xprintf("i2c: failed to map pci config: %d\n", status);
-        goto fail;
-    }
+    uint16_t vendor_id;
+    uint16_t device_id;
+    pci_config_read16(&pci, PCI_CONFIG_VENDOR_ID, &vendor_id);
+    pci_config_read16(&pci, PCI_CONFIG_DEVICE_ID, &device_id);
 
-    status = pci_map_resource(&pci, PCI_RESOURCE_BAR_0, ZX_CACHE_POLICY_UNCACHED_DEVICE,
-                              (void**)&device->regs, &device->regs_size, &device->regs_handle);
+    zx_status_t status = pci_map_bar(&pci, 0u, ZX_CACHE_POLICY_UNCACHED_DEVICE,
+                                   (void**)&device->regs, &device->regs_size, &device->regs_handle);
     if (status != ZX_OK) {
         xprintf("i2c: failed to mape pci bar 0: %d\n", status);
         goto fail;
@@ -759,9 +800,34 @@ zx_status_t intel_serialio_bind_i2c(zx_device_t* dev) {
     // Run the bus at standard speed by default.
     device->bus_freq = I2C_MAX_STANDARD_SPEED_HZ;
 
-    status = intel_serialio_i2c_device_specific_init(device, pci_config);
+    status = intel_serialio_i2c_device_specific_init(device, device_id);
+    if (status != ZX_OK)
+        goto fail;
+
+    status = intel_serialio_compute_bus_timing(device);
     if (status < 0)
         goto fail;
+
+    // Temporary hack until we have routed through the FMCN ACPI tables.
+    if (vendor_id == INTEL_VID &&
+        device_id == INTEL_SUNRISE_POINT_SERIALIO_I2C0_DID) {
+        // TODO: These should all be extracted from FPCN in the ACPI tables.
+        device->fmp_scl_lcnt = 0x0042;
+        device->fmp_scl_hcnt = 0x001b;
+        device->sda_hold = 0x24;
+    } else if (vendor_id == INTEL_VID &&
+        device_id == INTEL_SUNRISE_POINT_SERIALIO_I2C1_DID) {
+        // TODO(yky): These should all be extracted from FMCN in the ACPI tables.
+        device->fs_scl_lcnt = 0x00b6;
+        device->fs_scl_hcnt = 0x0059;
+        device->sda_hold = 0x24;
+    } else if (vendor_id == INTEL_VID &&
+               device_id == INTEL_SUNRISE_POINT_SERIALIO_I2C2_DID) {
+        // TODO: These should all be extracted from FMCN in the ACPI tables.
+        device->fs_scl_lcnt = 0x00ba;
+        device->fs_scl_hcnt = 0x005d;
+        device->sda_hold = 0x24;
+    }
 
     // Configure the I2C controller. We don't need to hold the lock because
     // nobody else can see this controller yet.
@@ -770,7 +836,7 @@ zx_status_t intel_serialio_bind_i2c(zx_device_t* dev) {
         goto fail;
 
     char name[ZX_DEVICE_NAME_MAX];
-    snprintf(name, sizeof(name), "i2c-bus-%04x", pci_config->device_id);
+    snprintf(name, sizeof(name), "i2c-bus-%04x", device_id);
 
    device_add_args_t args = {
         .version = DEVICE_ADD_ARGS_VERSION,
@@ -789,28 +855,7 @@ zx_status_t intel_serialio_bind_i2c(zx_device_t* dev) {
         "reg=%p regsize=%ld\n",
         device->regs, device->regs_size);
 
-    // Temporarily setup the controller for the Acer12 touch panel. This will
-    // eventually be done by enumerating the device via ACPI, but for now we
-    // hardcode it.
-    if (pci_config->vendor_id == INTEL_VID &&
-        pci_config->device_id == ACER_I2C_TOUCH) {
-        intel_serialio_i2c_set_bus_frequency(device, 400000);
-        intel_serialio_i2c_add_slave(device, I2C_7BIT_ADDRESS, 0x0010);
-    }
-
-    // more temporary hacks
-    if (pci_config->vendor_id == INTEL_VID &&
-        pci_config->device_id == INTEL_SUNRISE_POINT_SERIALIO_I2C0_DID) {
-        intel_serialio_i2c_set_bus_frequency(device, 1000000);
-        intel_serialio_i2c_add_slave(device, I2C_7BIT_ADDRESS, 0x000A);
-    }
-    if (pci_config->vendor_id == INTEL_VID &&
-        pci_config->device_id == INTEL_SUNRISE_POINT_SERIALIO_I2C2_DID) {
-        intel_serialio_i2c_set_bus_frequency(device, 400000);
-        intel_serialio_i2c_add_slave(device, I2C_7BIT_ADDRESS, 0x0049);
-    }
-
-    zx_handle_close(config_handle);
+    intel_serialio_add_devices(device, &pci);
     return ZX_OK;
 
 fail:
@@ -821,8 +866,6 @@ fail:
         zx_handle_close(device->irq_handle);
     if (device->event_handle != ZX_HANDLE_INVALID)
         zx_handle_close(device->event_handle);
-    if (config_handle)
-        zx_handle_close(config_handle);
     free(device);
 
     return status;

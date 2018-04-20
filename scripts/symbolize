@@ -13,14 +13,14 @@ function names and, if available, source code locations (filenames and
 line numbers from debug info).
 
 Example usage #1:
-  ./scripts/run-zircon -a x86-64 | ./scripts/symbolize devmgr.elf --build-dir=build-zircon-pc-x86-64
+  ./scripts/run-zircon -a x64 | ./scripts/symbolize devmgr.elf --build-dir=build-x64
 
 Example usage #2:
-  ./scripts/symbolize devmgr.elf --build-dir=build-zircon-pc-x86-64
+  ./scripts/symbolize devmgr.elf --build-dir=build-x64
   <copy and paste output from Zircon>
 
 Example usage #3 (for zircon kernel output):
-  ./scripts/symbolize --build-dir=build-zircon-pc-x86-64
+  ./scripts/symbolize --build-dir=build-x64
   <copy and paste output from Zircon>
 
 
@@ -38,6 +38,7 @@ PREBUILTS_BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(SCRIPT_DIR), "
                                                   "downloads"))
 GCC_VERSION = '6.3.0'
 name_to_full_path = {}
+debug_mode = False
 
 
 def find_func(find_args, dirname, names):
@@ -90,6 +91,10 @@ def find_dso_full_path_uncached(dso, exe_name, name_to_buildid, build_dirs):
         found_path = buildid_to_full_path(name_to_buildid[dso], build_dirs)
         if found_path:
             return found_path
+        # This can be a bug in the generation of the ids.txt file, report it.
+        # It's not necessarily a bug though, so for now only report in debug mode.
+        if debug_mode:
+            print "WARNING: Unable to find %s in any ids.txt file." % dso
 
     # The name 'app' indicates the real app name is unknown.
     # If the process has a name property that will be printed, but
@@ -142,18 +147,37 @@ def tool_path(arch, tool):
         platform = "Darwin"
     else:
         raise Exception("Unsupported platform!")
-    return ("%s/%s-elf-%s-%s-x86_64/bin/%s-elf-%s" %
-            (PREBUILTS_BASE_DIR, arch, GCC_VERSION, platform, arch, tool))
+    return ("%s/gcc/bin/%s-elf-%s" %
+            (PREBUILTS_BASE_DIR, arch, tool))
 
 
 def run_tool(arch, tool, *args):
     cmd = [tool_path(arch, tool)] + list(args)
+    if debug_mode:
+        print "Running: %s" % " ".join(cmd)
     try:
         output = subprocess.check_output(cmd)
     except Exception as e:
         print "Calling %s failed: command %s error %s" % (tool, cmd, e)
         return False
     return output
+
+
+# Note: addr2line requires hex addresses.
+# |addr_as_hex_string| must already be PIE-adjusted.
+def run_addr2line(arch, elf_path, addr_as_hex_string):
+    return run_tool(arch, "addr2line", "-Cipfe", elf_path, addr_as_hex_string)
+
+
+def get_call_location(arch, elf_path, addr_as_hex_string):
+    # Subtract 1 to convert from a return address to a call site
+    # address.  (To be more exact, this converts to an address that
+    # is within the call site instruction.)  This adjustment gives
+    # more correct results in the presence of inlining and
+    # 'noreturn' functions.  (See ZX-842.)
+    call_addr = "0x%x" % (int(addr_as_hex_string, 16) - 1)
+    return run_addr2line(arch, elf_path, call_addr)
+
 
 # On BSD platforms there are cases where writing to stdout can return EAGAIN.
 # In that event, retry the line again. This only manifests itself when piping
@@ -181,7 +205,9 @@ def main():
                         default=sys.stdin,
                         help="File to read from, stdin by default")
     parser.add_argument("--build-dir", "-b", nargs="*",
-                        help="List of additional build directories to search")
+                        help="List of build directories to search instead of"
+                             " the default Fuchsia build directory"
+                             " (out/<variant>-<arch>)")
     parser.add_argument("--disassemble", "-d", action="store_true",
                         help="Show disassembly of each function")
     parser.add_argument("--stack_size", "-s", type=int,
@@ -191,46 +217,63 @@ def main():
                         help="Echo lines of input (on by default)")
     parser.add_argument("--no-echo", dest="echo", action="store_false",
                         help="Don't echo lines of input")
+    parser.add_argument("--debug", "-D", action="store_true",
+                        help="Print messages for debugging symbolize")
     parser.add_argument("app", nargs="?", help="Name of primary application")
     parser.set_defaults(echo=True)
     args = parser.parse_args()
+    global debug_mode
+    debug_mode = args.debug
 
     zircon_build_dir = os.path.join(
-        os.path.dirname(SCRIPT_DIR), "build-zircon-pc-x86-64")
+        os.path.dirname(SCRIPT_DIR), "build-x64")
     if not os.path.exists(zircon_build_dir):
         zircon_build_dir = os.path.join(
-            os.path.dirname(SCRIPT_DIR), os.pardir, "out", "build-zircon", "build-zircon-pc-x86-64")
+            os.path.dirname(SCRIPT_DIR), os.pardir, "out", "build-zircon", "build-x64")
     build_dirs = [zircon_build_dir]
     if args.build_dir:
         build_dirs = args.build_dir + build_dirs
     else:
+        # Put the unstripped path ahead of the stripped one, we want the
+        # former searched first. This does mean the unstripped directory
+        # will get searched twice, but relative to the entire search time,
+        # the addition is small.
+        # Plus once a file is found its location is cached.
+        # Plus this is only used as a fallback in case the file isn't found
+        # in ids.txt.
         fuchsia_build_dir = os.path.abspath(os.path.join(
-            os.path.dirname(SCRIPT_DIR), os.pardir, "out", "debug-x86-64"))
-        build_dirs.insert(0, fuchsia_build_dir)
+            os.path.dirname(SCRIPT_DIR), os.pardir, "out", "debug-x64"))
+        fuchsia_unstripped_dir = os.path.join(fuchsia_build_dir,
+            "exe.unstripped")
+        build_dirs = [fuchsia_unstripped_dir, fuchsia_build_dir] + build_dirs
 
     # Parsing vars
     arch = "x86_64"
+    bias = 0
     name_to_buildid = {}
+    bias_to_name = {}
     processed_lines = []
     prev_sp = None
     prev_frame_num = None
     frame_sizes = []
     total_stack_size = 0
+    # If True and we see a dso line, start over collecting the list.
+    done_dso_list = True
 
     # Regex for parsing
     # Either nothing, or something like "[00007.268] 00304.00325> "
-    full_prefix = "^(|\[\d+\.\d+\] \d+\.\d+> )"
+    full_prefix = "^(|\[\d+\.\d+\] \d+\.\d+> ?)"
     btre = re.compile(full_prefix + "bt#(\d+):")
     bt_with_offset_re = re.compile(full_prefix +
         "bt#(\d+): pc 0x[0-9a-f]+ sp (0x[0-9a-f]+) \(([^,]+),(0x[0-9a-f]+)\)$")
     bt_end_re = re.compile(full_prefix + "bt#(\d+): end")
     arch_re = re.compile(full_prefix + "arch: ([\\S]+)$")
     build_id_re = re.compile(full_prefix +
-        "dso: id=([0-9a-z]+) base=(0x[0-9a-f]+) name=(.+)$")
+        "(?:dlsvc: debug: )?dso: id=([0-9a-z]+) base=(0x[0-9a-f]+) name=(.+)$")
     disasm_re = re.compile("^ *(0x[0-9a-f]+)( .+)$")
 
     # Zircon backtraces
-    zircon_crash_re = re.compile("^ZIRCON KERNEL PANIC$")
+    zircon_crash_re = re.compile(full_prefix + "ZIRCON KERNEL PANIC$")
     # TODO(cja): Add ARM to the regex
     zircon_pc_re = re.compile("RIP: (0x[0-9a-z]+)")
     zircon_bt_re = re.compile(full_prefix +
@@ -238,6 +281,11 @@ def main():
     zircon_elf_path = ''
     zircon_bt = False
     zircon_pc = ''
+
+    # ASAN backtraces
+    asan_bt_re = re.compile(full_prefix + "\{\{\{bt:(\d+):(0x[0-9a-f]+)\}\}\}")
+    asan_bt_end_re = re.compile(full_prefix + "$")
+    asan_bt = False
 
     while True:
         line = args.file.readline()
@@ -247,7 +295,9 @@ def main():
         # Strip any trailing carriage return character ("\r"), since
         # these appear in the serial console output from QEMU.
         line = line.rstrip()
-        if bt_end_re.match(line):
+        bt_end = bt_end_re.match(line)
+        asan_bt_end = asan_bt and asan_bt_end_re.match(line)
+        if bt_end or asan_bt_end or end_of_file:
             if len(processed_lines) != 0:
                 writeline("\nstart of symbolized stack:\n")
                 writelines(processed_lines)
@@ -265,23 +315,34 @@ def main():
                 # when warning about stackoverflow
                 processed_lines = []
                 frames_sizes = []
-                name_to_buildid = {}
                 total_stack_size = 0
                 prev_sp = None
                 zircon_bt = False
+                asan_bt = False
             if end_of_file:
                 break
+            else:
+                continue
+
         m = arch_re.match(line)
         if m:
             arch = m.group(2)
             continue
         m = build_id_re.match(line)
         if m:
+            if done_dso_list:
+                name_to_buildid = {}
+                bias_to_name = {}
+                done_dso_list = False
             buildid = m.group(2)
             bias = int(m.group(3), 16)
             name = m.group(4)
             name_to_buildid[name] = buildid
+            bias_to_name[bias] = name
             continue
+        # We didn't see a dso line, so we're done with this list.
+        # The next time we see one means we're starting a new list.
+        done_dso_list = True
         m = btre.match(line)
         if m and not zircon_bt:
             frame_num = m.group(2)
@@ -300,11 +361,10 @@ def main():
                 dso_full_path = find_dso_full_path(
                     dso, args.app, name_to_buildid, build_dirs)
                 if dso_full_path:
-                    addr2line_output = run_tool(arch, "addr2line", "-Cipfe",
-                                                dso_full_path, off)
-                    if addr2line_output:
+                    call_loc = get_call_location(arch, dso_full_path, off)
+                    if call_loc:
                         processed_lines.append(
-                            "#%s: %s" % (frame_num, addr2line_output))
+                            "#%s: %s" % (frame_num, call_loc))
                     if args.disassemble:
                         pc = int(off, 16)
                         disassembly = run_tool(
@@ -323,9 +383,12 @@ def main():
                                         line = "%s%#.16x%s" % (prefix, bias + addr, rest)
                                     processed_lines.append(line + "\n")
                     continue
-
-            # fallthru print if we don't recognize the format of the backtrace entry
-            processed_lines.append("#%s: (unknown)\n" % (frame_num,))
+                else:
+                    # can't find dso_full_path
+                    processed_lines.append("#%s: unknown, can't find full path for %s\n" % (frame_num, dso))
+            else:
+                # bt_with_offset_re failed
+                processed_lines.append("#%s: unknown, can't find pc, sp or app/library in line\n" % (frame_num,))
 
         # Zircon Specific Handling
         if zircon_crash_re.search(line):
@@ -335,9 +398,13 @@ def main():
             else:
                 sys.stderr.write("Symbolize could not find the zircon elf binary. Perhaps you need to build "
                                   "zircon or specify the build directory with -b?\n")
+            continue
+
         m = zircon_pc_re.search(line)
         if m:
             zircon_pc = m.group(1)
+            continue
+
         m = zircon_bt_re.match(line)
         if m and zircon_bt:
             frame_num = m.group(2)
@@ -345,31 +412,47 @@ def main():
             # If we saw the instruction pointer for the fault/panic then use it once
             if zircon_pc:
                 prefix = "   pc: %s => " % zircon_pc
-                a2l_out = run_tool(arch, "addr2line", "-Cpife", zircon_elf_path,
-                        zircon_pc)
+                a2l_out = run_addr2line(arch, zircon_elf_path, zircon_pc)
                 processed_lines.append(prefix +
                         a2l_out.replace("(inlined", (" " * len(prefix)) + "(inlined"))
                 zircon_pc = None
 
-
             prefix = "bt#%s: %s => " % (frame_num, addr)
-            # Subtract 1 to convert from a return address to a call site
-            # address.  (To be more exact, this converts to an address that
-            # is within the call site instruction.)  This adjustment gives
-            # more correct results in the presence of inlining and
-            # 'noreturn' functions.  (See ZX-842.)
-            call_addr = "0x%x" % (int(addr, 16) - 1)
-            a2l_out = run_tool(arch, "addr2line", "-Cpife", zircon_elf_path,
-                               call_addr)
+            call_loc = get_call_location(arch, zircon_elf_path, addr)
             # In the case of inlined methods, it is more readable if the
             # inlined lines are aligned to be to the right of "=>".
             processed_lines.append(prefix +
-                    a2l_out.replace("(inlined", (" " * len(prefix)) + "(inlined"))
+                    call_loc.replace("(inlined", (" " * len(prefix)) + "(inlined"))
             continue
 
-        # Exit if we've reached the end of stdin
-        if end_of_file:
-            break
+        # ASAN Specific Handling
+        m = asan_bt_re.match(line)
+        if m and not zircon_bt:
+            asan_bt = True
+            frame_num = m.group(2)
+            addr = int(m.group(3), 16)
+            offset = None
+            dso = None
+            for bias, candidate_dso in bias_to_name.items():
+                if addr >= bias:
+                    candidate_offset = addr - bias
+                    if offset is None or candidate_offset < offset:
+                        offset = candidate_offset
+                        dso = candidate_dso
+            if offset is None:
+                processed_lines.append("#%s: unknown, can't find DSO for addr 0x%x\n" % (frame_num, addr))
+                continue
+            dso_full_path = find_dso_full_path(dso, args.app, name_to_buildid, build_dirs)
+            if not dso_full_path:
+                processed_lines.append("#%s: unknown, can't find full path for %s\n" % (frame_num, dso))
+                continue
+
+            prefix = "bt#%s: 0x%x => " % (frame_num, addr)
+            call_loc = run_addr2line(arch, dso_full_path, "0x%x" % offset)
+            # In the case of inlined methods, it is more readable if the
+            # inlined lines are aligned to be to the right of "=>".
+            processed_lines.append(prefix +
+                    call_loc.replace("(inlined", (" " * len(prefix)) + "(inlined"))
 
 if __name__ == '__main__':
     sys.exit(main())

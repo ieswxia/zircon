@@ -198,12 +198,11 @@ zx_status_t decompress_bootdata(zx_handle_t vmar, zx_handle_t vmo,
 
     const bootdata_t* hdr = (bootdata_t*)bootdata_addr;
     bootdata_addr += sizeof(bootdata_t);
-    if (hdr->flags & BOOTDATA_FLAG_EXTRA)
-        bootdata_addr += sizeof(bootextra_t);
 
     switch (hdr->type) {
     case BOOTDATA_BOOTFS_BOOT:
     case BOOTDATA_BOOTFS_SYSTEM:
+    case BOOTDATA_RAMDISK:
         if (hdr->flags & BOOTDATA_BOOTFS_FLAG_COMPRESSED) {
             status = decompress_bootfs_vmo(vmar, (const uint8_t*)bootdata_addr, hdr->extra, out, err);
         }

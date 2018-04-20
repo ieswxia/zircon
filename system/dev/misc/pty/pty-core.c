@@ -7,12 +7,12 @@
 #include <threads.h>
 
 #include <ddk/device.h>
+#include <ddk/driver.h>
 #include "pty-core.h"
 #include "pty-fifo.h"
 
 #include <zircon/errors.h>
 #include <zircon/device/pty.h>
-#include <zircon/device/console.h>
 
 #if 0
 #define xprintf(fmt...) printf(fmt)
@@ -150,18 +150,6 @@ static zx_status_t pty_client_ioctl(void* ctx, uint32_t op,
         mtx_lock(&ps->lock);
         pc->flags = (pc->flags & (~cs->clr)) | cs->set;
         mtx_unlock(&ps->lock);
-        return ZX_OK;
-    }
-    case IOCTL_CONSOLE_GET_DIMENSIONS: {
-        ioctl_console_dimensions_t* dims = out_buf;
-        if (out_len != sizeof(ioctl_console_dimensions_t)) {
-            return ZX_ERR_INVALID_ARGS;
-        }
-        mtx_lock(&ps->lock);
-        dims->width = ps->width;
-        dims->height = ps->height;
-        mtx_unlock(&ps->lock);
-        *out_actual = sizeof(pty_window_size_t);
         return ZX_OK;
     }
     case IOCTL_PTY_GET_WINDOW_SIZE: {

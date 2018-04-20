@@ -13,19 +13,19 @@
 
 #include <ddk/io-buffer.h>
 #include <ddk/protocol/ethernet.h>
+#include <fbl/macros.h>
+#include <fbl/unique_ptr.h>
+#include <virtio/net.h>
 #include <zircon/compiler.h>
 #include <zircon/device/ethernet.h>
 #include <zircon/thread_annotations.h>
 #include <zircon/types.h>
-#include <fbl/macros.h>
-#include <fbl/unique_ptr.h>
-#include <virtio/net.h>
 
 namespace virtio {
 
 class EthernetDevice : public Device {
 public:
-    explicit EthernetDevice(zx_device_t* device);
+    explicit EthernetDevice(zx_device_t* device, zx::bti, fbl::unique_ptr<Backend> backend);
     virtual ~EthernetDevice();
 
     zx_status_t Init() override TA_EXCL(state_lock_);
@@ -39,7 +39,9 @@ public:
     zx_status_t Query(uint32_t options, ethmac_info_t* info) TA_EXCL(state_lock_);
     void Stop() TA_EXCL(state_lock_);
     zx_status_t Start(ethmac_ifc_t* ifc, void* cookie) TA_EXCL(state_lock_);
-    void Send(uint32_t options, void* data, size_t length) TA_EXCL(state_lock_);
+    zx_status_t QueueTx(uint32_t options, ethmac_netbuf_t* netbuf) TA_EXCL(state_lock_);
+
+    const char* tag() const override { return "virtio-net"; }
 
 private:
     DISALLOW_COPY_ASSIGN_AND_MOVE(EthernetDevice);
@@ -62,6 +64,7 @@ private:
 
     // Saved net device configuration out of the pci config BAR
     virtio_net_config_t config_ TA_GUARDED(state_lock_);
+    size_t virtio_hdr_len_;
 
     // Ethmac callback interface; see ddk/protocol/ethernet.h
     ethmac_ifc_t* ifc_ TA_GUARDED(state_lock_);

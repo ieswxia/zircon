@@ -4,11 +4,9 @@
 
 #include <fbl/string.h>
 
+#include <fbl/algorithm.h>
 #include <fbl/type_support.h>
 #include <unittest/unittest.h>
-
-#define EXPECT_CSTR_EQ(expected, actual) \
-    EXPECT_STR_EQ(expected, actual, strlen(expected) + 1u, "unequal cstr")
 
 namespace fbl {
 namespace tests {
@@ -30,16 +28,16 @@ bool empty_string_test() {
     {
         fbl::String empty;
 
-        EXPECT_CSTR_EQ("", empty.data());
-        EXPECT_CSTR_EQ("", empty.c_str());
+        EXPECT_STR_EQ("", empty.data());
+        EXPECT_STR_EQ("", empty.c_str());
 
         EXPECT_EQ(0u, empty.length());
         EXPECT_EQ(0u, empty.size());
         EXPECT_TRUE(empty.empty());
 
-        EXPECT_CSTR_EQ("", empty.begin());
+        EXPECT_STR_EQ("", empty.begin());
         EXPECT_EQ(0u, empty.end() - empty.begin());
-        EXPECT_CSTR_EQ("", empty.cbegin());
+        EXPECT_STR_EQ("", empty.cbegin());
         EXPECT_EQ(0u, empty.cend() - empty.cbegin());
 
         EXPECT_EQ(0, empty[0u]);
@@ -48,16 +46,16 @@ bool empty_string_test() {
     {
         fbl::String empty("");
 
-        EXPECT_CSTR_EQ("", empty.data());
-        EXPECT_CSTR_EQ("", empty.c_str());
+        EXPECT_STR_EQ("", empty.data());
+        EXPECT_STR_EQ("", empty.c_str());
 
         EXPECT_EQ(0u, empty.length());
         EXPECT_EQ(0u, empty.size());
         EXPECT_TRUE(empty.empty());
 
-        EXPECT_CSTR_EQ("", empty.begin());
+        EXPECT_STR_EQ("", empty.begin());
         EXPECT_EQ(0u, empty.end() - empty.begin());
-        EXPECT_CSTR_EQ("", empty.cbegin());
+        EXPECT_STR_EQ("", empty.cbegin());
         EXPECT_EQ(0u, empty.cend() - empty.cbegin());
 
         EXPECT_EQ(0, empty[0u]);
@@ -66,16 +64,16 @@ bool empty_string_test() {
     {
         fbl::String empty("abcde", size_t(0u));
 
-        EXPECT_CSTR_EQ("", empty.data());
-        EXPECT_CSTR_EQ("", empty.c_str());
+        EXPECT_STR_EQ("", empty.data());
+        EXPECT_STR_EQ("", empty.c_str());
 
         EXPECT_EQ(0u, empty.length());
         EXPECT_EQ(0u, empty.size());
         EXPECT_TRUE(empty.empty());
 
-        EXPECT_CSTR_EQ("", empty.begin());
+        EXPECT_STR_EQ("", empty.begin());
         EXPECT_EQ(0u, empty.end() - empty.begin());
-        EXPECT_CSTR_EQ("", empty.cbegin());
+        EXPECT_STR_EQ("", empty.cbegin());
         EXPECT_EQ(0u, empty.cend() - empty.cbegin());
 
         EXPECT_EQ(0, empty[0u]);
@@ -84,16 +82,16 @@ bool empty_string_test() {
     {
         fbl::String empty(0u, 'x');
 
-        EXPECT_CSTR_EQ("", empty.data());
-        EXPECT_CSTR_EQ("", empty.c_str());
+        EXPECT_STR_EQ("", empty.data());
+        EXPECT_STR_EQ("", empty.c_str());
 
         EXPECT_EQ(0u, empty.length());
         EXPECT_EQ(0u, empty.size());
         EXPECT_TRUE(empty.empty());
 
-        EXPECT_CSTR_EQ("", empty.begin());
+        EXPECT_STR_EQ("", empty.begin());
         EXPECT_EQ(0u, empty.end() - empty.begin());
-        EXPECT_CSTR_EQ("", empty.cbegin());
+        EXPECT_STR_EQ("", empty.cbegin());
         EXPECT_EQ(0u, empty.cend() - empty.cbegin());
 
         EXPECT_EQ(0, empty[0u]);
@@ -102,16 +100,16 @@ bool empty_string_test() {
     {
         fbl::String empty(fbl::StringPiece("abcde", 0u));
 
-        EXPECT_CSTR_EQ("", empty.data());
-        EXPECT_CSTR_EQ("", empty.c_str());
+        EXPECT_STR_EQ("", empty.data());
+        EXPECT_STR_EQ("", empty.c_str());
 
         EXPECT_EQ(0u, empty.length());
         EXPECT_EQ(0u, empty.size());
         EXPECT_TRUE(empty.empty());
 
-        EXPECT_CSTR_EQ("", empty.begin());
+        EXPECT_STR_EQ("", empty.begin());
         EXPECT_EQ(0u, empty.end() - empty.begin());
-        EXPECT_CSTR_EQ("", empty.cbegin());
+        EXPECT_STR_EQ("", empty.cbegin());
         EXPECT_EQ(0u, empty.cend() - empty.cbegin());
 
         EXPECT_EQ(0, empty[0u]);
@@ -126,15 +124,15 @@ bool non_empty_string_test() {
     {
         fbl::String str("abc");
 
-        EXPECT_CSTR_EQ("abc", str.data());
+        EXPECT_STR_EQ("abc", str.data());
 
         EXPECT_EQ(3u, str.length());
         EXPECT_EQ(3u, str.size());
         EXPECT_FALSE(str.empty());
 
-        EXPECT_CSTR_EQ("abc", str.begin());
+        EXPECT_STR_EQ("abc", str.begin());
         EXPECT_EQ(3u, str.end() - str.begin());
-        EXPECT_CSTR_EQ("abc", str.cbegin());
+        EXPECT_STR_EQ("abc", str.cbegin());
         EXPECT_EQ(3u, str.cend() - str.cbegin());
 
         EXPECT_EQ('b', str[1u]);
@@ -143,15 +141,15 @@ bool non_empty_string_test() {
     {
         fbl::String str("abc", 2u);
 
-        EXPECT_CSTR_EQ("ab", str.data());
+        EXPECT_STR_EQ("ab", str.data());
 
         EXPECT_EQ(2u, str.length());
         EXPECT_EQ(2u, str.size());
         EXPECT_FALSE(str.empty());
 
-        EXPECT_CSTR_EQ("ab", str.begin());
+        EXPECT_STR_EQ("ab", str.begin());
         EXPECT_EQ(2u, str.end() - str.begin());
-        EXPECT_CSTR_EQ("ab", str.cbegin());
+        EXPECT_STR_EQ("ab", str.cbegin());
         EXPECT_EQ(2u, str.cend() - str.cbegin());
 
         EXPECT_EQ('b', str[1u]);
@@ -160,15 +158,15 @@ bool non_empty_string_test() {
     {
         fbl::String str(10u, 'x');
 
-        EXPECT_CSTR_EQ("xxxxxxxxxx", str.data());
+        EXPECT_STR_EQ("xxxxxxxxxx", str.data());
 
         EXPECT_EQ(10u, str.length());
         EXPECT_EQ(10u, str.size());
         EXPECT_FALSE(str.empty());
 
-        EXPECT_CSTR_EQ("xxxxxxxxxx", str.begin());
+        EXPECT_STR_EQ("xxxxxxxxxx", str.begin());
         EXPECT_EQ(10u, str.end() - str.begin());
-        EXPECT_CSTR_EQ("xxxxxxxxxx", str.cbegin());
+        EXPECT_STR_EQ("xxxxxxxxxx", str.cbegin());
         EXPECT_EQ(10u, str.cend() - str.cbegin());
 
         EXPECT_EQ('x', str[1u]);
@@ -177,15 +175,15 @@ bool non_empty_string_test() {
     {
         fbl::String str(fbl::StringPiece("abcdef", 2u));
 
-        EXPECT_CSTR_EQ("ab", str.data());
+        EXPECT_STR_EQ("ab", str.data());
 
         EXPECT_EQ(2u, str.length());
         EXPECT_EQ(2u, str.size());
         EXPECT_FALSE(str.empty());
 
-        EXPECT_CSTR_EQ("ab", str.begin());
+        EXPECT_STR_EQ("ab", str.begin());
         EXPECT_EQ(2u, str.end() - str.begin());
-        EXPECT_CSTR_EQ("ab", str.cbegin());
+        EXPECT_STR_EQ("ab", str.cbegin());
         EXPECT_EQ(2u, str.cend() - str.cbegin());
 
         EXPECT_EQ('b', str[1u]);
@@ -200,7 +198,7 @@ bool copy_move_and_assignment_test() {
     {
         fbl::String abc("abc");
         fbl::String copy(abc);
-        EXPECT_CSTR_EQ("abc", abc.data());
+        EXPECT_STR_EQ("abc", abc.data());
         EXPECT_EQ(abc.data(), copy.data());
         EXPECT_EQ(3u, copy.length());
     }
@@ -209,8 +207,8 @@ bool copy_move_and_assignment_test() {
         fbl::String abc("abc");
         fbl::String copy(abc);
         fbl::String move(fbl::move(copy));
-        EXPECT_CSTR_EQ("abc", abc.data());
-        EXPECT_CSTR_EQ("", copy.data());
+        EXPECT_STR_EQ("abc", abc.data());
+        EXPECT_STR_EQ("", copy.data());
         EXPECT_EQ(abc.data(), move.data());
         EXPECT_EQ(3u, move.length());
     }
@@ -219,7 +217,7 @@ bool copy_move_and_assignment_test() {
         fbl::String abc("abc");
         fbl::String str;
         str = abc;
-        EXPECT_CSTR_EQ("abc", abc.data());
+        EXPECT_STR_EQ("abc", abc.data());
         EXPECT_EQ(abc.data(), str.data());
         EXPECT_EQ(3u, str.length());
     }
@@ -229,8 +227,8 @@ bool copy_move_and_assignment_test() {
         fbl::String copy(abc);
         fbl::String str;
         str = fbl::move(copy);
-        EXPECT_CSTR_EQ("abc", abc.data());
-        EXPECT_CSTR_EQ("", copy.data());
+        EXPECT_STR_EQ("abc", abc.data());
+        EXPECT_STR_EQ("", copy.data());
         EXPECT_EQ(abc.data(), str.data());
         EXPECT_EQ(3u, str.length());
     }
@@ -238,21 +236,21 @@ bool copy_move_and_assignment_test() {
     {
         fbl::String str;
         str = "abc";
-        EXPECT_CSTR_EQ("abc", str.data());
+        EXPECT_STR_EQ("abc", str.data());
         EXPECT_EQ(3u, str.length());
 
         str = "";
-        EXPECT_CSTR_EQ("", str.data());
+        EXPECT_STR_EQ("", str.data());
         EXPECT_EQ(0u, str.length());
 
         fbl::String copy(str);
-        EXPECT_CSTR_EQ("", copy.data());
+        EXPECT_STR_EQ("", copy.data());
         EXPECT_EQ(0u, copy.length());
 
         fbl::String move(copy);
-        EXPECT_CSTR_EQ("", copy.data());
+        EXPECT_STR_EQ("", copy.data());
         EXPECT_EQ(0u, copy.length());
-        EXPECT_CSTR_EQ("", move.data());
+        EXPECT_STR_EQ("", move.data());
         EXPECT_EQ(0u, move.length());
     }
 
@@ -263,39 +261,39 @@ bool set_clear_test() {
     BEGIN_TEST;
 
     fbl::String str;
-    EXPECT_CSTR_EQ("", str.data());
+    EXPECT_STR_EQ("", str.data());
     EXPECT_EQ(0u, str.length());
 
     str.Set("abc");
-    EXPECT_CSTR_EQ("abc", str.data());
+    EXPECT_STR_EQ("abc", str.data());
     EXPECT_EQ(3u, str.length());
 
     str.Set("");
-    EXPECT_CSTR_EQ("", str.data());
+    EXPECT_STR_EQ("", str.data());
     EXPECT_EQ(0u, str.length());
 
     str.Set("abc", 2u);
-    EXPECT_CSTR_EQ("ab", str.data());
+    EXPECT_STR_EQ("ab", str.data());
     EXPECT_EQ(2u, str.length());
 
     str.Set(0u, 'x');
-    EXPECT_CSTR_EQ("", str.data());
+    EXPECT_STR_EQ("", str.data());
     EXPECT_EQ(0u, str.length());
 
     str.Set(10u, 'x');
-    EXPECT_CSTR_EQ("xxxxxxxxxx", str.data());
+    EXPECT_STR_EQ("xxxxxxxxxx", str.data());
     EXPECT_EQ(10u, str.length());
 
     str.Set(fbl::StringPiece("abcdef", 0u));
-    EXPECT_CSTR_EQ("", str.data());
+    EXPECT_STR_EQ("", str.data());
     EXPECT_EQ(0u, str.length());
 
     str.Set(fbl::StringPiece("abc", 2u));
-    EXPECT_CSTR_EQ("ab", str.data());
+    EXPECT_STR_EQ("ab", str.data());
     EXPECT_EQ(2u, str.length());
 
     str.clear();
-    EXPECT_CSTR_EQ("", str.data());
+    EXPECT_STR_EQ("", str.data());
     EXPECT_EQ(0u, str.length());
 
     END_TEST;
@@ -380,55 +378,55 @@ bool concat_test() {
 
     {
         fbl::String empty = fbl::String::Concat({});
-        EXPECT_CSTR_EQ("", empty.c_str());
+        EXPECT_STR_EQ("", empty.c_str());
         EXPECT_EQ(0u, empty.length());
     }
 
     {
         fbl::String empty = fbl::String::Concat({""});
-        EXPECT_CSTR_EQ("", empty.c_str());
+        EXPECT_STR_EQ("", empty.c_str());
         EXPECT_EQ(0u, empty.length());
     }
 
     {
         fbl::String empty = fbl::String::Concat({"", "", "", ""});
-        EXPECT_CSTR_EQ("", empty.c_str());
+        EXPECT_STR_EQ("", empty.c_str());
         EXPECT_EQ(0u, empty.length());
     }
 
     {
         fbl::String str = fbl::String::Concat({"abc"});
-        EXPECT_CSTR_EQ("abc", str.c_str());
+        EXPECT_STR_EQ("abc", str.c_str());
         EXPECT_EQ(3u, str.length());
     }
 
     {
         fbl::String str = fbl::String::Concat({"abc", "def"});
-        EXPECT_CSTR_EQ("abcdef", str.c_str());
+        EXPECT_STR_EQ("abcdef", str.c_str());
         EXPECT_EQ(6u, str.length());
     }
 
     {
         fbl::String str = fbl::String::Concat({"abc", "", "def"});
-        EXPECT_CSTR_EQ("abcdef", str.c_str());
+        EXPECT_STR_EQ("abcdef", str.c_str());
         EXPECT_EQ(6u, str.length());
     }
 
     {
         fbl::String str = fbl::String::Concat({"abc", "def", ""});
-        EXPECT_CSTR_EQ("abcdef", str.c_str());
+        EXPECT_STR_EQ("abcdef", str.c_str());
         EXPECT_EQ(6u, str.length());
     }
 
     {
         fbl::String str = fbl::String::Concat({"", "abc", "def"});
-        EXPECT_CSTR_EQ("abcdef", str.c_str());
+        EXPECT_STR_EQ("abcdef", str.c_str());
         EXPECT_EQ(6u, str.length());
     }
 
     {
         fbl::String str = fbl::String::Concat({"abc", "def", "g", "hi", "jklmnop"});
-        EXPECT_CSTR_EQ("abcdefghijklmnop", str.c_str());
+        EXPECT_STR_EQ("abcdefghijklmnop", str.c_str());
         EXPECT_EQ(16u, str.length());
     }
 
@@ -444,7 +442,7 @@ bool alloc_checker_test() {
         fbl::AllocChecker ac;
         fbl::String empty("", &ac);
         EXPECT_TRUE(ac.check());
-        EXPECT_CSTR_EQ("", empty.data());
+        EXPECT_STR_EQ("", empty.data());
         EXPECT_EQ(0u, empty.length());
     }
 
@@ -452,7 +450,7 @@ bool alloc_checker_test() {
         fbl::AllocChecker ac;
         fbl::String empty("abcdef", 0u, &ac);
         EXPECT_TRUE(ac.check());
-        EXPECT_CSTR_EQ("", empty.data());
+        EXPECT_STR_EQ("", empty.data());
         EXPECT_EQ(0u, empty.length());
     }
 
@@ -460,7 +458,7 @@ bool alloc_checker_test() {
         fbl::AllocChecker ac;
         fbl::String str(0u, 'x', &ac);
         EXPECT_TRUE(ac.check());
-        EXPECT_CSTR_EQ("", str.data());
+        EXPECT_STR_EQ("", str.data());
         EXPECT_EQ(0u, str.length());
     }
 
@@ -468,7 +466,7 @@ bool alloc_checker_test() {
         fbl::AllocChecker ac;
         fbl::String empty(fbl::StringPiece("abcdef", 0u), &ac);
         EXPECT_TRUE(ac.check());
-        EXPECT_CSTR_EQ("", empty.data());
+        EXPECT_STR_EQ("", empty.data());
         EXPECT_EQ(0u, empty.length());
     }
 
@@ -479,7 +477,7 @@ bool alloc_checker_test() {
         fbl::String empty("?");
         empty.Set("", &ac);
         EXPECT_TRUE(ac.check());
-        EXPECT_CSTR_EQ("", empty.data());
+        EXPECT_STR_EQ("", empty.data());
         EXPECT_EQ(0u, empty.length());
     }
 
@@ -488,7 +486,7 @@ bool alloc_checker_test() {
         fbl::String empty("?");
         empty.Set("abcdef", 0u, &ac);
         EXPECT_TRUE(ac.check());
-        EXPECT_CSTR_EQ("", empty.data());
+        EXPECT_STR_EQ("", empty.data());
         EXPECT_EQ(0u, empty.length());
     }
 
@@ -497,7 +495,7 @@ bool alloc_checker_test() {
         fbl::String str;
         str.Set(0u, 'x', &ac);
         EXPECT_TRUE(ac.check());
-        EXPECT_CSTR_EQ("", str.data());
+        EXPECT_STR_EQ("", str.data());
         EXPECT_EQ(0u, str.length());
     }
 
@@ -506,7 +504,7 @@ bool alloc_checker_test() {
         fbl::String empty("?");
         empty.Set(fbl::StringPiece("abcdef", 0u), &ac);
         EXPECT_TRUE(ac.check());
-        EXPECT_CSTR_EQ("", empty.data());
+        EXPECT_STR_EQ("", empty.data());
         EXPECT_EQ(0u, empty.length());
     }
 
@@ -516,7 +514,7 @@ bool alloc_checker_test() {
         fbl::AllocChecker ac;
         fbl::String str("abc", &ac);
         EXPECT_TRUE(ac.check());
-        EXPECT_CSTR_EQ("abc", str.data());
+        EXPECT_STR_EQ("abc", str.data());
         EXPECT_EQ(3u, str.length());
     }
 
@@ -524,7 +522,7 @@ bool alloc_checker_test() {
         fbl::AllocChecker ac;
         fbl::String str("abcdef", 5u, &ac);
         EXPECT_TRUE(ac.check());
-        EXPECT_CSTR_EQ("abcde", str.data());
+        EXPECT_STR_EQ("abcde", str.data());
         EXPECT_EQ(5u, str.length());
     }
 
@@ -532,7 +530,7 @@ bool alloc_checker_test() {
         fbl::AllocChecker ac;
         fbl::String str(10u, 'x', &ac);
         EXPECT_TRUE(ac.check());
-        EXPECT_CSTR_EQ("xxxxxxxxxx", str.data());
+        EXPECT_STR_EQ("xxxxxxxxxx", str.data());
         EXPECT_EQ(10u, str.length());
     }
 
@@ -540,7 +538,7 @@ bool alloc_checker_test() {
         fbl::AllocChecker ac;
         fbl::String str(fbl::StringPiece("abcdef", 5u), &ac);
         EXPECT_TRUE(ac.check());
-        EXPECT_CSTR_EQ("abcde", str.data());
+        EXPECT_STR_EQ("abcde", str.data());
         EXPECT_EQ(5u, str.length());
     }
 
@@ -551,7 +549,7 @@ bool alloc_checker_test() {
         fbl::String str;
         str.Set("abc", &ac);
         EXPECT_TRUE(ac.check());
-        EXPECT_CSTR_EQ("abc", str.data());
+        EXPECT_STR_EQ("abc", str.data());
         EXPECT_EQ(3u, str.length());
     }
 
@@ -560,7 +558,7 @@ bool alloc_checker_test() {
         fbl::String str;
         str.Set("abcdef", 5u, &ac);
         EXPECT_TRUE(ac.check());
-        EXPECT_CSTR_EQ("abcde", str.data());
+        EXPECT_STR_EQ("abcde", str.data());
         EXPECT_EQ(5u, str.length());
     }
 
@@ -569,7 +567,7 @@ bool alloc_checker_test() {
         fbl::String str;
         str.Set(10u, 'x', &ac);
         EXPECT_TRUE(ac.check());
-        EXPECT_CSTR_EQ("xxxxxxxxxx", str.data());
+        EXPECT_STR_EQ("xxxxxxxxxx", str.data());
         EXPECT_EQ(10u, str.length());
     }
 
@@ -578,7 +576,7 @@ bool alloc_checker_test() {
         fbl::String str;
         str.Set(fbl::StringPiece("abcdef", 5u), &ac);
         EXPECT_TRUE(ac.check());
-        EXPECT_CSTR_EQ("abcde", str.data());
+        EXPECT_STR_EQ("abcde", str.data());
         EXPECT_EQ(5u, str.length());
     }
 
@@ -588,7 +586,7 @@ bool alloc_checker_test() {
         fbl::AllocChecker ac;
         fbl::String empty = fbl::String::Concat({}, &ac);
         EXPECT_TRUE(ac.check());
-        EXPECT_CSTR_EQ("", empty.c_str());
+        EXPECT_STR_EQ("", empty.c_str());
         EXPECT_EQ(0u, empty.length());
     }
 
@@ -596,7 +594,7 @@ bool alloc_checker_test() {
         fbl::AllocChecker ac;
         fbl::String str = fbl::String::Concat({"abc", "def", "g", "hi", "jklmnop"}, &ac);
         EXPECT_TRUE(ac.check());
-        EXPECT_CSTR_EQ("abcdefghijklmnop", str.c_str());
+        EXPECT_STR_EQ("abcdefghijklmnop", str.c_str());
         EXPECT_EQ(16u, str.length());
     }
 
@@ -633,9 +631,9 @@ bool swap_test() {
     abc.swap(def);
     empty.swap(abc);
 
-    EXPECT_CSTR_EQ("def", empty.data());
-    EXPECT_CSTR_EQ("", abc.data());
-    EXPECT_CSTR_EQ("abc", def.data());
+    EXPECT_STR_EQ("def", empty.data());
+    EXPECT_STR_EQ("", abc.data());
+    EXPECT_STR_EQ("abc", def.data());
 
     END_TEST;
 }
@@ -700,7 +698,7 @@ bool ref_count_test() {
                     EXPECT_EQ(4u, StringTestHelper::GetRefCount(abc));
 
                     assigned_from_abc = "";
-                    EXPECT_CSTR_EQ("", assigned_from_abc.data());
+                    EXPECT_STR_EQ("", assigned_from_abc.data());
                     EXPECT_EQ(3u, StringTestHelper::GetRefCount(abc));
 
                     assigned_from_abc = abc;
@@ -708,7 +706,7 @@ bool ref_count_test() {
                     EXPECT_EQ(4u, StringTestHelper::GetRefCount(abc));
 
                     assigned_from_abc.clear();
-                    EXPECT_CSTR_EQ("", assigned_from_abc.data());
+                    EXPECT_STR_EQ("", assigned_from_abc.data());
                     EXPECT_EQ(3u, StringTestHelper::GetRefCount(abc));
                 }
                 EXPECT_EQ(3u, StringTestHelper::GetRefCount(abc));
@@ -737,7 +735,7 @@ bool ref_count_test() {
                     EXPECT_EQ(4u, StringTestHelper::GetRefCount(xs));
 
                     assigned_from_xs = "";
-                    EXPECT_CSTR_EQ("", assigned_from_xs.data());
+                    EXPECT_STR_EQ("", assigned_from_xs.data());
                     EXPECT_EQ(3u, StringTestHelper::GetRefCount(xs));
 
                     assigned_from_xs = xs;
@@ -745,7 +743,7 @@ bool ref_count_test() {
                     EXPECT_EQ(4u, StringTestHelper::GetRefCount(xs));
 
                     assigned_from_xs.clear();
-                    EXPECT_CSTR_EQ("", assigned_from_xs.data());
+                    EXPECT_STR_EQ("", assigned_from_xs.data());
                     EXPECT_EQ(3u, StringTestHelper::GetRefCount(xs));
                 }
                 EXPECT_EQ(3u, StringTestHelper::GetRefCount(xs));
@@ -753,6 +751,86 @@ bool ref_count_test() {
             EXPECT_EQ(2u, StringTestHelper::GetRefCount(xs));
         }
         EXPECT_EQ(1u, StringTestHelper::GetRefCount(xs));
+    }
+
+    END_TEST;
+}
+
+constexpr char kFakeStringData[] = "hello";
+constexpr size_t kFakeStringLength = fbl::count_of(kFakeStringData);
+
+struct SimpleFakeString {
+    const char* data() const { return kFakeStringData; }
+    size_t length() const { return kFakeStringLength; }
+};
+
+struct OverloadedFakeString {
+    const char* data() const { return kFakeStringData; }
+    size_t length() const { return kFakeStringLength; }
+
+    // These are decoys to verify that the conversion operator only considers
+    // the const overloads of these members.
+    void data();
+    void length();
+};
+
+struct EmptyString {
+    const char* data() const { return nullptr; }
+    size_t length() const { return 0u; }
+};
+
+bool conversion_from_string_like_object() {
+    BEGIN_TEST;
+
+    {
+        SimpleFakeString str;
+        fbl::String p(str);
+        EXPECT_STR_EQ(kFakeStringData, p.data());
+        EXPECT_EQ(kFakeStringLength, p.length());
+    }
+
+    {
+        OverloadedFakeString str;
+        fbl::String p(str);
+        EXPECT_STR_EQ(kFakeStringData, p.data());
+        EXPECT_EQ(kFakeStringLength, p.length());
+    }
+
+    {
+        EmptyString str;
+        fbl::String p(str);
+        EXPECT_STR_EQ("", p.data());
+        EXPECT_EQ(0u, p.length());
+    }
+
+    END_TEST;
+}
+
+bool assignment_from_string_like_object() {
+    BEGIN_TEST;
+
+    {
+        SimpleFakeString str;
+        fbl::String p;
+        p = str;
+        EXPECT_STR_EQ(kFakeStringData, p.data());
+        EXPECT_EQ(kFakeStringLength, p.length());
+    }
+
+    {
+        OverloadedFakeString str;
+        fbl::String p;
+        p = str;
+        EXPECT_STR_EQ(kFakeStringData, p.data());
+        EXPECT_EQ(kFakeStringLength, p.length());
+    }
+
+    {
+        EmptyString str;
+        fbl::String p("abc");
+        p = str;
+        EXPECT_STR_EQ("", p.data());
+        EXPECT_EQ(0u, p.length());
     }
 
     END_TEST;
@@ -771,4 +849,6 @@ RUN_TEST(alloc_checker_test)
 RUN_TEST(to_string_piece_test)
 RUN_TEST(swap_test)
 RUN_TEST(ref_count_test)
+RUN_TEST(conversion_from_string_like_object)
+RUN_TEST(assignment_from_string_like_object)
 END_TEST_CASE(string_tests)

@@ -11,7 +11,7 @@
 #include <string.h>
 
 #include <zxcpp/new.h>
-#include <object/handle_reaper.h>
+#include <object/handle.h>
 
 // static
 zx_status_t MessagePacket::NewPacket(uint32_t data_size, uint32_t num_handles,
@@ -46,7 +46,7 @@ zx_status_t MessagePacket::NewPacket(uint32_t data_size, uint32_t num_handles,
 }
 
 // static
-zx_status_t MessagePacket::Create(user_ptr<const void> data, uint32_t data_size,
+zx_status_t MessagePacket::Create(user_in_ptr<const void> data, uint32_t data_size,
                                   uint32_t num_handles,
                                   fbl::unique_ptr<MessagePacket>* msg) {
     zx_status_t status = NewPacket(data_size, num_handles, msg);
@@ -78,9 +78,10 @@ zx_status_t MessagePacket::Create(const void* data, uint32_t data_size,
 
 MessagePacket::~MessagePacket() {
     if (owns_handles_) {
-        // Delete handles out-of-band to avoid the worst case recursive
-        // destruction behavior.
-        ReapHandles(handles_, num_handles_);
+        for (size_t ix = 0; ix != num_handles_; ++ix) {
+            // Delete the handle via HandleOwner dtor.
+            HandleOwner ho(handles_[ix]);
+        }
     }
 }
 

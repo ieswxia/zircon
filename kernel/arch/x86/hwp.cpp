@@ -5,21 +5,21 @@
 // license that can be found in the LICENSE file or at
 // https://opensource.org/licenses/MIT
 
-#include <zircon/compiler.h>
+#include <arch/x86/feature.h>
 #include <err.h>
 #include <inttypes.h>
-#include <string.h>
-#include <arch/x86/feature.h>
 #include <kernel/auto_lock.h>
 #include <kernel/mp.h>
+#include <kernel/spinlock.h>
 #include <lib/console.h>
+#include <string.h>
+#include <zircon/compiler.h>
 
 static bool hwp_enabled = false;
 
-static spin_lock_t lock = SPIN_LOCK_INITIAL_VALUE;
+static SpinLock lock;
 
-static void hwp_enable_sync_task(void* ctx)
-{
+static void hwp_enable_sync_task(void* ctx) {
     // Enable HWP
     write_msr(X86_MSR_IA32_PM_ENABLE, 1);
 
@@ -30,9 +30,8 @@ static void hwp_enable_sync_task(void* ctx)
     write_msr(X86_MSR_IA32_HWP_REQUEST, hwp_req);
 }
 
-static void hwp_enable(void)
-{
-    AutoSpinLock guard(&lock);
+static void hwp_enable(void) {
+    AutoSpinLockNoIrqSave guard(&lock);
 
     if (hwp_enabled) {
         return;
@@ -43,13 +42,12 @@ static void hwp_enable(void)
         return;
     }
 
-    mp_sync_exec(MP_IPI_TARGET_ALL, 0, hwp_enable_sync_task, NULL);
+    mp_sync_exec(MP_IPI_TARGET_ALL, 0, hwp_enable_sync_task, nullptr);
 
     hwp_enabled = true;
 }
 
-static void hwp_set_hint_sync_task(void* ctx)
-{
+static void hwp_set_hint_sync_task(void* ctx) {
     uint8_t hint = (unsigned long)ctx & 0xff;
     uint64_t hwp_req = read_msr(X86_MSR_IA32_HWP_REQUEST) & ~(0xff << 24);
     hwp_req |= (hint << 24);
@@ -58,7 +56,7 @@ static void hwp_set_hint_sync_task(void* ctx)
 }
 
 static void hwp_set_hint(unsigned long hint) {
-    AutoSpinLock guard(&lock);
+    AutoSpinLockNoIrqSave guard(&lock);
 
     if (!hwp_enabled) {
         printf("Enable HWP first\n");
@@ -71,12 +69,11 @@ static void hwp_set_hint(unsigned long hint) {
     mp_sync_exec(MP_IPI_TARGET_ALL, 0, hwp_set_hint_sync_task, (void*)hint);
 }
 
-static int cmd_hwp(int argc, const cmd_args *argv, uint32_t flags)
-{
+static int cmd_hwp(int argc, const cmd_args* argv, uint32_t flags) {
     if (argc < 2) {
-notenoughargs:
+    notenoughargs:
         printf("not enough arguments\n");
-usage:
+    usage:
         printf("usage:\n");
         printf("%s enable\n", argv[0].str);
         printf("%s hint <0-255>\n", argv[0].str);

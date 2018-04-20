@@ -9,6 +9,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <sched.h>
 #include <sys/param.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -44,85 +45,6 @@ typedef struct {
 } transport_info_t;
 
 static const char* appname;
-
-static int pull_file(int s, const char* dst, const char* src) {
-    int r;
-    msg in, out;
-    size_t src_len = strlen(src);
-
-    out.hdr.cmd = NB_OPEN;
-    out.hdr.arg = O_RDONLY;
-    memcpy(out.data, src, src_len);
-    out.data[src_len] = 0;
-
-    r = netboot_txn(s, &in, &out, sizeof(out.hdr) + src_len + 1);
-    if (r < 0) {
-        fprintf(stderr, "%s: error opening remote file %s (%d)\n",
-                appname, src, errno);
-        return r;
-    }
-
-    char final_dst[MAXPATHLEN];
-    struct stat st;
-    strncpy(final_dst, dst, sizeof(final_dst));
-    if (stat(dst, &st) == 0 && (st.st_mode & S_IFDIR)) {
-        strncat(final_dst, "/", sizeof(final_dst) - strlen(final_dst) - 1);
-        strncat(final_dst, basename((char*)src), sizeof(final_dst) - strlen(final_dst) - 1);
-    }
-
-    bool use_stdout = (final_dst[0] == '-' && final_dst[1] == '\0');
-    int fd = (use_stdout) ? fileno(stdout) : open(final_dst, O_WRONLY|O_TRUNC|O_CREAT, 0664);
-    if (fd < 0) {
-        fprintf(stderr, "%s: cannot open %s for writing: %s\n",
-                appname, final_dst, strerror(errno));
-        return -1;
-    }
-
-    int n = 0;
-    int blocknum = 0;
-    for (;;) {
-        memset(&out, 0, sizeof(out));
-        out.hdr.cmd = NB_READ;
-        out.hdr.arg = blocknum;
-        r = netboot_txn(s, &in, &out, sizeof(out.hdr) + 1);
-        if (r < 0) {
-            fprintf(stderr, "%s: error reading block %d (%d)\n",
-                    appname, blocknum, errno);
-            close(fd);
-            return r;
-        }
-        r -= sizeof(in.hdr);
-        if (r == 0) {
-            break; // EOF
-        }
-        if (write(fd, in.data, r) < r) {
-            fprintf(stderr, "%s: pull short local write: %s\n",
-                    appname, strerror(errno));
-            close(fd);
-            return -1;
-        }
-        blocknum++;
-        n += r;
-    }
-
-    memset(&out, 0, sizeof(out));
-    out.hdr.cmd = NB_CLOSE;
-    r = netboot_txn(s, &in, &out, sizeof(out.hdr) + 1);
-    if (r < 0) {
-        close(fd);
-        return r;
-    }
-
-    if (close(fd)) {
-        fprintf(stderr, "%s: pull local close failed: %s\n",
-                appname, strerror(errno));
-        return -1;
-    }
-
-    fprintf(stderr, "read %d bytes\n", n);
-
-    return 0;
-}
 
 static ssize_t file_open_read(const char* filename, void* file_cookie) {
     int fd = open(filename, O_RDONLY);
@@ -178,13 +100,12 @@ static void file_close(void* file_cookie) {
 // Longest time we will wait for a send operation to succeed
 #define MAX_SEND_TIME_MS 1000
 
-static int transport_send(void* data, size_t len, void* transport_cookie) {
+static tftp_status transport_send(void* data, size_t len, void* transport_cookie) {
     transport_info_t* transport_info = transport_cookie;
     ssize_t send_result;
+    struct pollfd poll_fds = {.fd = transport_info->socket,
+                              .events = POLLOUT};
     do {
-        struct pollfd poll_fds = {.fd = transport_info->socket,
-                                  .events = POLLOUT,
-                                  .revents = 0};
         int poll_result = poll(&poll_fds, 1, MAX_SEND_TIME_MS);
         if (poll_result <= 0) {
             // We'll treat a timeout as an IO error and not a TFTP_ERR_TIMED_OUT,
@@ -199,12 +120,14 @@ static int transport_send(void* data, size_t len, void* transport_cookie) {
         } else {
             send_result = send(transport_info->socket, data, len, 0);
         }
-    } while ((send_result < 0) && ((errno == EAGAIN) || (errno == EWOULDBLOCK)));
+    } while ((send_result < 0) &&
+             ((errno == EAGAIN) || (errno == EWOULDBLOCK) ||
+              (errno == ENOBUFS && sched_yield() == 0)));
 
     if (send_result < 0) {
         return TFTP_ERR_IO;
     }
-    return (int)send_result;
+    return TFTP_NO_ERROR;
 }
 
 static int transport_recv(void* data, size_t len, bool block, void* transport_cookie) {
@@ -261,8 +184,8 @@ static int transport_timeout_set(uint32_t timeout_ms, void* transport_cookie) {
     return 0;
 }
 
-static int push_file(int s, struct sockaddr_in6* addr, const char* dst,
-                     const char* src) {
+static int transfer_file(bool push, int s, struct sockaddr_in6* addr, const char* dst,
+                         const char* src) {
     // Initialize session
     tftp_session* session = NULL;
     size_t session_data_sz = tftp_sizeof_session();
@@ -294,8 +217,6 @@ static int push_file(int s, struct sockaddr_in6* addr, const char* dst,
     tftp_session_set_transport_interface(session, &transport_ifc);
 
     // Set our preferred transport options
-    uint16_t tftp_block_size = 1024;
-    uint16_t tftp_window_size = 1024;
     tftp_set_options(session, &tftp_block_size, NULL, &tftp_window_size);
 
     // Prepare buffers
@@ -308,8 +229,12 @@ static int push_file(int s, struct sockaddr_in6* addr, const char* dst,
     opts.err_msg = err_msg;
     opts.err_msg_sz = sizeof(err_msg);
 
-    tftp_status status = tftp_push_file(session, &transport_info, &file_info,
-                                        src, dst, &opts);
+    tftp_status status;
+    if (push) {
+        status = tftp_push_file(session, &transport_info, &file_info, src, dst, &opts);
+    } else {
+        status = tftp_pull_file(session, &transport_info, &file_info, dst, src, &opts);
+    }
 
     free(session_data);
     free(opts.inbuf);
@@ -326,8 +251,8 @@ static int push_file(int s, struct sockaddr_in6* addr, const char* dst,
 }
 
 static void usage(void) {
-    fprintf(stderr, "usage: %s [hostname:]src [hostname:]dst\n", appname);
-    netboot_usage();
+    fprintf(stderr, "usage: %s [options] [hostname:]src [hostname:]dst\n", appname);
+    netboot_usage(true);
 }
 
 int main(int argc, char** argv) {
@@ -375,7 +300,7 @@ int main(int argc, char** argv) {
 
     int s;
     struct sockaddr_in6 server_addr;
-    if ((s = netboot_open(hostname, NULL, &server_addr, !push)) < 0) {
+    if ((s = netboot_open(hostname, NULL, &server_addr, false)) < 0) {
         if (errno == ETIMEDOUT) {
             fprintf(stderr, "%s: lookup of %s timed out\n", appname, hostname);
         } else {
@@ -385,12 +310,7 @@ int main(int argc, char** argv) {
     }
 
 
-    int ret;
-    if (push) {
-        ret = push_file(s, &server_addr, dst, src);
-    } else {
-        ret = pull_file(s, dst, src);
-    }
+    int ret = transfer_file(push, s, &server_addr, dst, src);
     close(s);
     return ret;
 }

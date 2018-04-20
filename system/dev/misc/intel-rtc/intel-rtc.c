@@ -24,60 +24,60 @@
 
 #define RTC_HOUR_PM_BIT 0x80
 
+// Leading 0 allows using the 1-indexed month values from rtc.
+static const uint64_t days_in_month[] = {
+    0,
+    31, // January
+    28, // February (not leap year)
+    31, // March
+    30, // April
+    31, // May
+    30, // June
+    31, // July
+    31, // August
+    30, // September
+    31, // October
+    30, // November
+    31, // December
+};
+
+// Start with seconds from the Unix epoch to 2016/1/1T00:00:00.
+static const uint64_t local_epoc = 1451606400;
+static const uint16_t local_epoc_year = 2016;
+
+static bool is_leap_year(uint16_t year) {
+    return ((year % 4) == 0 && (year % 100) != 0) || ((year % 400) == 0);
+}
+
 // This is run on boot (after validation of the RTC) and whenever the
 // RTC is adjusted.
 static void set_utc_offset(rtc_t* rtc) {
-    // Start with seconds from the Unix epoch to 2016/1/1T00:00:00.
-    uint64_t seconds_to_new_year = 1451606400;
+    // First add all of the prior years
+    uint64_t days_since_local_epoc = 0;
+    for (uint16_t year = local_epoc_year; year < rtc->year; year++) {
+        days_since_local_epoc += is_leap_year(year) ? 366 : 365;
+    }
 
-    // Leading 0 allows using the 1-indexed month values from rtc.
-    static uint64_t days_in_month[] = {
-        0,
-        31, // 2016 January
-        29, // 2016 February
-        31, // 2016 March
-        30, // 2016 April
-        31, // 2016 May
-        30, // 2016 June
-        31, // 2016 July
-        31, // 2016 August
-        30, // 2016 September
-        31, // 2016 October
-        30, // 2016 November
-        31, // 2016 December
-        31, // 2017 January
-        28, // 2017 February
-        31, // 2017 March
-        30, // 2017 April
-        31, // 2017 May
-        30, // 2017 June
-        31, // 2017 July
-        31, // 2017 August
-        30, // 2017 September
-        31, // 2017 October
-        30, // 2017 November
-        31, // 2017 December
-    };
-
-    // First add all the prior complete months.
-    size_t current_month = rtc->month + 12 * (rtc->year - 2016);
-    uint64_t days_this_year = 0;
-    for (size_t month = 1; month < current_month; month++) {
-        days_this_year += days_in_month[month];
+    // Next add all the prior complete months this year.
+    for (size_t month = 1; month < rtc->month; month++) {
+        days_since_local_epoc += days_in_month[month];
+    }
+    if (rtc->month > 2 && is_leap_year(rtc->year)) {
+        days_since_local_epoc++;
     }
 
     // Add all the prior complete days.
-    days_this_year += rtc->day - 1;
+    days_since_local_epoc += rtc->day - 1;
 
     // Hours, minutes, and seconds are 0 indexed.
-    uint64_t hours_this_year = days_this_year * 24 + rtc->hours;
-    uint64_t minutes_this_year = hours_this_year * 60 + rtc->minutes;
-    uint64_t seconds_this_year = minutes_this_year * 60 + rtc->seconds;
+    uint64_t hours_since_local_epoc = (days_since_local_epoc * 24) + rtc->hours;
+    uint64_t minutes_since_local_epoc = (hours_since_local_epoc * 60) + rtc->minutes;
+    uint64_t seconds_since_local_epoc = (minutes_since_local_epoc * 60) + rtc->seconds;
 
-    uint64_t rtc_seconds = seconds_to_new_year + seconds_this_year;
+    uint64_t rtc_seconds = local_epoc + seconds_since_local_epoc;
     uint64_t rtc_nanoseconds = rtc_seconds * 1000000000;
 
-    uint64_t monotonic_nanoseconds = zx_time_get(ZX_CLOCK_MONOTONIC);
+    uint64_t monotonic_nanoseconds = zx_clock_get(ZX_CLOCK_MONOTONIC);
     int64_t offset = rtc_nanoseconds - monotonic_nanoseconds;
 
     zx_status_t status = zx_clock_adjust(get_root_resource(), ZX_CLOCK_UTC, offset);
@@ -304,7 +304,7 @@ static void sanitize_rtc(rtc_t* rtc) {
     };
 
     intel_rtc_get(rtc, sizeof(*rtc));
-    if (rtc_is_invalid(rtc) || rtc->year < 2016 || rtc->year > 2017) {
+    if (rtc_is_invalid(rtc) || rtc->year < local_epoc_year) {
         intel_rtc_set(&default_rtc, sizeof(&default_rtc));
         *rtc = default_rtc;
     }
@@ -335,7 +335,7 @@ static zx_protocol_device_t intel_rtc_device_proto __UNUSED = {
 };
 
 //TODO: bind against hw, not misc
-static zx_status_t intel_rtc_bind(void* ctx, zx_device_t* parent, void** cookie) {
+static zx_status_t intel_rtc_bind(void* ctx, zx_device_t* parent) {
 #if defined(__x86_64__) || defined(__i386__)
     // TODO(teisenbe): This should be probed via the ACPI pseudo bus whenever it
     // exists.
@@ -372,6 +372,11 @@ static zx_driver_ops_t intel_rtc_driver_ops = {
     .bind = intel_rtc_bind,
 };
 
-ZIRCON_DRIVER_BEGIN(intel_rtc, intel_rtc_driver_ops, "zircon", "0.1", 1)
-    BI_MATCH_IF(EQ, BIND_PROTOCOL, ZX_PROTOCOL_MISC_PARENT),
+ZIRCON_DRIVER_BEGIN(intel_rtc, intel_rtc_driver_ops, "zircon", "0.1", 6)
+    BI_ABORT_IF(NE, BIND_PROTOCOL, ZX_PROTOCOL_ACPI),
+    BI_GOTO_IF(NE, BIND_ACPI_HID_0_3, 0x504e5030, 0), // PNP0B00\0
+    BI_MATCH_IF(EQ, BIND_ACPI_HID_4_7, 0x42303000),
+    BI_LABEL(0),
+    BI_ABORT_IF(NE, BIND_ACPI_CID_0_3, 0x504e5030), // PNP0B00\0
+    BI_MATCH_IF(EQ, BIND_ACPI_CID_4_7, 0x42303000),
 ZIRCON_DRIVER_END(intel_rtc)

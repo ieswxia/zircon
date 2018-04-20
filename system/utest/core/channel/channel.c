@@ -4,6 +4,7 @@
 
 #include <assert.h>
 #include <zircon/compiler.h>
+#include <zircon/rights.h>
 #include <zircon/syscalls.h>
 #include <zircon/syscalls/object.h>
 #include <unittest/unittest.h>
@@ -13,7 +14,7 @@
 #include <threads.h>
 #include <unistd.h>
 
-zx_handle_t _channel[4];
+static zx_handle_t _channel[4];
 
 /**
  * Channel tests with wait multiple.
@@ -91,8 +92,21 @@ static bool channel_test(void) {
     status = zx_channel_create(0, &h[0], &h[1]);
     ASSERT_EQ(status, ZX_OK, "error in channel create");
 
-    ASSERT_EQ(get_satisfied_signals(h[0]), ZX_CHANNEL_WRITABLE | ZX_SIGNAL_LAST_HANDLE, "");
-    ASSERT_EQ(get_satisfied_signals(h[1]), ZX_CHANNEL_WRITABLE | ZX_SIGNAL_LAST_HANDLE, "");
+    // Check that koids line up.
+    zx_info_handle_basic_t info[2] = {};
+    status = zx_object_get_info(h[0], ZX_INFO_HANDLE_BASIC, &info[0], sizeof(info[0]), NULL, NULL);
+    ASSERT_EQ(status, ZX_OK, "");
+    status = zx_object_get_info(h[1], ZX_INFO_HANDLE_BASIC, &info[1], sizeof(info[1]), NULL, NULL);
+    ASSERT_EQ(status, ZX_OK, "");
+    ASSERT_NE(info[0].koid, 0u, "zero koid!");
+    ASSERT_NE(info[0].related_koid, 0u, "zero peer koid!");
+    ASSERT_NE(info[1].koid, 0u, "zero koid!");
+    ASSERT_NE(info[1].related_koid, 0u, "zero peer koid!");
+    ASSERT_EQ(info[0].koid, info[1].related_koid, "mismatched koids!");
+    ASSERT_EQ(info[1].koid, info[0].related_koid, "mismatched koids!");
+
+    ASSERT_EQ(get_satisfied_signals(h[0]), ZX_CHANNEL_WRITABLE, "");
+    ASSERT_EQ(get_satisfied_signals(h[1]), ZX_CHANNEL_WRITABLE, "");
 
     _channel[0] = h[0];
     _channel[2] = h[1];
@@ -101,9 +115,9 @@ static bool channel_test(void) {
     status = zx_channel_write(_channel[0], 0u, &write_data, sizeof(uint32_t), NULL, 0u);
     ASSERT_EQ(status, ZX_OK, "error in message write");
     ASSERT_EQ(get_satisfied_signals(
-        _channel[0]), ZX_CHANNEL_WRITABLE | ZX_SIGNAL_LAST_HANDLE, "");
+        _channel[0]), ZX_CHANNEL_WRITABLE, "");
     ASSERT_EQ(get_satisfied_signals(
-        _channel[2]), ZX_CHANNEL_READABLE | ZX_CHANNEL_WRITABLE | ZX_SIGNAL_LAST_HANDLE, "");
+        _channel[2]), ZX_CHANNEL_READABLE | ZX_CHANNEL_WRITABLE, "");
 
     status = zx_channel_create(0, &h[0], &h[1]);
     ASSERT_EQ(status, ZX_OK, "error in channel create");
@@ -142,7 +156,7 @@ static bool channel_test(void) {
     // Since the the other side of _channel[3] is closed, and the read thread read everything
     // from it, the only satisfied/satisfiable signals should be "peer closed".
     ASSERT_EQ(get_satisfied_signals(
-        _channel[3]), ZX_CHANNEL_PEER_CLOSED | ZX_SIGNAL_LAST_HANDLE, "");
+        _channel[3]), ZX_CHANNEL_PEER_CLOSED, "");
 
     zx_handle_close(_channel[2]);
     zx_handle_close(_channel[3]);
@@ -190,7 +204,7 @@ static bool channel_close_test(void) {
     ASSERT_EQ(zx_channel_create(0, &channel[0], &channel[1]), ZX_OK, "");
     ASSERT_EQ(zx_handle_close(channel[1]), ZX_OK, "");
     ASSERT_EQ(get_satisfied_signals(
-        channel[0]), ZX_CHANNEL_PEER_CLOSED | ZX_SIGNAL_LAST_HANDLE, "");
+        channel[0]), ZX_CHANNEL_PEER_CLOSED, "");
     ASSERT_EQ(zx_handle_close(channel[0]), ZX_OK, "");
 
     ASSERT_EQ(zx_channel_create(0, &channel[0], &channel[1]), ZX_OK, "");
@@ -213,14 +227,14 @@ static bool channel_close_test(void) {
     ASSERT_EQ(zx_object_wait_one(
         channel1[1], ZX_CHANNEL_PEER_CLOSED, ZX_TIME_INFINITE, NULL), ZX_OK, "");
     ASSERT_EQ(get_satisfied_signals(
-        channel2[1]), ZX_CHANNEL_WRITABLE | ZX_SIGNAL_LAST_HANDLE, "");
+        channel2[1]), ZX_CHANNEL_WRITABLE, "");
 
     // Close channel[0]; the former channel2[0] should be closed, so channel2[1]
     // should have peer closed.
     ASSERT_EQ(zx_handle_close(channel[0]), ZX_OK, "");
     channel[0] = ZX_HANDLE_INVALID;
     ASSERT_EQ(get_satisfied_signals(
-        channel1[1]), ZX_CHANNEL_PEER_CLOSED | ZX_SIGNAL_LAST_HANDLE, "");
+        channel1[1]), ZX_CHANNEL_PEER_CLOSED, "");
     ASSERT_EQ(zx_object_wait_one(
         channel2[1], ZX_CHANNEL_PEER_CLOSED, ZX_TIME_INFINITE, NULL), ZX_OK, "");
 
@@ -483,6 +497,9 @@ typedef struct {
 #define CLI_RECV_HANDLE   0x0200
 #define CLI_SEND_HANDLE   0x0400
 
+#define TEST_SHORT_WAIT_MS    250
+#define TEST_LONG_WAIT_MS   10000
+
 static int call_client(void* _args) {
     ccargs_t* ccargs = _args;
     zx_channel_call_args_t args;
@@ -491,7 +508,7 @@ static int call_client(void* _args) {
     zx_handle_t txhandle = 0;
     zx_handle_t rxhandle = 0;
 
-    zx_status_t r;
+    zx_status_t r = ZX_OK;
     if (ccargs->action & CLI_SEND_HANDLE) {
         if ((r = zx_event_create(0, &txhandle)) != ZX_OK) {
             ccargs->err = "failed to create event";
@@ -511,8 +528,10 @@ static int call_client(void* _args) {
     uint32_t act_bytes = 0xffffffff;
     uint32_t act_handles = 0xffffffff;
 
-    zx_time_t deadline = (ccargs->action & CLI_SHORT_WAIT) ? zx_deadline_after(ZX_MSEC(250)) :
-            ZX_TIME_INFINITE;
+    zx_time_t deadline = (ccargs->action & CLI_SHORT_WAIT) ?
+        zx_deadline_after(ZX_MSEC(TEST_SHORT_WAIT_MS)) :
+        zx_deadline_after(ZX_MSEC(TEST_LONG_WAIT_MS));
+
     zx_status_t rs = ZX_OK;
     if ((r = zx_channel_call(ccargs->h, 0, deadline, &args, &act_bytes, &act_handles, &rs)) != ccargs->expect) {
         ccargs->err = "channel call returned";
@@ -528,9 +547,10 @@ static int call_client(void* _args) {
         if (ccargs->expect_rs && (ccargs->expect_rs != rs)) {
             ccargs->err = "read_status not what was expected";
             ccargs->val = ccargs->expect_rs;
+        } else {
+            r = ZX_OK;
         }
-    }
-    if (r == ZX_OK) {
+    } else if (r == ZX_OK) {
         if (act_bytes != sizeof(data)) {
             ccargs->err = "expected 8 bytes";
             ccargs->val = act_bytes;
@@ -543,6 +563,9 @@ static int call_client(void* _args) {
         } else if ((ccargs->action & CLI_RECV_HANDLE) && (act_handles != 1)) {
             ccargs->err = "recv handle missing";
         }
+    } else if ((r == ZX_ERR_TIMED_OUT) && (ccargs->action & CLI_SHORT_WAIT)) {
+        // We expect CLI_SHORT_WAIT calls to time-out.
+        r = ZX_OK;
     }
 
 done:
@@ -550,7 +573,7 @@ done:
     call_test_done |= ccargs->bit;
     cnd_broadcast(&call_test_cvar);
     mtx_unlock(&call_test_lock);
-    return 0;
+    return (int) r;
 }
 
 static ccargs_t ccargs[] = {
@@ -561,7 +584,7 @@ static ccargs_t ccargs[] = {
         .expect_rs = ZX_ERR_BUFFER_TOO_SMALL,
     },
     {
-        .name = "no reply",
+        .name = "no reply (short wait)",
         .action = SRV_DISCARD | CLI_SHORT_WAIT,
         .expect = ZX_ERR_TIMED_OUT,
     },
@@ -603,6 +626,8 @@ static int call_server(void* ptr) {
     ccargs_t msg[countof(ccargs)];
     memset(msg, 0, sizeof(msg));
 
+    zx_status_t status;
+
     // received the expected number of messages
     for (unsigned n = 0; n < countof(ccargs); n++) {
         zx_object_wait_one(h, ZX_CHANNEL_READABLE | ZX_CHANNEL_PEER_CLOSED, ZX_TIME_INFINITE, NULL);
@@ -610,12 +635,15 @@ static int call_server(void* ptr) {
         uint32_t bytes = sizeof(msg[0]);
         uint32_t handles = 1;
         zx_handle_t handle = 0;
-        if (zx_channel_read(h, 0, &msg[n], &handle, bytes, handles, &bytes, &handles) != ZX_OK) {
+        status = zx_channel_read(h, 0, &msg[n], &handle, bytes, handles, &bytes, &handles);
+        if (status != ZX_OK) {
             fprintf(stderr, "call_server() read failed\n");
-            break;
+            return (int) status;
         }
         if (handle) {
-            zx_handle_close(handle);
+            status = zx_handle_close(handle);
+            if (status != ZX_OK)
+                return (int) status;
         }
     }
 
@@ -639,9 +667,10 @@ static int call_server(void* ptr) {
         if (handles) {
             zx_event_create(0, &handle);
         }
-        if (zx_channel_write(h, 0, data, bytes, &handle, handles) != ZX_OK) {
+        status = zx_channel_write(h, 0, data, bytes, &handle, handles);
+        if (status != ZX_OK) {
             fprintf(stderr, "call_server() write failed\n");
-            break;
+            return (int) status;
         }
     }
     return 0;
@@ -650,8 +679,8 @@ static int call_server(void* ptr) {
 static bool channel_call(void) {
     BEGIN_TEST;
 
-    mtx_init(&call_test_lock, mtx_plain);
-    cnd_init(&call_test_cvar);
+    ASSERT_EQ(mtx_init(&call_test_lock, mtx_plain), thrd_success, "");
+    ASSERT_EQ(cnd_init(&call_test_cvar), thrd_success, "");
 
     zx_handle_t cli, srv;
     ASSERT_EQ(zx_channel_create(0, &cli, &srv), ZX_OK, "");
@@ -671,17 +700,16 @@ static bool channel_call(void) {
         ASSERT_EQ(thrd_create(&ccargs[n].t, call_client, &ccargs[n]), thrd_success, "");
     }
 
-    // wait for all tests to finish or timeout
-    struct timespec until;
-    clock_gettime(CLOCK_REALTIME, &until);
-    until.tv_sec += 5;
+    // Wait for all tests to finish. There is no timeout, we leave that to
+    // the test harness.
     int r = 0;
     while (r == 0) {
         mtx_lock(&call_test_lock);
         if (call_test_done == waitfor) {
             r = -1;
         } else {
-            r = cnd_timedwait(&call_test_cvar, &call_test_lock, &until);
+            r = cnd_timedwait(&call_test_cvar, &call_test_lock, NULL);
+            EXPECT_EQ(r, thrd_success, "wait failed");
         }
         mtx_unlock(&call_test_lock);
     }
@@ -701,8 +729,18 @@ static bool channel_call(void) {
     }
     mtx_unlock(&call_test_lock);
 
+    int retv = 0;
+    EXPECT_EQ(thrd_join(srvt, &retv), thrd_success, "");
+    EXPECT_EQ(retv, 0, "");
+
+    for (unsigned n = 0; n < countof(ccargs); n++) {
+        EXPECT_EQ(thrd_join(ccargs[n].t, &retv), thrd_success, "");
+        EXPECT_EQ(retv, 0, "");
+    }
+
     zx_handle_close(cli);
     zx_handle_close(srv);
+
     END_TEST;
 }
 
@@ -762,6 +800,10 @@ static bool channel_call2(void) {
 
     EXPECT_EQ(r, ZX_ERR_CALL_FAILED, "");
     EXPECT_EQ(rs, ZX_ERR_PEER_CLOSED, "");
+
+    int retv = 0;
+    EXPECT_EQ(thrd_join(t, &retv), thrd_success, "");
+    EXPECT_EQ(retv, 0, "");
 
     END_TEST;
 }
@@ -826,7 +868,10 @@ static bool channel_nest(void) {
     ASSERT_EQ(zx_channel_create(0, &channel[0], &channel[1]), ZX_OK, "");
 
     zx_handle_t end;
-    ASSERT_TRUE(create_and_nest(channel[0], &end, 10), "");
+    // Nest 200 channels, each one in the payload of the previous one. Without
+    // the SafeDeleter in fbl_recycle() this blows the kernel stack when calling
+    // the destructors.
+    ASSERT_TRUE(create_and_nest(channel[0], &end, 200), "");
     EXPECT_EQ(zx_handle_close(channel[1]), ZX_OK, "");
     EXPECT_EQ(zx_object_wait_one(channel[0], ZX_CHANNEL_PEER_CLOSED, ZX_TIME_INFINITE, NULL), ZX_OK, "");
 
@@ -855,6 +900,53 @@ static bool channel_disallow_write_to_self(void) {
     END_TEST;
 }
 
+static bool channel_read_etc(void) {
+    BEGIN_TEST;
+
+    zx_handle_t event;
+    ASSERT_EQ(zx_event_create(0u, &event), ZX_OK, "");
+    ASSERT_EQ(zx_handle_replace(event,  ZX_RIGHT_SIGNAL | ZX_RIGHT_TRANSFER, &event), ZX_OK, "");
+
+    zx_handle_t fifo[2];
+    ASSERT_EQ(zx_fifo_create(32u, 8u, 0u, &fifo[0], &fifo[1]), ZX_OK, "");
+
+    zx_handle_t sent[] = {
+        fifo[0],
+        event,
+        fifo[1]
+    };
+
+    zx_handle_t channel[2];
+    ASSERT_EQ(zx_channel_create(0, &channel[0], &channel[1]), ZX_OK, "");
+    EXPECT_EQ(zx_channel_write(channel[0], 0u, NULL, 0, sent, 3u), ZX_OK, "");
+
+    zx_handle_info_t recv[] = {{}, {}, {}};
+    uint32_t actual_bytes;
+    uint32_t actual_handles;
+
+    EXPECT_EQ(zx_channel_read_etc(
+        channel[1], 0u, NULL, recv, 0u, 3u, &actual_bytes, &actual_handles), ZX_OK, "");
+
+    EXPECT_EQ(actual_bytes, 0u, "");
+    EXPECT_EQ(actual_handles, 3u, "");
+    EXPECT_EQ(recv[0].type, ZX_OBJ_TYPE_FIFO, "");
+    EXPECT_EQ(recv[0].rights, ZX_DEFAULT_FIFO_RIGHTS, "");
+
+    EXPECT_EQ(recv[1].type, ZX_OBJ_TYPE_EVENT, "");
+    EXPECT_EQ(recv[1].rights, ZX_RIGHT_SIGNAL | ZX_RIGHT_TRANSFER, "");
+
+    EXPECT_EQ(recv[2].type, ZX_OBJ_TYPE_FIFO, "");
+    EXPECT_EQ(recv[2].rights, ZX_DEFAULT_FIFO_RIGHTS, "");
+
+    EXPECT_EQ(zx_handle_close(channel[0]), ZX_OK, "");
+    EXPECT_EQ(zx_handle_close(channel[1]), ZX_OK, "");
+    EXPECT_EQ(zx_handle_close(recv[0].handle), ZX_OK, "");
+    EXPECT_EQ(zx_handle_close(recv[1].handle), ZX_OK, "");
+    EXPECT_EQ(zx_handle_close(recv[2].handle), ZX_OK, "");
+
+    END_TEST;
+}
+
 BEGIN_TEST_CASE(channel_tests)
 RUN_TEST(channel_test)
 RUN_TEST(channel_read_error_test)
@@ -868,6 +960,7 @@ RUN_TEST(channel_call2)
 RUN_TEST(bad_channel_call_finish)
 RUN_TEST(channel_nest)
 RUN_TEST(channel_disallow_write_to_self)
+RUN_TEST(channel_read_etc)
 END_TEST_CASE(channel_tests)
 
 #ifndef BUILD_COMBINED_TESTS

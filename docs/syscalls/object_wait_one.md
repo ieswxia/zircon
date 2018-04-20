@@ -11,7 +11,7 @@ object_wait_one - wait for signals on an object
 
 zx_status_t zx_object_wait_one(zx_handle_t handle,
                                zx_signals_t signals,
-                               zx_time deadline,
+                               zx_time_t deadline,
                                zx_signals_t* observed);
 ```
 
@@ -48,7 +48,7 @@ For any other return value, *observed* is undefined.
 
 **ZX_ERR_BAD_HANDLE**  *handle* is not a valid handle.
 
-**ZX_ERR_ACCESS_DENIED**  *handle* does not have **ZX_RIGHT_READ** and may
+**ZX_ERR_ACCESS_DENIED**  *handle* does not have **ZX_RIGHT_WAIT** and may
 not be waited upon.
 
 **ZX_ERR_CANCELED**  *handle* was invalidated (e.g., closed) during the wait.

@@ -19,10 +19,11 @@ MODULE_STATIC_LIBS := \
     system/ulib/fvm \
     system/ulib/gpt \
     system/ulib/digest \
+    system/ulib/zx \
     system/ulib/zxcpp \
     system/ulib/fbl \
     system/ulib/sync \
-    third_party/ulib/cryptolib \
+    third_party/ulib/uboringssl \
 
 MODULE_LIBS := \
     system/ulib/c \
